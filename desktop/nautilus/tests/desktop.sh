@@ -33,12 +33,14 @@ export GIO_USE_VFS=local GDK_BACKEND=x11 GSK_RENDERER=cairo
 export MESA_SHADER_CACHE_DISABLE=true
 export ONEDRIVE_RS_MOUNT="$mount" ONEDRIVE_DESKTOP_TEST="$root"
 if [[ $mode == retention ]]; then
+    desktop_deadline=40s
     [[ ${XDG_RUNTIME_DIR:?} == "$root/"* && -S $XDG_RUNTIME_DIR/onedrive-rs/daemon.sock ]]
 else
+    desktop_deadline=25s
     export XDG_RUNTIME_DIR="$root/desktop-runtime"
     mkdir -m 700 "$XDG_RUNTIME_DIR"
 fi
 unset DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE WAYLAND_DISPLAY
 ulimit -c 0
-timeout -k 2s 40s dbus-run-session --config-file="$root/desktop-bus.conf" -- \
+timeout -k 2s "$desktop_deadline" dbus-run-session --config-file="$root/desktop-bus.conf" -- \
     xvfb-run -a -s '-screen 0 1024x768x24' python "$test_dir/drive.py" "$mode"

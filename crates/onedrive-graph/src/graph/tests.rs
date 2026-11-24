@@ -781,3 +781,153 @@ async fn checked_rmdir_uses_the_empty_snapshot_ctag_and_rejects_nonempty_folders
     }
     assert_eq!(server.received_requests().await.unwrap().len(), 4);
 }
+
+#[tokio::test]
+async fn graph_pin_streams_one_chunked_snapshot_and_requires_an_exact_complete_body() {
+    use axum::{Router, body::Body, routing::get};
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+    use onedrive_core::{Engine, EngineError, SystemClock};
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    const CHUNK: usize = 64 * 1024;
+    const CHUNKS: usize = 96;
+    const SIZE: usize = CHUNKS * CHUNK + 1;
+    for (tail, completes) in [
+        (Ok(1), true),
+        (Ok(0), false),
+        (Ok(2), false),
+        (Err(io::ErrorKind::ConnectionReset), false),
+    ] {
+        let server = MockServer::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/content", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let finish = Arc::new(Notify::new());
+        let cdn = Router::new().route(
+            "/content",
+            get({
+                let requests = requests.clone();
+                let finish = finish.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let requests = requests.clone();
+                    let finish = finish.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        assert!(!headers.contains_key("range"));
+                        assert!(!headers.contains_key("authorization"));
+                        assert_eq!(headers["accept-encoding"], "identity");
+                        let chunks = stream::iter(
+                            (0..CHUNKS)
+                                .map(|index| Ok(Bytes::from(vec![(index % 251) as u8; CHUNK]))),
+                        );
+                        let tail = tail
+                            .map(|size| Bytes::from(vec![255; size]))
+                            .map_err(io::Error::from);
+                        Body::from_stream(chunks.chain(stream::once(async move {
+                            finish.notified().await;
+                            tail
+                        })))
+                    }
+                }
+            }),
+        );
+        let cdn = tokio::spawn(async move { axum::serve(listener, cdn).await.unwrap() });
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root/delta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {"id": "root", "name": "root", "folder": {}, "root": {}},
+                    {"id": "file", "name": "sample.bin", "file": {}, "size": SIZE,
+                     "parentReference": {"id": "root"}}
+                ],
+                "@odata.deltaLink": format!("{}/complete", server.uri())
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/items/file"))
+            .and(header("authorization", "Bearer synthetic-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "@microsoft.graph.downloadUrl": url
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let engine = Arc::new(
+            Engine::open_with_cache(
+                temp.path().join("metadata.db"),
+                &cache,
+                Arc::new(mock_graph(&server)),
+                Arc::new(SystemClock),
+            )
+            .unwrap(),
+        );
+        engine.sync().await.unwrap();
+        let inode = engine.lookup("root", "sample.bin").unwrap().unwrap().inode;
+        let pin = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.pin("file").await }
+        });
+        // The server withholds EOF until the client has staged a block.
+        // Buffering the whole response in Graph would deadlock this transfer.
+        let cache_namespaces = || {
+            std::fs::read_dir(&cache)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_dir())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if cache_namespaces().any(|namespace| {
+                    std::fs::read_dir(namespace)
+                        .unwrap()
+                        .any(|entry| entry.unwrap().path().join("0").is_file())
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Graph did not stage a block before EOF");
+        assert_eq!(engine.cache_status().unwrap().pinned_bytes, 0);
+        finish.notify_one();
+        let pin = pin.await.unwrap();
+        if completes {
+            pin.unwrap();
+            assert_eq!(engine.cache_status().unwrap().pinned_bytes, SIZE as u64);
+            assert_eq!(
+                engine.read(inode, 32 * CHUNK as u64 - 1, 2).await.unwrap(),
+                [31, 32]
+            );
+            assert_eq!(engine.read(inode, SIZE as u64 - 1, 1).await.unwrap(), [255]);
+        } else {
+            match tail {
+                Ok(_) => assert!(matches!(pin, Err(EngineError::InvalidRange)), "{pin:?}"),
+                Err(_) => assert!(
+                    matches!(pin, Err(EngineError::Cloud(CloudError::Unavailable))),
+                    "{pin:?}"
+                ),
+            }
+            assert_eq!(engine.cache_status().unwrap().pinned_bytes, 0);
+            assert_eq!(
+                engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+                b"Cloud-only"
+            );
+            assert!(
+                cache_namespaces()
+                    .all(|namespace| std::fs::read_dir(namespace).unwrap().next().is_none())
+            );
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        cdn.abort();
+    }
+}

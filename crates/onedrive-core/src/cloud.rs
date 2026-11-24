@@ -4,7 +4,11 @@ use std::os::unix::fs::FileExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use thiserror::Error;
+
+pub type SnapshotStream = BoxStream<'static, Result<Bytes, CloudError>>;
 
 /// The Graph adapter translates HTTP responses into this port's domain types.
 #[async_trait]
@@ -31,6 +35,16 @@ pub trait CloudDrive: Send + Sync {
         _offset: u64,
         _length: usize,
     ) -> Result<Vec<u8>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    /// Stream the complete body of a single download response. The caller
+    /// verifies the final byte count against the catalog size before publication.
+    async fn stream_snapshot(
+        &self,
+        _item_id: &str,
+        _size: u64,
+    ) -> Result<SnapshotStream, CloudError> {
         Err(CloudError::Unsupported)
     }
 

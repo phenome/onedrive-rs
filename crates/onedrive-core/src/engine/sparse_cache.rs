@@ -6,14 +6,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
+use futures_util::{StreamExt, stream};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use rustix::fs::{FlockOperation, Mode, OFlags, flock};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{CatalogItem, Engine, EngineError, ItemKind};
+use crate::{CloudError, SnapshotStream};
 
 pub(super) const HEADER_BYTES: u64 = 64 * 1024;
 pub(super) const STREAM_BYTES: u64 = 2 * 1024 * 1024;
+const LEGACY_SNAPSHOT_LIMIT: u64 = 2 * STREAM_BYTES;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadKind {
     Header,
@@ -73,6 +76,24 @@ pub(super) struct SparseCache {
     locks: Mutex<RangeLocks>,
     #[cfg(test)]
     before_flush: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+// A journaled generation is reclaimable after a crash. The directory lock
+// protects it from reclamation by any Engine while the response is in flight.
+struct SnapshotStage {
+    generation: i64,
+    path: PathBuf,
+    directory: File,
+    published: bool,
+}
+
+impl Drop for SnapshotStage {
+    fn drop(&mut self) {
+        if !self.published {
+            // Keep the journal entry until reclamation syncs the parent directory.
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 impl SparseCache {
@@ -154,7 +175,23 @@ impl SparseCache {
     }
 
     fn remove_generation(&self, generation: i64) -> bool {
-        let removed = fs::remove_dir_all(self.path(generation));
+        let path = self.path(generation);
+        let _lease = match rustix::fs::open(
+            &path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(file) => {
+                if flock(&file, FlockOperation::NonBlockingLockExclusive).is_err() {
+                    return false;
+                }
+                Some(file)
+            }
+            Err(rustix::io::Errno::NOENT) => return true,
+            Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => None,
+            Err(_) => return false,
+        };
+        let removed = fs::remove_dir_all(path);
         removed.is_ok() || removed.is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
     }
 
@@ -493,7 +530,7 @@ impl Engine {
             };
             let bytes = match versioned {
                 Err(crate::CloudError::Unsupported) => {
-                    if kind == ReadKind::Pin && item.size > block.capacity() {
+                    if kind == ReadKind::Pin {
                         self.hydrate_unversioned_snapshot(item, generation).await?;
                         return Ok(ReadOutcome::Retired);
                     }
@@ -546,77 +583,177 @@ impl Engine {
         item: &CatalogItem,
         generation: i64,
     ) -> Result<(), EngineError> {
-        self.check_hydration_space(item.size)?;
-        let length = usize::try_from(item.size).map_err(|_| EngineError::InvalidRange)?;
-        let bytes = self.cloud.read_range(&item.item_id, 0, length).await;
-        let directory = self.cache.lock_disk()?;
-        let (bytes, snapshot) = {
-            let mut db = self.db();
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if !generation_is_current(&tx, item, generation, ReadKind::Pin)? {
-                return Ok(());
+        let response = self.cloud.stream_snapshot(&item.item_id, item.size).await;
+        if !generation_is_current(&self.db(), item, generation, ReadKind::Pin)? {
+            return Ok(());
+        }
+        let mut response: SnapshotStream = match response {
+            Err(CloudError::Unsupported) if item.size <= LEGACY_SNAPSHOT_LIMIT => {
+                self.check_hydration_space(item.size)?;
+                let bytes = self
+                    .cloud
+                    .read_range(&item.item_id, 0, item.size as usize)
+                    .await;
+                Box::pin(stream::iter([bytes.map(Into::into)]))
             }
-            let bytes = bytes?;
-            if bytes.len() != length {
-                return Err(EngineError::InvalidRange);
-            }
-            self.check_hydration_space(item.size)?;
-            // Reserve a fresh generation and journal it for recovery before
-            // writing files. The disk lock prevents premature reclamation.
-            let snapshot: i64 = tx.query_row(
-                "UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = 'sparse_files' RETURNING seq",
-                [],
-                |row| row.get(0),
-            )?;
-            tx.execute("INSERT INTO sparse_retired VALUES (?1)", [snapshot])?;
-            tx.commit()?;
-            (bytes, snapshot)
+            result => result?,
         };
-        let result = (|| {
-            let mut ranges = Vec::new();
-            for (index, bytes) in bytes.chunks(STREAM_BYTES as usize).enumerate() {
-                let block = Block::Stream(index as u64 * STREAM_BYTES);
-                let stamp = self.cache.write_block(&directory, snapshot, block, bytes)?;
-                ranges.push((block, stamp));
+        let Some(mut stage) = self.reserve_snapshot(item, generation)? else {
+            return Ok(());
+        };
+        let result = self
+            .stage_snapshot(item, generation, &stage, &mut response)
+            .await;
+        let result = match result {
+            Ok(true) => self.publish_snapshot(item, generation, &mut stage),
+            Ok(false) => Ok(()),
+            Err(error) => {
+                if generation_is_current(&self.db(), item, generation, ReadKind::Pin)? {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
             }
-            let mut db = self.db();
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if !generation_is_current(&tx, item, generation, ReadKind::Pin)? {
-                return Ok(());
-            }
-            // Publish all blocks as a unit, dropping any independent ranges.
-            tx.execute(
-                "DELETE FROM sparse_files WHERE generation = ?1",
-                [generation],
-            )?;
-            tx.execute(
-                "INSERT INTO sparse_files (inode, generation) VALUES (?1, ?2)",
-                params![item.inode, snapshot],
-            )?;
-            for (block, stamp) in ranges {
-                tx.execute(
-                    "INSERT INTO sparse_ranges VALUES (?1, ?2)",
-                    params![snapshot, block.key()],
-                )?;
-                tx.execute(
-                    "INSERT INTO sparse_range_files VALUES (?1, ?2, ?3)",
-                    params![snapshot, block.key(), stamp],
-                )?;
-                // NULL tags permit composition within this snapshot. They
-                // cannot satisfy a writeback base's version check.
-                tx.execute(
-                    "INSERT INTO sparse_range_versions VALUES (?1, ?2, NULL, NULL)",
-                    params![snapshot, block.key()],
-                )?;
-            }
-            self.touch_generation(&tx, snapshot)?;
-            forget_retired(&tx, snapshot)?;
-            tx.commit()?;
-            Ok::<_, EngineError>(())
-        })();
-        drop(directory);
+        };
+        drop(stage);
         let reclaimed = self.reclaim_sparse_cache();
         result.and(reclaimed)
+    }
+
+    fn reserve_snapshot(
+        &self,
+        item: &CatalogItem,
+        generation: i64,
+    ) -> Result<Option<SnapshotStage>, EngineError> {
+        let _disk = self.cache.lock_disk()?;
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !generation_is_current(&tx, item, generation, ReadKind::Pin)? {
+            return Ok(None);
+        }
+        self.check_hydration_space(item.size)?;
+        let snapshot = tx.query_row(
+            "UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = 'sparse_files' RETURNING seq",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute("INSERT INTO sparse_retired VALUES (?1)", [snapshot])?;
+        tx.commit()?;
+        let path = self.cache.path(snapshot);
+        fs::create_dir(&path)?;
+        let directory = File::open(&path).inspect_err(|_| {
+            let _ = fs::remove_dir(&path);
+        })?;
+        let stage = SnapshotStage {
+            generation: snapshot,
+            path,
+            directory,
+            published: false,
+        };
+        flock(&stage.directory, FlockOperation::LockExclusive).map_err(io::Error::from)?;
+        Ok(Some(stage))
+    }
+
+    async fn stage_snapshot(
+        &self,
+        item: &CatalogItem,
+        generation: i64,
+        stage: &SnapshotStage,
+        response: &mut SnapshotStream,
+    ) -> Result<bool, EngineError> {
+        let mut received = 0;
+        let mut offset = 0;
+        let mut bytes = Vec::with_capacity(item.size.min(STREAM_BYTES) as usize);
+        while let Some(chunk) = response.next().await {
+            let chunk = chunk?;
+            if chunk.len() as u64 > item.size - received {
+                return Err(EngineError::InvalidRange);
+            }
+            received += chunk.len() as u64;
+            let mut chunk = &chunk[..];
+            while !chunk.is_empty() {
+                let length = (item.size - offset).min(STREAM_BYTES) as usize;
+                let take = chunk.len().min(length - bytes.len());
+                bytes.extend_from_slice(&chunk[..take]);
+                chunk = &chunk[take..];
+                if bytes.len() == length {
+                    // Serialize the free-space check and block write with
+                    // other cache writes. Release the lock before reading more.
+                    let root = self.cache.lock_disk()?;
+                    if !generation_is_current(&self.db(), item, generation, ReadKind::Pin)? {
+                        return Ok(false);
+                    }
+                    self.check_hydration_space(length as u64)?;
+                    self.cache
+                        .write_block(&root, stage.generation, Block::Stream(offset), &bytes)
+                        .map_err(|error| {
+                            if error.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error())
+                            {
+                                EngineError::LowDisk
+                            } else {
+                                error.into()
+                            }
+                        })?;
+                    offset += length as u64;
+                    bytes.clear();
+                }
+            }
+        }
+        if received != item.size {
+            return Err(EngineError::InvalidRange);
+        }
+        Ok(true)
+    }
+
+    fn publish_snapshot(
+        &self,
+        item: &CatalogItem,
+        generation: i64,
+        stage: &mut SnapshotStage,
+    ) -> Result<(), EngineError> {
+        let _disk = self.cache.lock_disk()?;
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !generation_is_current(&tx, item, generation, ReadKind::Pin)? {
+            return Ok(());
+        }
+        self.check_hydration_space(0)?;
+        // Publish all blocks as a unit, dropping any independent ranges.
+        tx.execute(
+            "DELETE FROM sparse_files WHERE generation = ?1",
+            [generation],
+        )?;
+        tx.execute(
+            "INSERT INTO sparse_files (inode, generation) VALUES (?1, ?2)",
+            params![item.inode, stage.generation],
+        )?;
+        for offset in (0..item.size).step_by(STREAM_BYTES as usize) {
+            let block = Block::Stream(offset);
+            let metadata = fs::symlink_metadata(self.cache.block_path(stage.generation, block))?;
+            if !metadata.is_file()
+                || metadata.size() != (item.size - offset).min(STREAM_BYTES)
+                || metadata.modified()? != UNIX_EPOCH
+            {
+                return Err(EngineError::InvalidRange);
+            }
+            tx.prepare_cached("INSERT INTO sparse_ranges VALUES (?1, ?2)")?
+                .execute(params![stage.generation, block.key()])?;
+            tx.prepare_cached("INSERT INTO sparse_range_files VALUES (?1, ?2, ?3)")?
+                .execute(params![
+                    stage.generation,
+                    block.key(),
+                    file_stamp(&metadata)
+                ])?;
+            // NULL tags permit composition within this snapshot. They cannot
+            // satisfy a writeback base's version check.
+            tx.prepare_cached("INSERT INTO sparse_range_versions VALUES (?1, ?2, NULL, NULL)")?
+                .execute(params![stage.generation, block.key()])?;
+        }
+        self.touch_generation(&tx, stage.generation)?;
+        forget_retired(&tx, stage.generation)?;
+        tx.commit()?;
+        stage.published = true;
+        Ok(())
     }
 
     fn publish_block(

@@ -5,11 +5,11 @@ A cloud-first OneDrive client for Linux desktops (targeting Nautilus and POSIX t
 ## Language
 
 **Cloud-only**:
-A file whose metadata exists locally but whose content bytes are not stored in the local cache; opening it fetches bytes on demand.
+A file whose metadata is available locally and whose content is fetched on demand. A cached header or other partial range can satisfy a read while the file remains Cloud-only.
 _Avoid_: Placeholder, stub, remote-only
 
 **Hydrated**:
-A file whose content bytes are currently stored in the local cache and available without re-downloading.
+A file whose complete contents are available from the local cache.
 _Avoid_: Downloaded, materialized, locally synced
 
 **Pin**:

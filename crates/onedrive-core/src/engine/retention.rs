@@ -297,17 +297,14 @@ impl Engine {
         for file in &mut entries {
             let idle = now.saturating_sub(file.accessed_at).max(0) as u64;
             if file.hydrated && idle > max_age_ms && !self.file_is_open(file.inode) {
-                tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [file.inode])?;
-                unpinned -= file.bytes;
-                file.bytes = 0;
+                unpinned -= file.evict(&tx)?;
             }
         }
-        for file in entries.into_iter().filter(|file| file.bytes > 0) {
+        for file in entries.iter_mut().filter(|file| file.bytes > 0) {
             if unpinned <= self.config.max_unpinned_cache_bytes {
                 break;
             }
-            tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [file.inode])?;
-            unpinned -= file.bytes;
+            unpinned -= file.evict(&tx)?;
         }
         tx.commit()?;
         drop(db);
@@ -406,6 +403,13 @@ struct CachedFile {
     state: SyncState,
     pinned: bool,
     hydrated: bool,
+}
+
+impl CachedFile {
+    fn evict(&mut self, db: &Connection) -> rusqlite::Result<u64> {
+        db.execute("DELETE FROM sparse_files WHERE inode = ?1", [self.inode])?;
+        Ok(std::mem::take(&mut self.bytes))
+    }
 }
 
 fn cached_files(db: &Connection) -> Result<Vec<CachedFile>, EngineError> {

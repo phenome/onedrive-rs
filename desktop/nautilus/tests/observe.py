@@ -30,16 +30,6 @@ def observe_menu(self, files):
     if len(files) == 1:
         name = files[0].get_name()
         record("menu", name, [(item.props.name, item.props.sensitive) for item in items])
-        trigger = test_root / "desktop-action"
-        if trigger.exists():
-            expected_name, operation = json.loads(trigger.read_text())
-            if name == expected_name:
-                for item in items:
-                    if item.props.name == f"OneDrive::{operation}" and item.props.sensitive:
-                        trigger.unlink()
-                        # Exercise the real MenuItem signal and its socket callback.
-                        GLib.idle_add(lambda: item.emit("activate") or GLib.SOURCE_REMOVE)
-                        break
     return items
 
 
@@ -55,3 +45,5 @@ request = observe_request
 Nautilus.FileInfo.add_emblem = observe_emblem
 OneDriveExtension.finish_update = observe_finish
 OneDriveExtension.get_file_items = observe_menu
+
+record("thumbnail-policy", Gio.Settings.new("org.gnome.nautilus.preferences").get_string("show-image-thumbnails"))

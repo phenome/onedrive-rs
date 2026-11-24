@@ -5,7 +5,7 @@ nautilus-python, PyGObject, D-Bus, Xvfb and xvfb-run, Bubblewrap, ImageMagick,
 and libXtst.
 
 ```sh
-cargo test -p onedrive-core --test live_fuse live_nautilus_preview -- --ignored --nocapture
+cargo test --locked -p onedrive-core --test live_fuse live_nautilus_preview -- --ignored --nocapture
 ```
 
 The test mounts two synthetic 12 MiB PNGs through the real FUSE adapter. The
@@ -23,22 +23,16 @@ metadata and bytes throughout.
 
 ## Mounted daemon and retention
 
-Once #8's daemon and #5/#6 are integrated, stage the daemon fixture as a test in
-the binary crate. Then pass Cargo's compiled test executable to the runner.
+Run the combined Nautilus and daemon test from the workspace.
 
 ```sh
-cp desktop/nautilus/tests/daemon.rs crates/onedrive-rs/tests/nautilus_fixture.rs
-worker=$(
-    cargo test --locked -p onedrive-rs --test nautilus_fixture --no-run --message-format=json |
-    python -c 'import json,sys; print(next(o["executable"] for o in map(json.loads, sys.stdin) if o.get("target", {}).get("name") == "nautilus_fixture" and o.get("executable")))'
-)
-timeout -k 3s 45s bash desktop/nautilus/tests/retention.sh "$worker"
+cargo test --locked -p onedrive-rs --test nautilus_fixture live_nautilus_retention -- --ignored --nocapture
 ```
 
 This runs the real daemon against the fake cloud and checks its read telemetry
-before Pin. A right-click invokes the native MenuProvider. The fixture
-activates the returned Nautilus menu item and asserts the socket reply,
-refreshed status and emblem, and pinned byte count for both Pin and Purge.
+before Pin. It opens the native context menu and activates Pin and Purge through
+keyboard input. The fixture checks both socket replies, FUSE xattrs, the
+emblem rendered in the same window, and pinned byte counts.
 The runner signals only its daemon worker, checks that the socket and mount are
 gone, and removes the temporary files. It reports a retained mount path if
 fallback unmount also fails. For a screenshot when assertions fail, set

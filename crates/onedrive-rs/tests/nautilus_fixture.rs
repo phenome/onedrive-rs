@@ -1,7 +1,9 @@
-//! Copy into crates/onedrive-rs/tests/nautilus_fixture.rs once #8 is integrated.
+//! Fake cloud worker for the isolated Nautilus retention integration test.
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -39,6 +41,23 @@ impl CloudDrive for DesktopCloud {
         writeln!(self.reads.lock().unwrap(), "{line}").unwrap();
         self.fake.read_range(id, offset, length).await
     }
+}
+
+#[test]
+#[ignore = "requires FUSE3, Nautilus 51, Xvfb, nautilus-python and ImageMagick"]
+fn live_nautilus_retention() {
+    let runner =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../desktop/nautilus/tests/retention.sh");
+    let status = Command::new("timeout")
+        .args(["-k", "10s", "45s", "bash"])
+        .arg(runner)
+        .arg(env::current_exe().unwrap())
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "Nautilus retention fixture exited with {status}"
+    );
 }
 
 #[test]

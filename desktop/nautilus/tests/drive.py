@@ -1,11 +1,13 @@
 """Drive the private Nautilus window and assert rendered and extension state."""
 
 import ctypes as c
+import hashlib
 import json
 import os
 from pathlib import Path
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -56,12 +58,28 @@ def preview_location():
     return None
 
 
+def screen_crop(x, y, width, height):
+    return subprocess.run(
+        ["magick", "import", "-window", "root", "-crop",
+         f"{width}x{height}+{x}+{y}", "-depth", "8", "rgb:-"],
+        check=True, capture_output=True, timeout=3,
+    ).stdout
+
+
+def thumbnail_size(name, subdirectory):
+    uri = Gio.File.new_for_path(str(MOUNT / name)).get_uri()
+    filename = hashlib.md5(uri.encode()).hexdigest() + ".png"
+    data = (Path(os.environ["XDG_CACHE_HOME"]) / "thumbnails" / subdirectory / filename).read_bytes()
+    assert data[:16] == b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+    return struct.unpack(">II", data[16:24])
+
+
 def thumbnail_attributes(name):
     file = Gio.File.new_for_path(str(MOUNT / name))
     return file.query_info("thumbnail::*", Gio.FileQueryInfoFlags.NONE, None)
 
 
-def input_event(button=None, point=None):
+def input_event(button=None, point=None, keys=()):
     x11 = c.CDLL("libX11.so.6")
     xtest = c.CDLL("libXtst.so.6")
     x11.XOpenDisplay.restype = c.c_void_p
@@ -69,9 +87,10 @@ def input_event(button=None, point=None):
     assert display
     try:
         if button is None:
-            keycode = x11.XKeysymToKeycode(display, c.c_ulong(0xFF1B))  # Escape
-            assert xtest.XTestFakeKeyEvent(display, keycode, 1, 0)
-            assert xtest.XTestFakeKeyEvent(display, keycode, 0, 0)
+            for symbol in keys:
+                keycode = x11.XKeysymToKeycode(display, c.c_ulong(symbol))
+                assert xtest.XTestFakeKeyEvent(display, keycode, 1, 0)
+                assert xtest.XTestFakeKeyEvent(display, keycode, 0, 0)
         else:
             assert xtest.XTestFakeMotionEvent(display, -1, *point, 0)
             assert xtest.XTestFakeButtonEvent(display, button, 1, 0)
@@ -93,25 +112,33 @@ def daemon_status():
     return response["result"]
 
 
+def emblem_pixels(location):
+    x, y = location
+    # At the fixture's default grid zoom, the emblem sits at the top right.
+    return screen_crop(x + 46, y - 53, 24, 24)
+
+
 def perform_action(location, operation, status, emblem):
-    trigger = ROOT / "desktop-action"
     previous = len(events())
-    pending = trigger.with_suffix(".tmp")
-    pending.write_text(json.dumps([POSITIVE, operation]))
-    pending.rename(trigger)
+    x, y = location
+    # The menu overlaps the lower-right part of the visible thumbnail.
+    def menu_patch():
+        return screen_crop(x + 5, y + 4, 225, 220)
+
     input_event(1, location)
+    tile = menu_patch()
     input_event(3, location)
+    wait_for(f"visible {operation} menu", lambda: menu_patch() != tile)
+    assert ["menu", POSITIVE, [[f"OneDrive::{operation}", True]]] in events()
+    # Nautilus 51 places the single extension item just above Properties.
+    input_event(keys=(0xFF52, 0xFF52, 0xFF0D))  # Up, Up, Return
+    wait_for(f"closed {operation} menu", lambda: menu_patch() == tile)
 
     def observed():
         current = events()[previous:]
         return (
             ["status", POSITIVE, status] in current
             and ["emblem", POSITIVE, emblem] in current
-            and any(
-                event[:2] == ["menu", POSITIVE]
-                and [f"OneDrive::{operation}", True] in event[2]
-                for event in current
-            )
         )
 
     reply = wait_for(
@@ -124,8 +151,9 @@ def perform_action(location, operation, status, emblem):
     )
     assert reply[3] is None, reply
     wait_for(f"{operation} status and emblem refresh", observed)
-    assert not trigger.exists()
-    input_event()
+    state, pin = status.split(":")
+    assert os.getxattr(MOUNT / POSITIVE, "user.onedrive.state") == state.encode()
+    assert os.getxattr(MOUNT / POSITIVE, "user.onedrive.pin") == pin.encode()
 
 
 def verify(mode):
@@ -138,6 +166,7 @@ def verify(mode):
         version = subprocess.run(
             [*nautilus, "--version"], check=True, capture_output=True, text=True, timeout=4,
         )
+        print(version.stdout.strip())
         assert version.stdout.strip().startswith("GNOME nautilus 51."), version.stdout
         if mode == "retention":
             wait_for("fixture sync", lambda: daemon_status()["sync_state"] == "idle")
@@ -146,6 +175,9 @@ def verify(mode):
             for name in (POSITIVE, NEGATIVE):
                 wait_for(name, lambda: ["status", name, "Cloud-only:none"] in events())
                 assert ["emblem", name, "folder-remote-symbolic"] in events()
+            assert ["thumbnail-policy", "local-only"] in events()
+            assert thumbnail_size(POSITIVE, "x-large") == (512, 256)
+            assert thumbnail_size(NEGATIVE, "fail/gnome-thumbnail-factory") == (1, 1)
             seeded = thumbnail_attributes(POSITIVE)
             missing = thumbnail_attributes(NEGATIVE)
             assert seeded.get_attribute_boolean("thumbnail::is-valid")
@@ -164,10 +196,17 @@ def verify(mode):
                     [[name, 0, 65536] for name in (POSITIVE, NEGATIVE)]
                 ), reads
                 print(f"Nautilus source reads before Pin: {reads}")
+                unselected = emblem_pixels(location)
+                input_event(1, location)
+                cloud_only = wait_for(
+                    "selected tile", lambda: (pixels := emblem_pixels(location)) != unselected and pixels,
+                )
                 perform_action(location, "pin", "Hydrated:pinned", "starred-symbolic")
                 assert daemon_status()["pinned_cache_bytes"] == 12 * 1024 * 1024
+                wait_for("visible pinned emblem", lambda: emblem_pixels(location) != cloud_only)
                 perform_action(location, "purge", "Cloud-only:none", "folder-remote-symbolic")
                 assert daemon_status()["pinned_cache_bytes"] == 0
+                wait_for("visible Cloud-only emblem", lambda: emblem_pixels(location) == cloud_only)
                 print("Nautilus Pin and Purge updated the daemon cache and refreshed emblems.")
             else:
                 input_event(1, location)

@@ -452,8 +452,15 @@ assert not factory.can_thumbnail(failed, "image/x-jp2-codestream", 1700000000)
             .output()
             .unwrap()
     };
-    assert!(list(&mount).status.success());
-    assert!(list(code.parent().unwrap()).status.success());
+    let seeded_listing = list(&mount);
+    assert!(seeded_listing.status.success(), "{seeded_listing:?}");
+    assert!(String::from_utf8_lossy(&seeded_listing.stdout).contains("failed.j2k"));
+    let code_listing = list(code.parent().unwrap());
+    assert!(code_listing.status.success(), "{code_listing:?}");
+    assert!(
+        code_listing.stdout.starts_with(b"script.ts\t"),
+        "{code_listing:?}"
+    );
     let unseen_folder = unseen.parent().unwrap();
     let error = fs::read_dir(unseen_folder)
         .unwrap()
@@ -469,7 +476,9 @@ assert not factory.can_thumbnail(failed, "image/x-jp2-codestream", 1700000000)
     assert_eq!(drive.thumbnail_list_requests(), ["root"]);
 
     network.offline.store(false, Ordering::Relaxed);
-    assert!(list(unseen.parent().unwrap()).status.success());
+    let retried = list(unseen_folder);
+    assert!(retried.status.success(), "{retried:?}");
+    assert!(retried.stdout.starts_with(b"retry.qoi\t"), "{retried:?}");
     assert_eq!(drive.thumbnail_list_requests(), ["root", "unseen"]);
     assert_eq!(events.next().unwrap_err(), rustix::io::Errno::AGAIN);
     assert!(drive.range_requests().is_empty());

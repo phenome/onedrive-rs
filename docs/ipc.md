@@ -67,19 +67,23 @@ After signing in, run `onedrive-rs daemon` in the foreground. The default mount
 is `$XDG_RUNTIME_DIR/onedrive`. The daemon creates the mount directory if needed
 and requires it to be empty. The catalog and delta checkpoint are stored in
 `$XDG_DATA_HOME/onedrive-rs/catalog.sqlite3` (default
-`~/.local/share/onedrive-rs/catalog.sqlite3`). File content is cached under
+`~/.local/share/onedrive-rs/catalog.sqlite3`). Dirty staging lives beside the
+catalog in `catalog.sqlite3.staging`. File content is cached under
 `$XDG_CACHE_HOME/onedrive-rs` (default `~/.cache/onedrive-rs`).
 
 Delta sync runs on startup and then every `delta_poll_interval_secs`, measured
 from the completion of the previous background pass. The default is 60 seconds.
-`pause` prevents new background passes and lets any active pass finish.
-`sync` can run while paused. `resume` wakes the background poller. SIGINT and
+`pause` prevents new background delta passes and suspends the upload worker.
+An active delta pass can finish. `sync` can run while paused and drains pending
+uploads after a successful delta pass. `resume` wakes both workers. SIGINT and
 SIGTERM end requests in flight, unmount the filesystem, and remove the socket.
-Committed delta pages and cache files survive the restart.
+Committed delta pages, dirty staging, and cache files survive the restart.
+A catalog from the earlier XDG state layout is checkpointed and moved when
+the two directories are on the same filesystem. Startup reports an error if
+both locations contain catalogs or if the filesystem move fails.
 
 Status reports cached content bytes, the cache filesystem's free disk floor,
-and the count of catalog entries marked Dirty or Uploading. A second sync
-request returns an error while a delta pass is active. Pin and sync requests
-can run for up to five minutes. The daemon reserves connection capacity for
-short requests while these operations run. The uploads queue awaits writeback
-integration.
+and the count of queued uploads. A second sync request returns an error while
+a delta pass is active. Pin and sync requests can run for up to five minutes.
+The daemon reserves connection capacity for short requests while these
+operations run.

@@ -19,6 +19,7 @@ mod catalog_invalidation;
 mod retention;
 mod sparse_cache;
 mod thumbnails;
+mod writeback;
 
 pub(crate) use catalog_invalidation::{CatalogInvalidation, CatalogObserver};
 pub use retention::CacheStatus;
@@ -37,6 +38,8 @@ pub enum EngineError {
     Catalog(#[from] rusqlite::Error),
     #[error("metadata catalog requires SQLite WAL mode")]
     WalUnavailable,
+    #[error("could not checkpoint the catalog for relocation")]
+    CatalogRelocation,
     #[error("another engine advanced the delta checkpoint")]
     SyncSuperseded,
     #[error("item does not exist")]
@@ -49,6 +52,16 @@ pub enum EngineError {
     LowDisk,
     #[error("cannot read a directory as a file")]
     IsDirectory,
+    #[error("item is not a directory")]
+    NotDirectory,
+    #[error("directory is not empty")]
+    NotEmpty,
+    #[error("name already exists")]
+    AlreadyExists,
+    #[error("invalid file name or operation")]
+    InvalidMutation,
+    #[error("top-level .Trash directories are prohibited")]
+    TrashProhibited,
     #[error("sparse cache I/O error")]
     CacheIo(#[from] io::Error),
     #[error("thumbnail cache I/O error")]
@@ -80,6 +93,11 @@ pub struct CatalogItem {
     pub last_accessed_at: Option<i64>,
     pub pin_state: PinState,
     pub sync_state: SyncState,
+    pub intended_name: String,
+    pub mode: Option<u16>,
+    pub local_atime: Option<i64>,
+    pub local_mtime: Option<i64>,
+    pub unlinked: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,12 +145,17 @@ pub struct Engine {
     config: Config,
     hydrating: tokio::sync::Mutex<()>,
     hydration_paused_low_disk: AtomicBool,
+    writeback: writeback::Writeback,
     observers: Mutex<Vec<Weak<catalog_invalidation::Observer>>>,
 }
 
 const ITEM_COLUMNS: &str =
     "inode, item_id, parent_id, coalesce(alias, name), kind, size, mtime, etag, ctag, quickxor_hash, last_accessed_at, sync_state,
-     (SELECT pin_state FROM pin_directives WHERE item_id = items.item_id)";
+     (SELECT pin_state FROM pin_directives WHERE item_id = items.item_id),
+     (SELECT mode FROM local_attributes WHERE inode = items.inode),
+     (SELECT atime FROM local_attributes WHERE inode = items.inode),
+     (SELECT mtime FROM local_attributes WHERE inode = items.inode),
+     EXISTS (SELECT 1 FROM writeback_queue WHERE inode = items.inode AND deleted), name";
 
 impl Engine {
     pub fn open(
@@ -155,6 +178,19 @@ impl Engine {
         Self::open_with_config(database, cache_dir, cloud, clock, Config::default())
     }
 
+    /// Prepare an offline catalog for an atomic filesystem move.
+    /// The caller holds exclusive access to both catalog locations.
+    pub fn checkpoint_for_relocation(database: &Path) -> Result<(), EngineError> {
+        let db =
+            Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        // Exiting WAL mode folds committed frames into the main database.
+        let mode: String = db.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+        if mode != "delete" {
+            return Err(EngineError::CatalogRelocation);
+        }
+        Ok(())
+    }
+
     pub fn open_with_config(
         database: impl AsRef<Path>,
         cache_dir: impl AsRef<Path>,
@@ -162,7 +198,7 @@ impl Engine {
         clock: Arc<dyn Clock>,
         config: Config,
     ) -> Result<Self, EngineError> {
-        let mut db = Connection::open(database)?;
+        let mut db = Connection::open(database.as_ref())?;
         db.pragma_update(None, "foreign_keys", true)?;
         let journal: String = db.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         if !journal.eq_ignore_ascii_case("wal") {
@@ -176,8 +212,10 @@ impl Engine {
         transaction.commit()?;
         catalog_invalidation::install(&db)?;
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
+        let writeback = writeback::Writeback::open(database.as_ref(), &mut db)?;
         let engine = Self {
             cache,
+            writeback,
             thumbnails: ThumbnailCache::default(),
             db: Mutex::new(db),
             cloud,
@@ -267,6 +305,11 @@ impl Engine {
                 DeltaCursor::Next(link) => (link, false),
                 DeltaCursor::Complete(link) => (link, true),
             };
+            transaction.execute(
+                "DELETE FROM writeback_recycled WHERE EXISTS (
+                    SELECT 1 FROM delta_checkpoint WHERE singleton = 1 AND full_scan AND link IS NULL
+                )", [],
+            )?;
             advance_checkpoint(transaction, revision, Some(&link))?;
             let full_scan = transaction.query_row(
                 "SELECT full_scan FROM delta_checkpoint WHERE singleton = 1",
@@ -299,8 +342,16 @@ impl Engine {
         &self,
         update: impl FnOnce(&Transaction<'_>) -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
+        self.update_catalog_after(update, |_| {})
+    }
+
+    fn update_catalog_after<T>(
+        &self,
+        update: impl FnOnce(&Transaction<'_>) -> Result<T, EngineError>,
+        committed: impl FnOnce(&T),
+    ) -> Result<T, EngineError> {
         let mut db = self.db();
-        let transaction = db.transaction()?;
+        let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM changed_inodes", [])?;
         transaction.execute("DELETE FROM changed_entries", [])?;
         let result = update(&transaction)?;
@@ -315,6 +366,7 @@ impl Engine {
             catalog_invalidation::collect(&transaction)?
         };
         transaction.commit()?;
+        committed(&result);
         drop(db);
         for observer in observers {
             observer(&invalidations);
@@ -374,11 +426,9 @@ impl Engine {
     }
 
     pub fn pending_upload_count(&self) -> Result<u64, EngineError> {
-        Ok(self.db().query_row(
-            "SELECT count(*) FROM items WHERE sync_state IN (?1, ?2)",
-            params![SyncState::Dirty as i64, SyncState::Uploading as i64],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .db()
+            .query_row("SELECT count(*) FROM writeback_queue", [], |row| row.get(0))?)
     }
 
     pub fn root(&self) -> Result<Option<CatalogItem>, EngineError> {
@@ -409,7 +459,7 @@ impl Engine {
             .db()
             .prepare_cached(
                 "SELECT inode, kind, coalesce(alias, name)
-                 FROM items WHERE parent_id = ?1 ORDER BY coalesce(alias, name), inode",
+                 FROM items WHERE parent_id = ?1 AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted) ORDER BY coalesce(alias, name), inode",
             )?
             .query_map([parent_id], |row| {
                 Ok((row.get(0)?, item_kind(row, 1)?, row.get(2)?))
@@ -449,7 +499,7 @@ impl Engine {
 
 fn list_children(db: &Connection, parent_id: &str) -> rusqlite::Result<Vec<CatalogItem>> {
     db.prepare_cached(&format!(
-        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 ORDER BY coalesce(alias, name), inode"
+        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted) ORDER BY coalesce(alias, name), inode"
     ))?
     .query_map([parent_id], catalog_item)?
     .collect()
@@ -487,7 +537,8 @@ fn root(db: &Connection) -> rusqlite::Result<Option<CatalogItem>> {
 
 fn lookup(db: &Connection, parent_id: &str, name: &str) -> rusqlite::Result<Option<CatalogItem>> {
     db.prepare_cached(&format!(
-        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND coalesce(alias, name) = ?2"
+        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND coalesce(alias, name) = ?2
+         AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted)"
     ))?
     .query_row(params![parent_id, name], catalog_item)
     .optional()
@@ -531,6 +582,12 @@ fn catalog_item(row: &Row<'_>) -> rusqlite::Result<CatalogItem> {
         quickxor_hash: row.get(9)?,
         last_accessed_at: row.get(10)?,
         sync_state: row.get(11)?,
+        intended_name: row.get(17)?,
+        mode: row.get(13)?,
+        local_atime: row.get(14)?,
+        local_mtime: row.get(15)?,
+        unlinked: row.get(16)?,
+
         pin_state: row
             .get::<_, Option<PinState>>(12)?
             .unwrap_or(PinState::None),
@@ -564,6 +621,10 @@ fn apply_change(
     match change {
         DeltaChange::Delete(item_id) => {
             affected.record_item(transaction, &item_id)?;
+            transaction.execute(
+                "DELETE FROM writeback_recycled WHERE item_id = ?1",
+                [&item_id],
+            )?;
             transaction
                 .prepare_cached("INSERT OR IGNORE INTO delta_deletions VALUES (?1)")?
                 .execute([item_id])?;
@@ -571,7 +632,14 @@ fn apply_change(
         DeltaChange::Upsert(item) => {
             affected.record_item(transaction, &item.item_id)?;
             record_sighting(transaction, &item.item_id, full_scan)?;
-            if let Some(name) = &item.name {
+            let suppressed = transaction.query_row(
+                "SELECT EXISTS (SELECT 1 FROM writeback_recycled WHERE item_id = ?1)
+                     OR EXISTS (SELECT 1 FROM writeback_attempts WHERE remote_id IS NULL AND parent_id = ?2 AND name = ?3)
+                     OR EXISTS (SELECT 1 FROM writeback_temporary_names WHERE item_id = ?1 AND name = ?3)",
+                params![item.item_id, item.parent_id, item.name],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !suppressed && let Some(name) = &item.name {
                 affected.insert(item.parent_id.clone(), name.clone());
                 upsert_remote_item(transaction, item, revision, position)?;
             }
@@ -598,7 +666,8 @@ fn upsert_remote_item(
              size = excluded.size, mtime = excluded.mtime, etag = excluded.etag,
              ctag = excluded.ctag, quickxor_hash = excluded.quickxor_hash,
              claim_revision = excluded.claim_revision, claim_position = excluded.claim_position
-         WHERE items.sync_state = 0",
+         WHERE items.sync_state IN (0, 3)
+           AND items.inode NOT IN (SELECT inode FROM writeback_queue)",
         )?
         .execute(params![
             reserved_inode(&item),

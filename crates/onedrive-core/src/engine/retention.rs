@@ -91,13 +91,10 @@ impl Engine {
                     "{SUBTREE} SELECT i.item_id, i.sync_state FROM items i JOIN subtree USING (item_id)
                  WHERE i.sync_state <> 0 ORDER BY i.sync_state, i.inode LIMIT 1",
                 ))?
-                .query_row([item_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_row([item_id], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))
                 .optional()?;
             if let Some((item_id, state)) = protected {
-                return Err(match state {
-                    SyncState::Conflict => EngineError::UnresolvedConflict { item_id },
-                    _ => EngineError::PendingUpload { item_id },
-                });
+                super::writeback::refuse_purge(&item_id, state)?;
             }
 
             let pin = unpin_directive(tx, item.parent_id.as_deref())?;

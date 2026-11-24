@@ -139,7 +139,7 @@ impl SparseCache {
 
     // Independent engines opening the same catalog coordinate publication and
     // reclamation. Always acquire this lock before consulting the catalog.
-    fn lock_disk(&self) -> io::Result<File> {
+    pub(super) fn lock_disk(&self) -> io::Result<File> {
         let directory = File::open(&self.root)?;
         flock(&directory, FlockOperation::LockExclusive)?;
         Ok(directory)
@@ -148,6 +148,40 @@ impl SparseCache {
     fn remove_generation(&self, generation: i64) -> bool {
         let removed = fs::remove_dir_all(self.path(generation));
         removed.is_ok() || removed.is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+    }
+
+    pub(super) fn retain_upload(
+        &self,
+        directory: &File,
+        db: &Connection,
+        inode: u64,
+        size: u64,
+        source: &File,
+    ) -> Result<(), EngineError> {
+        db.execute("DELETE FROM sparse_files WHERE inode = ?1", [inode])?;
+        db.execute("INSERT INTO sparse_files (inode) VALUES (?1)", [inode])?;
+        let generation = db.last_insert_rowid();
+        // A rolled-back transaction can leave an unpublished directory.
+        if !self.remove_generation(generation) {
+            return Err(io::Error::other("could not clear unpublished cache generation").into());
+        }
+        // Keep a warm prefix without expanding a large sparse stage on disk
+        // or holding the catalog lock across a full-file copy.
+        for offset in (0..size.min(4 * STREAM_BYTES)).step_by(STREAM_BYTES as usize) {
+            let block = Block::Stream(offset);
+            let mut bytes = vec![0; (size - offset).min(STREAM_BYTES) as usize];
+            source.read_exact_at(&mut bytes, offset)?;
+            let stamp = self.write_block(directory, generation, block, &bytes)?;
+            db.execute(
+                "INSERT INTO sparse_ranges VALUES (?1, ?2)",
+                params![generation, block.key()],
+            )?;
+            db.execute(
+                "INSERT INTO sparse_range_files VALUES (?1, ?2, ?3)",
+                params![generation, block.key(), stamp],
+            )?;
+        }
+        Ok(())
     }
 
     fn lock(&self, generation: i64, stream_offset: u64) -> Arc<AsyncMutex<()>> {
@@ -260,6 +294,12 @@ impl Engine {
                 }
                 if offset >= item.size || length == 0 {
                     return Ok(Vec::new());
+                }
+                if let Some(stage) = self.open_stage(&tx, inode)? {
+                    let end = offset.saturating_add(length as u64).min(item.size);
+                    let mut bytes = vec![0; (end - offset) as usize];
+                    stage.read_exact_at(&mut bytes, offset)?;
+                    return Ok(bytes);
                 }
                 let generation = allocate_generation(&tx, inode)?;
                 tx.commit()?;

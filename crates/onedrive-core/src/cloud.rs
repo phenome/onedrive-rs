@@ -1,4 +1,6 @@
 use std::fmt;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -40,6 +42,75 @@ pub trait CloudDrive: Send + Sync {
         Err(CloudError::Unsupported)
     }
 
+    /// Upload from an immutable seekable source. Legacy adapters can handle a
+    /// bounded small upload through their byte-slice implementation.
+    async fn upload_from(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        if source.len() > 10 * 1024 * 1024 {
+            return Err(CloudError::Unsupported);
+        }
+        self.upload(target, &source.read(0, source.len()).await?, if_match)
+            .await
+    }
+
+    /// Resolve the current upload destination. Absence is represented by None.
+    async fn upload_destination(
+        &self,
+        _target: UploadTarget<'_>,
+    ) -> Result<Option<RemoteItem>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    /// Confirm the destination's identity and stable version against the source.
+    /// None means the request can be retried with its original precondition.
+    async fn confirm_upload(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<Option<RemoteItem>, CloudError> {
+        let Some(item) = self.upload_destination(target).await? else {
+            return Ok(None);
+        };
+        if item.etag.is_none() {
+            return Err(CloudError::Unavailable);
+        }
+        if item.etag.as_deref() == if_match {
+            return Ok(None);
+        }
+        let mut matches = item.kind == ItemKind::File && item.size == source.len() as u64;
+        if matches {
+            const BLOCK: usize = 1024 * 1024;
+            for offset in (0..source.len()).step_by(BLOCK) {
+                let length = (source.len() - offset).min(BLOCK);
+                if self
+                    .read_range(&item.item_id, offset as u64, length)
+                    .await?
+                    != source.read(offset, length).await?
+                {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        let current = self
+            .upload_destination(target)
+            .await?
+            .ok_or(CloudError::Unavailable)?;
+        if current.item_id != item.item_id || current.etag != item.etag {
+            return Err(CloudError::Unavailable);
+        }
+        if matches {
+            Ok(Some(current))
+        } else {
+            Err(CloudError::Conflict)
+        }
+    }
+
     async fn create_folder(&self, _parent_id: &str, _name: &str) -> Result<RemoteItem, CloudError> {
         Err(CloudError::Unsupported)
     }
@@ -53,6 +124,10 @@ pub trait CloudDrive: Send + Sync {
         Err(CloudError::Unsupported)
     }
 
+    async fn delete_if_match(&self, _item_id: &str, _etag: &str) -> Result<(), CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
     async fn delete_item(&self, _item_id: &str) -> Result<(), CloudError> {
         Err(CloudError::Unsupported)
     }
@@ -63,6 +138,45 @@ pub trait CloudDrive: Send + Sync {
 pub struct RemoteThumbnail {
     pub item_id: String,
     pub url: String,
+}
+
+#[derive(Clone, Copy)]
+pub enum UploadSource<'a> {
+    Bytes(&'a [u8]),
+    File { file: &'a File, size: usize },
+}
+
+impl UploadSource<'_> {
+    pub fn len(self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::File { size, .. } => size,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub async fn read(self, offset: usize, length: usize) -> Result<Vec<u8>, CloudError> {
+        if offset > self.len() || length > self.len() - offset {
+            return Err(CloudError::InvalidResponse);
+        }
+        match self {
+            Self::Bytes(bytes) => Ok(bytes[offset..offset + length].to_vec()),
+            Self::File { file, .. } => {
+                let file = file.try_clone().map_err(|_| CloudError::Unavailable)?;
+                tokio::task::spawn_blocking(move || {
+                    let mut bytes = vec![0; length];
+                    file.read_exact_at(&mut bytes, offset as u64)
+                        .map_err(|_| CloudError::Unavailable)?;
+                    Ok(bytes)
+                })
+                .await
+                .map_err(|_| CloudError::Unavailable)?
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

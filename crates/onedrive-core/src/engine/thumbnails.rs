@@ -117,6 +117,7 @@ struct Target {
     item_id: String,
     metadata: TargetMetadata,
     filename: String,
+    pending_move: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -163,9 +164,23 @@ impl Directory {
             .filter(|entry| is_thumbnailable(entry))
             .peekable();
         if media.peek().is_some() {
+            // Staged files can be thumbnailed from their local bytes. A Graph
+            // rendition can be stale or unavailable until writeback completes.
+            let pending = snapshot
+                .prepare_cached(
+                    "SELECT items.inode, stage IS NOT NULL, remote_parent IS NOT items.parent_id
+                     FROM items JOIN writeback_queue USING (inode) WHERE items.parent_id = ?1",
+                )?
+                .query_map([folder_id], |row| {
+                    Ok((row.get::<_, u64>(0)?, (row.get(1)?, row.get(2)?)))
+                })?
+                .collect::<Result<HashMap<u64, (bool, bool)>, _>>()?;
             let relative = path_for(&snapshot, folder_id)?.ok_or(EngineError::NotFound)?;
             let path = mountpoint.join(relative.strip_prefix("/").expect("absolute catalog path"));
-            targets.extend(media.map(|entry| Target::new(entry, &path)));
+            targets.extend(media.filter_map(|entry| {
+                let (staged, moved) = pending.get(&entry.inode).copied().unwrap_or_default();
+                (!staged).then(|| Target::new(entry, &path, moved))
+            }));
         }
         Ok(Self { entries, targets })
     }
@@ -204,16 +219,26 @@ impl Engine {
             if unseeded.is_empty() {
                 return Ok(directory.entries);
             }
-            let renditions: HashMap<_, _> = self
-                .cloud
-                .list_thumbnails(folder_id)
-                .await?
-                .into_iter()
-                .map(|thumbnail| (thumbnail.item_id.clone(), thumbnail))
-                .collect();
+            // A pending move may target a folder that does not yet exist on
+            // OneDrive. Seed a temporary failure marker until it reaches Graph.
+            let renditions: HashMap<_, _> = if unseeded.iter().any(|target| !target.pending_move) {
+                self.cloud
+                    .list_thumbnails(folder_id)
+                    .await?
+                    .into_iter()
+                    .map(|thumbnail| (thumbnail.item_id.clone(), thumbnail))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
             let results: Vec<_> = stream::iter(unseeded)
                 .map(|target| {
-                    self.prepare_thumbnail(target, renditions.get(&target.item_id), thumbnail_root)
+                    let rendition = if target.pending_move {
+                        None
+                    } else {
+                        renditions.get(&target.item_id)
+                    };
+                    self.prepare_thumbnail(target, rendition, thumbnail_root)
                 })
                 .buffer_unordered(CONCURRENT_THUMBNAILS)
                 .collect()
@@ -320,21 +345,25 @@ fn thumbnail_pixels(bytes: Option<Vec<u8>>) -> Result<RgbaImage, EngineError> {
 }
 
 impl Target {
-    fn new(entry: &CatalogItem, folder: &Path) -> Self {
+    fn new(entry: &CatalogItem, folder: &Path, pending_move: bool) -> Self {
         let uri = file_uri(&folder.join(&entry.name));
         let filename = format!("{:x}.png", md5::compute(&uri));
         // A different item or content generation can occupy the same URI and second.
-        let content = format!(
+        let mut content = format!(
             "{:x}:{:x}:{}",
             md5::compute(&entry.item_id),
             md5::compute(entry.ctag.as_deref().unwrap_or_default()),
             entry.size
         );
+        if pending_move {
+            content.push_str(":pending-move");
+        }
         Self {
             item_id: entry.item_id.clone(),
+            pending_move,
             metadata: TargetMetadata {
                 uri,
-                mtime: entry.mtime.to_string(),
+                mtime: entry.local_mtime.unwrap_or(entry.mtime).to_string(),
                 content,
                 size: entry.size.to_string(),
             },

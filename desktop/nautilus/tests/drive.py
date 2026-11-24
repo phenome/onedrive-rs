@@ -133,7 +133,9 @@ def perform_action(location, operation, status, emblem):
     tile = menu_patch()
     input_event(3, location)
     wait_for(f"visible {operation} menu", lambda: menu_patch() != tile)
-    assert ["menu", POSITIVE, [[f"OneDrive::{operation}", True]]] in events()
+    wait_for(f"{operation} context action", lambda: (
+        ["menu", POSITIVE, [[f"OneDrive::{operation}", True]]] in events()
+    ))
     # Nautilus 51 places the single extension item just above Properties.
     for symbol in (0xFF52, 0xFF52, 0xFF0D):  # Up, Up, Return
         # Let GTK finish opening the popover and move focus between key events.
@@ -197,12 +199,12 @@ def verify_external_changes(location, cloud_only):
                            "Hydrated:pinned", "starred-symbolic", ["purge"], cloud_only)
     hydrated = check_refresh(lambda: cli("unpin", VIEW),
                              "Hydrated:none", "object-select-symbolic", ["pin", "purge"], pinned)
-    purged = check_refresh(lambda: cli("purge", VIEW / POSITIVE),
-                           "Cloud-only:none", "folder-remote-symbolic", ["pin"], hydrated)
-    assert purged == cloud_only
+    check_refresh(lambda: cli("purge", VIEW / POSITIVE),
+                  "Cloud-only:none", "folder-remote-symbolic", ["pin"], hydrated)
+    wait_for("visible Cloud-only emblem after CLI Purge", lambda: emblem_pixels(location) == cloud_only)
     check_refresh(lambda: subprocess.run(
         ["cat", os.fspath(VIEW / POSITIVE)], stdout=subprocess.DEVNULL, check=True, timeout=5,
-    ), "Hydrated:none", "object-select-symbolic", ["pin", "purge"], purged)
+    ), "Hydrated:none", "object-select-symbolic", ["pin", "purge"], cloud_only)
     print("CLI Sticky Pin, Unpin, Purge and read hydration refreshed the same tile and context actions.")
 
 

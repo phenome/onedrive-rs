@@ -181,13 +181,18 @@ impl CloudDrive for InFlightRange {
         self.fake.delta(request).await
     }
 
-    async fn read_range(
+    async fn read_range_at_version(
         &self,
         item: &str,
+        etag: Option<&str>,
+        ctag: Option<&str>,
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, CloudError> {
-        let bytes = self.fake.read_range(item, offset, length).await?;
+        let bytes = self
+            .fake
+            .read_range_at_version(item, etag, ctag, offset, length)
+            .await?;
         if offset == self.pause_offset && self.pause_once.swap(false, Ordering::Relaxed) {
             self.captured.notify_one();
             self.resume.notified().await;
@@ -203,7 +208,7 @@ async fn eviction_reclaims_over_budget_partial_bytes_after_read_cancellation() {
     let (cloud, engine) = InFlightRange::open_at(&temp, fake.clone(), STREAM as u64, 32 * 1024);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         tokio::select! {
-            result = engine.read(inode, 0, original.len()) => panic!("read finished early: {result:?}"),
+            result = engine.read(inode, 0, original.len()) => panic!("read finished early: {:?}", result.map(|bytes| bytes.len())),
             () = cloud.captured.notified() => (),
         }
     })
@@ -508,5 +513,156 @@ async fn sync_recovers_damaged_content_for_an_existing_pin() {
         bytes.len() as u64
     );
     assert_eq!(engine.read(inode, 0, bytes.len()).await.unwrap(), bytes);
+    assert_eq!(drive.range_requests().len(), 2);
+}
+
+struct UnversionedDrive(Arc<FakeCloudDrive>);
+
+#[async_trait]
+impl CloudDrive for UnversionedDrive {
+    async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
+        self.0.delta(request).await
+    }
+
+    async fn read_range(
+        &self,
+        item: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        self.0.read_range(item, offset, length).await
+    }
+}
+
+#[tokio::test]
+async fn unversioned_blocks_never_combine_or_establish_multiblock_hydration() {
+    let (temp, drive, engine, inode, original) = setup(STREAM + 100).await;
+    drop(engine);
+    let engine = Engine::open_with_cache(
+        temp.path().join("metadata.db"),
+        temp.path().join("cache"),
+        Arc::new(UnversionedDrive(drive.clone())),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.read(inode, 0, STREAM).await.unwrap(),
+        original[..STREAM]
+    );
+    let replacement = vec![23; original.len()];
+    drive.set_content("file", replacement.clone());
+    assert_eq!(
+        engine.read(inode, STREAM as u64, 100).await.unwrap(),
+        replacement[STREAM..]
+    );
+    assert_eq!(
+        engine.read(inode, 0, original.len()).await.unwrap(),
+        replacement
+    );
+    assert_eq!(
+        drive.range_requests(),
+        [
+            ("file".into(), 0, STREAM),
+            ("file".into(), STREAM as u64, STREAM),
+            ("file".into(), 0, original.len()),
+        ]
+    );
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Cloud-only"
+    );
+    engine.pin("file").await.unwrap();
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.pin").unwrap().unwrap(),
+        b"pinned"
+    );
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Hydrated"
+    );
+    drive.set_content("file", vec![80; original.len()]);
+    assert_eq!(
+        engine.read(inode, 0, original.len()).await.unwrap(),
+        replacement
+    );
+    assert_eq!(drive.range_requests().len(), 4);
+}
+
+#[tokio::test]
+async fn etag_change_retires_ranges_only_without_a_stable_ctag() {
+    let (_temp, drive, engine, inode, original) = setup(8192).await;
+    engine.read(inode, 0, original.len()).await.unwrap();
+    let mut item = fixture_file(original.len());
+    item.etag = Some("metadata-only".into());
+    drive.upsert(item.clone());
+    engine.sync().await.unwrap();
+    assert_eq!(
+        engine.read(inode, 0, original.len()).await.unwrap(),
+        original
+    );
+    assert_eq!(drive.range_requests().len(), 1);
+
+    item.ctag = None;
+    drive.upsert(item.clone());
+    engine.sync().await.unwrap();
+    engine.read(inode, 0, original.len()).await.unwrap();
+    item.etag = Some("replacement".into());
+    drive.upsert(item);
+    let replacement = vec![42; original.len()];
+    drive.set_content("file", replacement.clone());
+    engine.sync().await.unwrap();
+    assert_eq!(
+        engine.read(inode, 0, original.len()).await.unwrap(),
+        replacement
+    );
+    assert_eq!(drive.range_requests().len(), 3);
+}
+
+#[tokio::test]
+async fn nonregular_cache_block_is_refetched() {
+    let (temp, drive, engine, inode, bytes) = setup(8192).await;
+    engine.read(inode, 0, bytes.len()).await.unwrap();
+    let generation = std::fs::read_dir(cache_namespace(&temp))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let block = generation.join("-1");
+    std::fs::remove_file(&block).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(block).unwrap();
+    assert_eq!(engine.read(inode, 0, bytes.len()).await.unwrap(), bytes);
+    assert_eq!(drive.range_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn upgrade_retires_stale_etag_only_ranges() {
+    let (temp, drive, engine, inode, original) = setup(8192).await;
+    let mut item = fixture_file(original.len());
+    item.ctag = None;
+    drive.upsert(item.clone());
+    engine.sync().await.unwrap();
+    engine.read(inode, 0, original.len()).await.unwrap();
+    drop(engine);
+
+    item.etag = Some("replacement".into());
+    let db = rusqlite::Connection::open(temp.path().join("metadata.db")).unwrap();
+    db.execute_batch("PRAGMA user_version = 0; DROP TRIGGER sparse_invalidate_on_content_change;")
+        .unwrap();
+    db.execute(
+        "UPDATE items SET etag = ?1 WHERE inode = ?2",
+        rusqlite::params![item.etag, inode],
+    )
+    .unwrap();
+    drop(db);
+    drive.upsert(item);
+    let replacement = vec![42; original.len()];
+    drive.set_content("file", replacement.clone());
+    let engine = open(&temp, &drive);
+    assert_eq!(
+        engine.read(inode, 0, original.len()).await.unwrap(),
+        replacement
+    );
     assert_eq!(drive.range_requests().len(), 2);
 }

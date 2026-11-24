@@ -84,8 +84,9 @@ CREATE TABLE IF NOT EXISTS sparse_retired (
 CREATE TABLE IF NOT EXISTS sparse_preserve_on_move (inode INTEGER PRIMARY KEY);
 DROP TRIGGER IF EXISTS sparse_invalidate_on_content_change;
 CREATE TRIGGER sparse_invalidate_on_content_change
-AFTER UPDATE OF ctag, mtime, size, kind ON items
+AFTER UPDATE OF ctag, etag, mtime, size, kind ON items
 WHEN (OLD.ctag IS NOT NEW.ctag OR OLD.mtime IS NOT NEW.mtime
+     OR (NEW.ctag IS NULL AND OLD.etag IS NOT NEW.etag)
      OR OLD.size IS NOT NEW.size OR OLD.kind IS NOT NEW.kind)
      AND NOT EXISTS (SELECT 1 FROM sparse_preserve_on_move WHERE inode = NEW.inode)
 BEGIN
@@ -181,6 +182,8 @@ CREATE TABLE IF NOT EXISTS writeback_missing_ranges (
     PRIMARY KEY (stage, start)
 );
 
+-- Each row proves a range can be combined within its cache generation.
+-- NULL tags describe bytes from one response or a retained local upload.
 CREATE TABLE IF NOT EXISTS sparse_range_versions (
     generation INTEGER NOT NULL,
     block INTEGER NOT NULL,

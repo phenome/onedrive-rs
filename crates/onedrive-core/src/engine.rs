@@ -213,6 +213,7 @@ impl Engine {
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("schema.sql"))?;
         crate::namespace::migrate(&transaction)?;
+        sparse_cache::retire_stale_etag_ranges(&transaction)?;
         retention::initialize_cached_access_times(&transaction, clock.as_ref())?;
         transaction.commit()?;
         catalog_invalidation::install(&db)?;

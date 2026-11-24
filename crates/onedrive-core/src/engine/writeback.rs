@@ -729,7 +729,7 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn open_file(&self, inode: u64, writable: bool) -> Result<bool, EngineError> {
+    pub(crate) fn open_file(&self, inode: u64) -> Result<(), EngineError> {
         let db = self.db();
         let item = item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?;
         if item.kind != ItemKind::File {
@@ -739,22 +739,12 @@ impl Engine {
         if queued.as_ref().is_some_and(|job| job.deleted) {
             return Err(EngineError::NotFound);
         }
-        // Kernel cache hits need not issue a FUSE read, even across opens.
+        // Refresh retention even if the caller only accesses mapped pages.
         db.execute("UPDATE items SET last_accessed_at = max(coalesce(last_accessed_at, 0), ?2)
                     WHERE inode = ?1 AND inode IN (SELECT inode FROM sparse_files WHERE inode = ?1)",
             params![inode, self.access_time()])?;
-        let stage = queued.as_ref().and_then(|job| job.stage.as_deref());
-        let sparse = if let Some(stage) = stage {
-            db.query_row(
-                "SELECT EXISTS (SELECT 1 FROM writeback_bases WHERE stage = ?1)",
-                [stage],
-                |row| row.get(0),
-            )?
-        } else {
-            writable && item.size != 0 && !super::sparse_cache::is_hydrated(&db, &item)?
-        };
         self.register_open(inode);
-        Ok(sparse)
+        Ok(())
     }
 
     pub(super) fn file_is_open(&self, inode: u64) -> bool {

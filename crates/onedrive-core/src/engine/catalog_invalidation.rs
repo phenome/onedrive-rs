@@ -36,6 +36,7 @@ pub(super) fn install(db: &Connection) -> rusqlite::Result<()> {
              INSERT INTO changed_inodes VALUES (
                  NEW.inode, OLD.kind IS NOT NEW.kind OR OLD.size IS NOT NEW.size
                             OR OLD.mtime IS NOT NEW.mtime OR OLD.ctag IS NOT NEW.ctag
+                            OR (NEW.ctag IS NULL AND OLD.etag IS NOT NEW.etag)
              );
          END;
          CREATE TEMP TRIGGER catalog_moved AFTER UPDATE OF parent_id, name, alias ON main.items

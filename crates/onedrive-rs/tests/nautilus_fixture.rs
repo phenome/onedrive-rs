@@ -31,15 +31,19 @@ impl CloudDrive for DesktopCloud {
         self.fake.download_thumbnail(thumb).await
     }
 
-    async fn read_range(
+    async fn read_range_at_version(
         &self,
         id: &str,
+        etag: Option<&str>,
+        ctag: Option<&str>,
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, CloudError> {
         let line = serde_json::to_string(&(id, offset, length)).unwrap();
         writeln!(self.reads.lock().unwrap(), "{line}").unwrap();
-        self.fake.read_range(id, offset, length).await
+        self.fake
+            .read_range_at_version(id, etag, ctag, offset, length)
+            .await
     }
 }
 
@@ -95,6 +99,7 @@ fn desktop_fixture_worker() {
             name: Some(name.into()),
             kind: ItemKind::File,
             size: original.len() as u64,
+            ctag: Some("content-1".into()),
             ..folder.clone()
         });
         fake.set_content(name, original.clone());

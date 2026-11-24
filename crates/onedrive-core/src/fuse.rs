@@ -94,6 +94,8 @@ impl FuseAdapter {
         let notifier = session.notifier();
         let (send, mut changes) =
             tokio::sync::mpsc::unbounded_channel::<Vec<CatalogInvalidation>>();
+        // Kernel invalidation can wait on a FUSE callback to finish. Keep
+        // the notifier off callback and catalog commit paths.
         runtime.spawn_blocking(move || {
             while let Some(changes) = changes.blocking_recv() {
                 for change in &changes {
@@ -283,16 +285,14 @@ impl Filesystem for FuseAdapter {
         &self,
         _req: &Request,
         ino: INodeNo,
-        flags: OpenFlags,
+        _flags: OpenFlags,
         _kill_suid_gid: bool,
         reply: ReplyOpen,
     ) {
-        let writable = flags.0 & rustix::fs::OFlags::ACCMODE.bits() as i32 != 0;
-        match self.engine.open_file(ino.0, writable) {
-            // The kernel page cache expands small reads to cover whole pages.
-            // An offline sparse stage may only have the requested bytes.
-            Ok(true) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_DIRECT_IO),
-            Ok(false) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_KEEP_CACHE),
+        match self.engine.open_file(ino.0) {
+            // Read through the Engine immediately after a catalog commit.
+            // mmap uses kernel pages and still needs asynchronous invalidation.
+            Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_DIRECT_IO),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -322,7 +322,7 @@ impl Filesystem for FuseAdapter {
                 &attributes(&item),
                 Generation(0),
                 FileHandle(item.inode),
-                FopenFlags::FOPEN_KEEP_CACHE,
+                FopenFlags::FOPEN_DIRECT_IO,
             ),
             Err(error) => reply.error(error),
         }

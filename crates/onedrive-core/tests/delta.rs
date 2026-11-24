@@ -456,6 +456,7 @@ async fn replacement_keeps_dirty_file_and_remote_file_reachable_in_either_delta_
             "new"
         );
         retained.name = "report (conflict 2).txt".into();
+        retained.intended_name = retained.name.clone();
         assert_eq!(
             engine.resolve_path("/report (conflict 2).txt").unwrap(),
             Some(retained.clone())
@@ -561,6 +562,7 @@ async fn full_resync_replacement_preserves_nested_dirty_paths_and_pins() {
         "new-file"
     );
     old.name = "Folder.v1 (conflict)".into();
+    old.intended_name = old.name.clone();
     assert_eq!(
         engine.resolve_path("/Folder.v1 (conflict)").unwrap(),
         Some(old)

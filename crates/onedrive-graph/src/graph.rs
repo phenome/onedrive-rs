@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use onedrive_core::{
     CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem, RemoteThumbnail, UploadTarget,
+    RemoteItem, RemoteThumbnail, UploadSource, UploadTarget,
 };
 use reqwest::header::{self, HeaderValue};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
@@ -116,7 +116,7 @@ impl GraphDrive {
     async fn resumable_upload(
         &self,
         target: UploadTarget<'_>,
-        bytes: &[u8],
+        source: UploadSource<'_>,
         if_match: Option<&str>,
     ) -> Result<RemoteItem, CloudError> {
         #[derive(Deserialize)]
@@ -140,17 +140,17 @@ impl GraphDrive {
         let mut final_uncertain = false;
 
         loop {
-            let end = (start + FRAGMENT_SIZE).min(bytes.len());
-            let final_fragment = end == bytes.len();
+            let end = (start + FRAGMENT_SIZE).min(source.len());
+            let final_fragment = end == source.len();
             let request = self
                 .client
                 .put(url.clone())
                 .header(
                     header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end - 1, bytes.len()),
+                    format!("bytes {}-{}/{}", start, end - 1, source.len()),
                 )
                 .header(header::CONTENT_LENGTH, end - start)
-                .body(bytes[start..end].to_vec());
+                .body(source.read(start, end - start).await?);
             let retry_error = match self.send(request).await {
                 Ok(response)
                     if final_fragment
@@ -162,7 +162,7 @@ impl GraphDrive {
                     break;
                 }
                 Ok(response) if response.status() == StatusCode::ACCEPTED => {
-                    let next = match next_upload_offset(response, bytes.len()).await {
+                    let next = match next_upload_offset(response, source.len()).await {
                         Ok(next) => next,
                         Err(_) if final_fragment || final_uncertain => break,
                         Err(error) => return Err(error),
@@ -208,7 +208,7 @@ impl GraphDrive {
             }
             recoveries += 1;
             let progress = match self.send(self.client.get(url.clone())).await {
-                Ok(status) => next_upload_offset(status, bytes.len()).await,
+                Ok(status) => next_upload_offset(status, source.len()).await,
                 Err(error) => Err(error),
             };
             match progress {
@@ -219,32 +219,36 @@ impl GraphDrive {
             }
         }
 
-        self.confirm_upload(target, bytes, if_match).await
+        self.confirm_upload(target, source, if_match)
+            .await?
+            .ok_or(CloudError::Unavailable)
     }
 
-    async fn confirm_upload(
+    async fn confirm_destination(
         &self,
         target: UploadTarget<'_>,
-        bytes: &[u8],
+        source: UploadSource<'_>,
         if_match: Option<&str>,
-    ) -> Result<RemoteItem, CloudError> {
+    ) -> Result<Option<RemoteItem>, CloudError> {
         let destination = match target {
             UploadTarget::Existing { item_id } => self.endpoint(&["items", item_id]),
             UploadTarget::New { parent_id, name } => {
                 self.endpoint(&["items", &format!("{parent_id}:"), name])
             }
         };
-        let item = self.upload_destination(&destination).await?;
+        let Some(item) = self.fetch_destination(&destination).await? else {
+            return Ok(None);
+        };
         let tag = item.etag.as_deref().filter(|tag| !tag.is_empty());
-        if !item.matches_destination(target)
-            || tag.is_none()
-            || (if_match != Some("*") && tag == if_match)
-        {
+        if !item.matches_destination(target) || tag.is_none() {
             return Err(CloudError::Unavailable);
+        }
+        if if_match != Some("*") && tag == if_match {
+            return Ok(None);
         }
         let matches = if item.file.is_some()
             && item.folder.is_none()
-            && item.size == Some(bytes.len() as u64)
+            && item.size == Some(source.len() as u64)
         {
             let url = item
                 .download_url
@@ -255,7 +259,7 @@ impl GraphDrive {
                 .client
                 .get(url)
                 .header(header::ACCEPT_ENCODING, "identity");
-            matches_upload_bytes(self.send(request).await?, bytes).await?
+            matches_upload_bytes(self.send(request).await?, source).await?
         } else if item.folder.is_some() || item.size.is_some() {
             false
         } else {
@@ -263,7 +267,10 @@ impl GraphDrive {
         };
 
         // Confirm the download and destination lookup refer to the same current version.
-        let current = self.upload_destination(&destination).await?;
+        let current = self
+            .fetch_destination(&destination)
+            .await?
+            .ok_or(CloudError::Unavailable)?;
         if !current.matches_destination(target)
             || current.id != item.id
             || current.etag != item.etag
@@ -271,7 +278,7 @@ impl GraphDrive {
             return Err(CloudError::Unavailable);
         }
         if matches {
-            current.into_remote()
+            current.into_remote().map(Some)
         } else if matches!(target, UploadTarget::New { .. })
             || if_match.is_some_and(|tag| tag != "*")
         {
@@ -281,13 +288,12 @@ impl GraphDrive {
         }
     }
 
-    async fn upload_destination(&self, url: &Url) -> Result<DriveItem, CloudError> {
-        decode(self.graph(self.client.get(url.clone())).await?)
-            .await
-            .map_err(|error| match error {
-                CloudError::NotFound | CloudError::Conflict => CloudError::Unavailable,
-                error => error,
-            })
+    async fn fetch_destination(&self, url: &Url) -> Result<Option<DriveItem>, CloudError> {
+        let response = self.graph(self.client.get(url.clone())).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        decode(response).await.map(Some)
     }
 
     fn upload_endpoint(&self, target: UploadTarget<'_>, operation: &str) -> Url {
@@ -418,8 +424,18 @@ impl CloudDrive for GraphDrive {
         bytes: &[u8],
         if_match: Option<&str>,
     ) -> Result<RemoteItem, CloudError> {
-        if bytes.len() > SIMPLE_UPLOAD_LIMIT {
-            return self.resumable_upload(target, bytes, if_match).await;
+        self.upload_from(target, UploadSource::Bytes(bytes), if_match)
+            .await
+    }
+
+    async fn upload_from(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        if source.len() > SIMPLE_UPLOAD_LIMIT {
+            return self.resumable_upload(target, source, if_match).await;
         }
         let mut url = self.upload_endpoint(target, "content");
         if matches!(target, UploadTarget::New { .. }) {
@@ -430,24 +446,62 @@ impl CloudDrive for GraphDrive {
             .client
             .put(url)
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(bytes.to_vec());
+            .body(source.read(0, source.len()).await?);
         match self.graph(conditional(request, if_match)).await {
             Ok(response) if response.status().is_success() => {
                 match decode_upload_item(response, target).await {
                     Ok(item) => Ok(item),
-                    Err(_) => self.confirm_upload(target, bytes, if_match).await,
+                    Err(_) => self
+                        .confirm_upload(target, source, if_match)
+                        .await?
+                        .ok_or(CloudError::Unavailable),
                 }
             }
             Ok(response)
                 if response.status().is_server_error()
                     || response.status() == StatusCode::REQUEST_TIMEOUT =>
             {
-                self.confirm_upload(target, bytes, if_match).await
+                self.confirm_upload(target, source, if_match)
+                    .await?
+                    .ok_or(CloudError::Unavailable)
             }
-            Err(CloudError::Unavailable) => self.confirm_upload(target, bytes, if_match).await,
+            Err(CloudError::Unavailable) => self
+                .confirm_upload(target, source, if_match)
+                .await?
+                .ok_or(CloudError::Unavailable),
             Ok(response) => Err(status_error(response.status())),
             Err(error) => Err(error),
         }
+    }
+
+    async fn upload_destination(
+        &self,
+        target: UploadTarget<'_>,
+    ) -> Result<Option<RemoteItem>, CloudError> {
+        let url = match target {
+            UploadTarget::Existing { item_id } => self.endpoint(&["items", item_id]),
+            UploadTarget::New { parent_id, name } => {
+                self.endpoint(&["items", &format!("{parent_id}:"), name])
+            }
+        };
+        self.fetch_destination(&url)
+            .await?
+            .map(|item| {
+                if !item.matches_destination(target) {
+                    return Err(CloudError::InvalidResponse);
+                }
+                item.into_remote()
+            })
+            .transpose()
+    }
+
+    async fn confirm_upload(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<Option<RemoteItem>, CloudError> {
+        self.confirm_destination(target, source, if_match).await
     }
 
     async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteItem, CloudError> {
@@ -465,6 +519,15 @@ impl CloudDrive for GraphDrive {
         let url = self.endpoint(&["items", item_id]);
         let body = json!({"name": name, "parentReference": {"id": parent_id}});
         decode_item(self.graph(self.client.patch(url).json(&body)).await?).await
+    }
+
+    async fn delete_if_match(&self, item_id: &str, etag: &str) -> Result<(), CloudError> {
+        let url = self.endpoint(&["items", item_id]);
+        successful(
+            self.graph(conditional(self.client.delete(url), Some(etag)))
+                .await?,
+        )?;
+        Ok(())
     }
 
     async fn delete_item(&self, item_id: &str) -> Result<(), CloudError> {
@@ -526,27 +589,32 @@ fn retryable_upload_status(status: StatusCode) -> bool {
         )
 }
 
-async fn matches_upload_bytes(mut response: Response, bytes: &[u8]) -> Result<bool, CloudError> {
+async fn matches_upload_bytes(
+    mut response: Response,
+    source: UploadSource<'_>,
+) -> Result<bool, CloudError> {
     if response.status() != StatusCode::OK
         || response.headers().contains_key(header::CONTENT_RANGE)
         || !identity_encoding(&response)
     {
         return Err(CloudError::Unavailable);
     }
-    let mut remaining = bytes;
+    let mut offset = 0;
     let mut matches = true;
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|_| CloudError::Unavailable)?
     {
-        let Some((expected, rest)) = remaining.split_at_checked(chunk.len()) else {
+        if chunk.len() > source.len() - offset {
             return Err(CloudError::Unavailable);
-        };
-        matches &= chunk.as_ref() == expected;
-        remaining = rest;
+        }
+        for part in chunk.chunks(FRAGMENT_SIZE) {
+            matches &= part == source.read(offset, part.len()).await?;
+            offset += part.len();
+        }
     }
-    if !remaining.is_empty() {
+    if offset != source.len() {
         return Err(CloudError::Unavailable);
     }
     Ok(matches)

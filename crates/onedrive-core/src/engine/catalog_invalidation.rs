@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
-#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) enum CatalogInvalidation {
     Inode { inode: u64, content: bool },
     Entry { parent: u64, name: String },

@@ -1,3 +1,4 @@
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -9,6 +10,7 @@ fn cli(runtime: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_onedrive-rs"))
         .current_dir(runtime)
         .env("XDG_RUNTIME_DIR", runtime)
+        .env("XDG_CONFIG_HOME", runtime.join("config"))
         .args(args)
         .output()
         .unwrap()
@@ -204,27 +206,24 @@ fn rejects_paths_outside_the_mount_and_parent_components_before_connecting() {
 }
 
 #[test]
-fn daemon_command_reports_unavailable_runtime_in_both_formats() {
+fn daemon_reports_invalid_mount_configuration_in_both_formats() {
     let runtime = private_runtime();
-    let commands: &[(&[&str], &str)] = &[(
-        &["daemon"],
-        "The daemon runtime is not available in this build",
-    )];
-    for (args, message) in commands {
-        let human = cli(runtime.path(), args);
-        assert_eq!(human.status.code(), Some(1));
-        assert_eq!(
-            String::from_utf8(human.stderr).unwrap().trim_end(),
-            *message
-        );
-        let output = cli(runtime.path(), &[&["--json"], *args].concat());
-        assert_eq!(output.status.code(), Some(1));
-        assert_eq!(
-            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-            json!({"ok":false,"error":message})
-        );
-    }
-    assert!(!runtime.path().join("onedrive-rs").exists());
+    let config = runtime.path().join("config/onedrive-rs");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "client_id = 'test-client'\n").unwrap();
+    let args = ["daemon", "--mount-path", "relative"];
+    let message = "The OneDrive mount path must be absolute and cannot contain ..";
+
+    let human = cli(runtime.path(), &args);
+    assert_eq!(human.status.code(), Some(1));
+    assert_eq!(String::from_utf8(human.stderr).unwrap().trim_end(), message);
+    let output = cli(runtime.path(), &[&["--json"], args.as_slice()].concat());
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"ok":false,"error":message})
+    );
+    assert!(!socket_path(runtime.path()).exists());
 }
 
 #[test]

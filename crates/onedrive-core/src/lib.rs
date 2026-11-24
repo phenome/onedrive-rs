@@ -5,6 +5,7 @@ pub use config::{Config, ConfigError};
 mod cloud;
 mod engine;
 mod fake_cloud;
+mod namespace;
 
 pub use cloud::{
     Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,

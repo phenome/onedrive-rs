@@ -164,6 +164,7 @@ async fn purge_folder_is_atomic_on_pending_upload_then_clears_descendant_pins() 
     let engine = fixture.open();
     engine.sync().await.unwrap();
     engine.pin("folder").await.unwrap();
+    assert_eq!(state(&engine, "folder"), "Hydrated");
     engine.pin("clean").await.unwrap();
     engine
         .set_sync_state("dirty", SyncState::Uploading)
@@ -189,4 +190,97 @@ async fn purge_folder_is_atomic_on_pending_upload_then_clears_descendant_pins() 
         vec![13; 10]
     );
     assert_eq!(fixture.drive.range_requests().len(), requests + 1);
+}
+
+#[tokio::test]
+async fn automatic_hydration_pauses_at_free_disk_floor_and_retries() {
+    let mut fixture = Fixture::new();
+    fixture.add("folder", Some("root"), ItemKind::Folder, 0);
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.pin("folder").await.unwrap();
+    drop(engine);
+
+    fixture.config.min_free_disk_bytes = u64::MAX;
+    fixture.add("new", Some("folder"), ItemKind::File, 10);
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    assert!(engine.cache_status().unwrap().hydration_paused_low_disk);
+    assert_eq!(state(&engine, "new"), "Cloud-only");
+    assert_eq!(xattr(&engine, "new", "user.onedrive.pin"), "pinned");
+    assert!(fixture.drive.range_requests().is_empty());
+    drop(engine);
+
+    fixture.config.min_free_disk_bytes = 0;
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    let status = engine.cache_status().unwrap();
+    assert!(!status.hydration_paused_low_disk);
+    assert_eq!(status.pinned_bytes, 10);
+    assert_eq!(status.unpinned_bytes, 0);
+    assert_eq!(state(&engine, "new"), "Hydrated");
+}
+
+#[tokio::test]
+async fn reads_evict_lru_by_cached_bytes_and_periodic_sync_evicts_idle_overrides() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_unpinned_cache_bytes = 20;
+    fixture.add("folder", Some("root"), ItemKind::Folder, 0);
+    fixture.add("pinned", Some("folder"), ItemKind::File, 50);
+    fixture.add("override", Some("folder"), ItemKind::File, 10);
+    for name in ["lru", "new"] {
+        fixture.add(name, Some("root"), ItemKind::File, 10);
+    }
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.pin("folder").await.unwrap();
+    engine.purge("override").unwrap();
+    for name in ["override", "lru", "override", "new"] {
+        fixture.clock.advance(1);
+        assert_eq!(
+            engine.read(inode(&engine, name), 0, 10).await.unwrap(),
+            vec![13; 10]
+        );
+    }
+
+    assert_eq!(state(&engine, "lru"), "Cloud-only");
+    assert_eq!(state(&engine, "override"), "Hydrated");
+    assert_eq!(engine.cache_status().unwrap().pinned_bytes, 50);
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 20);
+    engine
+        .set_sync_state("new", onedrive_core::SyncState::Dirty)
+        .unwrap();
+    fixture.clock.advance(7 * 86400);
+    engine.sync().await.unwrap();
+    assert_eq!(state(&engine, "override"), "Cloud-only");
+    assert_eq!(state(&engine, "pinned"), "Hydrated");
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 10);
+    engine
+        .set_sync_state("new", onedrive_core::SyncState::Clean)
+        .unwrap();
+    assert_eq!(state(&engine, "new"), "Hydrated");
+}
+
+#[tokio::test]
+async fn unpin_retains_bytes_and_direct_purge_clears_pin_even_for_empty_files() {
+    let fixture = Fixture::new();
+    fixture.add("file", Some("root"), ItemKind::File, 10);
+    fixture.add("empty", Some("root"), ItemKind::File, 0);
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+
+    engine.pin("file").await.unwrap();
+    engine.unpin("file").unwrap();
+    assert_eq!(engine.effective_pin_state("file").unwrap(), PinState::None);
+    assert_eq!(state(&engine, "file"), "Hydrated");
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 10);
+
+    for name in ["file", "empty"] {
+        engine.pin(name).await.unwrap();
+        assert_eq!(state(&engine, name), "Hydrated");
+        engine.purge(name).unwrap();
+        assert_eq!(state(&engine, name), "Cloud-only");
+        assert_eq!(engine.pin_state(name).unwrap(), PinState::None);
+    }
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 0);
 }

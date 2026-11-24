@@ -1,7 +1,29 @@
+use std::sync::atomic::Ordering;
+
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::sparse_cache::{HEADER_BYTES, STREAM_BYTES, allocate_generation, is_hydrated};
-use super::{Engine, EngineError, ItemKind, PinState, SyncState, item_by_id, write_pin};
+use super::sparse_cache::{
+    HAS_COMPLETE_CONTENT, HEADER_BYTES, STREAM_BYTES, allocate_generation, is_hydrated,
+};
+use super::{
+    CatalogItem, Engine, EngineError, ItemKind, PinState, SyncState, item_by_id, item_by_inode,
+    write_pin,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheStatus {
+    pub pinned_bytes: u64,
+    pub unpinned_bytes: u64,
+    pub available_disk_bytes: u64,
+    /// A Pin hydration pass reached the free-disk floor since the last full pass completed.
+    pub hydration_paused_low_disk: bool,
+}
+
+const XATTR_NAMES: [&str; 3] = [
+    "user.onedrive.state",
+    "user.onedrive.pin",
+    "user.onedrive.etag",
+];
 
 const SUBTREE: &str = "WITH RECURSIVE subtree(item_id) AS (
     SELECT item_id FROM items WHERE item_id = ?1
@@ -10,6 +32,38 @@ const SUBTREE: &str = "WITH RECURSIVE subtree(item_id) AS (
 )";
 
 impl Engine {
+    pub fn effective_pin_state(&self, item_id: &str) -> Result<PinState, EngineError> {
+        let db = self.db();
+        item_by_id(&db, item_id)?.ok_or(EngineError::NotFound)?;
+        Ok(effective_pin(&db, item_id)?)
+    }
+
+    pub fn list_xattrs(&self, inode: u64) -> Result<&'static [&'static str], EngineError> {
+        self.getattr(inode)?.ok_or(EngineError::NotFound)?;
+        Ok(&XATTR_NAMES)
+    }
+
+    pub fn xattr(&self, inode: u64, name: &str) -> Result<Option<Vec<u8>>, EngineError> {
+        let db = self.db();
+        let item = item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?;
+        let value = match name {
+            "user.onedrive.state" => match item.sync_state {
+                SyncState::Conflict => "Conflict",
+                SyncState::Dirty | SyncState::Uploading => "Dirty",
+                SyncState::Clean if content_is_hydrated(&db, &item)? => "Hydrated",
+                SyncState::Clean => "Cloud-only",
+            },
+            "user.onedrive.pin" => match effective_pin(&db, &item.item_id)? {
+                PinState::None => "none",
+                PinState::Pinned => "pinned",
+                PinState::UnpinOverride => "unpin_override",
+            },
+            "user.onedrive.etag" => item.etag.as_deref().unwrap_or_default(),
+            _ => return Ok(None),
+        };
+        Ok(Some(value.as_bytes().to_vec()))
+    }
+
     /// Remove a Pin while retaining cached bytes according to the eviction policy.
     pub fn unpin(&self, item_id: &str) -> Result<(), EngineError> {
         let mut db = self.db();
@@ -66,15 +120,20 @@ impl Engine {
         if !self.set_pin_state(item_id, PinState::Pinned)? {
             return Err(EngineError::NotFound);
         }
-        self.hydrate_pins(Some(item_id)).await?;
         self.evict()?;
+        self.hydrate_pins(Some(item_id)).await?;
         Ok(())
     }
 
     pub(super) async fn hydrate_pins(&self, root: Option<&str>) -> Result<(), EngineError> {
+        let _hydration = self.hydrating.lock().await;
+        if root.is_none() {
+            self.hydration_paused_low_disk
+                .store(false, Ordering::Relaxed);
+        }
         let candidates = self
             .db()
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "WITH RECURSIVE pinned(item_id) AS (
                  SELECT i.item_id FROM items i JOIN pin_directives p USING (item_id)
                  WHERE p.pin_state = 1 AND (?1 IS NULL OR i.item_id = ?1)
@@ -85,15 +144,30 @@ impl Engine {
                  )
              )
              SELECT i.item_id FROM items i JOIN pinned USING (item_id)
-             WHERE i.kind = 0 AND i.sync_state = 0 AND i.remote_missing = 0
+             WHERE i.kind = 0 AND i.sync_state = 0 AND i.remote_missing = 0 AND NOT {HAS_COMPLETE_CONTENT}
              ORDER BY i.inode",
-            )?
-            .query_map([root], |row| row.get::<_, String>(0))?
+            ))?
+            .query_map(params![root, HEADER_BYTES, STREAM_BYTES], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut failure = None;
         for id in candidates {
-            self.hydrate_pinned_file(&id).await?;
+            match self.hydrate_pinned_file(&id).await {
+                Ok(()) => {}
+                Err(EngineError::LowDisk) => {
+                    self.hydration_paused_low_disk
+                        .store(true, Ordering::Relaxed);
+                    return Err(EngineError::LowDisk);
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
         }
-        Ok(())
+        if root.is_none() && failure.is_none() {
+            self.hydration_paused_low_disk
+                .store(false, Ordering::Relaxed);
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     async fn hydrate_pinned_file(&self, item_id: &str) -> Result<(), EngineError> {
@@ -119,19 +193,51 @@ impl Engine {
         let mut offset = 0;
         while offset < item.size {
             let length = (item.size - offset).min(STREAM_BYTES) as usize;
-            if !self
+            if self
                 .read_generation(
                     &item,
                     generation,
                     offset,
                     item.size <= HEADER_BYTES,
                     &mut output[..length],
+                    true,
                 )
                 .await?
+                .is_none()
             {
                 break;
             }
             offset += length as u64;
+        }
+        Ok(())
+    }
+
+    /// Cached content bytes, excluding sparse holes and counting overlapping ranges once.
+    pub fn cache_status(&self) -> Result<CacheStatus, EngineError> {
+        let space = self.cache_capacity()?;
+        let mut status = CacheStatus {
+            pinned_bytes: 0,
+            unpinned_bytes: 0,
+            available_disk_bytes: space.f_bavail.saturating_mul(space.f_frsize),
+            hydration_paused_low_disk: self.hydration_paused_low_disk.load(Ordering::Relaxed),
+        };
+        for entry in cached_files(&self.db())? {
+            if entry.pinned {
+                status.pinned_bytes += entry.bytes;
+            } else {
+                status.unpinned_bytes += entry.bytes;
+            }
+        }
+        Ok(status)
+    }
+
+    pub(super) fn check_hydration_space(&self, bytes: u64) -> Result<(), EngineError> {
+        let space = self.cache_capacity()?;
+        let block = space.f_frsize.max(1);
+        let allocated = bytes.div_ceil(block).saturating_mul(block);
+        let available = space.f_bavail.saturating_mul(block);
+        if available < allocated || available - allocated < self.config.min_free_disk_bytes {
+            return Err(EngineError::LowDisk);
         }
         Ok(())
     }
@@ -240,4 +346,28 @@ fn unpin_directive(db: &Connection, parent_id: Option<&str>) -> rusqlite::Result
         return Ok(PinState::UnpinOverride);
     }
     Ok(PinState::None)
+}
+
+fn content_is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
+    if item.kind == ItemKind::File {
+        return is_hydrated(db, item);
+    }
+    // Directories have no content cache. A folder is hydrated when its
+    // descendant files are available, or when an empty folder is pinned.
+    db.prepare_cached(&format!(
+        "{SUBTREE}, files AS NOT MATERIALIZED (
+             SELECT i.inode, i.size FROM items i JOIN subtree USING (item_id) WHERE i.kind = 0
+         )
+         SELECT NOT EXISTS (SELECT 1 FROM files i WHERE NOT {HAS_COMPLETE_CONTENT})
+                AND (?4 OR EXISTS (SELECT 1 FROM files))",
+    ))?
+    .query_row(
+        params![
+            item.item_id,
+            HEADER_BYTES,
+            STREAM_BYTES,
+            effective_pin(db, &item.item_id)? == PinState::Pinned,
+        ],
+        |row| row.get(0),
+    )
 }

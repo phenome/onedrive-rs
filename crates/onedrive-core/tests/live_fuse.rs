@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use onedrive_core::{
-    Engine, FakeCloudDrive, FuseAdapter, ItemKind, PinState, RemoteItem, SystemClock,
+    Config, Engine, FakeCloudDrive, FuseAdapter, ItemKind, RemoteItem, SystemClock,
 };
 
 const WORKER_DIR: &str = "ONEDRIVE_LIVE_FUSE_WORKER_DIR";
@@ -116,8 +116,17 @@ fn exercise_mount(dir: &Path) {
     }
     drive.set_content("file", bytes.clone());
     let engine = Arc::new(
-        Engine::open_with_cache(dir.join("db"), &cache, drive.clone(), Arc::new(SystemClock))
-            .unwrap(),
+        Engine::open_with_config(
+            dir.join("db"),
+            &cache,
+            drive.clone(),
+            Arc::new(SystemClock),
+            Config {
+                min_free_disk_bytes: 0,
+                ..Config::default()
+            },
+        )
+        .unwrap(),
     );
     runtime.block_on(engine.sync()).unwrap();
     let delta_requests = drive.requests();
@@ -187,7 +196,7 @@ fn exercise_mount(dir: &Path) {
             ("file".into(), STREAM as u64, STREAM),
         ]
     );
-    engine.set_pin_state("file", PinState::Pinned).unwrap();
+    runtime.block_on(engine.pin("root")).unwrap();
     assert_xattrs(&path, b"Hydrated", b"pinned", b"\"version-1\"");
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(drive.range_requests().len(), 3);
@@ -199,14 +208,22 @@ fn exercise_mount(dir: &Path) {
     drive.set_content("file", new_bytes.clone());
     runtime.block_on(engine.sync()).unwrap();
     assert_eq!(fs::metadata(&path).unwrap().mtime(), file.mtime);
-    assert_xattrs(&path, b"Cloud-only", b"pinned", b"\"version-2\"");
+    assert_xattrs(&path, b"Hydrated", b"pinned", b"\"version-2\"");
+    handle.read_exact_at(&mut sniff, 0).unwrap();
+    assert_eq!(sniff, new_bytes[..32768]);
+    assert_eq!(drive.range_requests().len(), 5);
+
+    engine.purge("file").unwrap();
+    assert_xattrs(&path, b"Cloud-only", b"unpin_override", b"\"version-2\"");
+    runtime.block_on(engine.sync()).unwrap();
+    assert_xattrs(&path, b"Cloud-only", b"unpin_override", b"\"version-2\"");
     handle.read_exact_at(&mut sniff, 0).unwrap();
     assert_eq!(sniff, new_bytes[..32768]);
     assert_eq!(
         drive.range_requests().last().unwrap(),
         &("file".into(), 0, HEADER)
     );
-    assert_eq!(drive.range_requests().len(), 4);
+    assert_eq!(drive.range_requests().len(), 6);
     drop(handle);
 
     assert!(

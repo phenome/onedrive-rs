@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ use crate::{
 
 mod retention;
 mod sparse_cache;
+
+pub use retention::CacheStatus;
 
 use sparse_cache::SparseCache;
 
@@ -32,6 +35,8 @@ pub enum EngineError {
     PendingUpload { item_id: String },
     #[error("cannot purge {item_id}: unresolved conflict")]
     UnresolvedConflict { item_id: String },
+    #[error("cache hydration paused to preserve the free-disk floor")]
+    LowDisk,
     #[error("cannot read a directory as a file")]
     IsDirectory,
     #[error("sparse cache I/O error")]
@@ -101,6 +106,8 @@ pub struct Engine {
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
     config: Config,
+    hydrating: tokio::sync::Mutex<()>,
+    hydration_paused_low_disk: AtomicBool,
 }
 
 const ITEM_COLUMNS: &str =
@@ -153,6 +160,8 @@ impl Engine {
             clock,
             config,
             syncing: tokio::sync::Mutex::new(()),
+            hydrating: tokio::sync::Mutex::new(()),
+            hydration_paused_low_disk: AtomicBool::new(false),
         })
     }
 
@@ -162,6 +171,8 @@ impl Engine {
 
     pub async fn sync(&self) -> Result<(), EngineError> {
         let _sync = self.syncing.lock().await;
+        // Age-based eviction also runs when the cloud is unavailable.
+        self.evict()?;
         let mut restarted = false;
         loop {
             let (link, revision) = self.ready_checkpoint().await?;
@@ -183,7 +194,10 @@ impl Engine {
             };
             if self.commit_page(page, revision)? {
                 self.evict()?;
-                return self.hydrate_pins(None).await;
+                return match self.hydrate_pins(None).await {
+                    Err(EngineError::LowDisk) => Ok(()),
+                    result => result,
+                };
             }
         }
     }
@@ -254,7 +268,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Store the explicit directive. Effective sticky pin policy belongs in Engine.
+    /// Store a directive without fetching or removing content. Use pin, unpin, or purge for user actions.
     pub fn set_pin_state(&self, item_id: &str, pin: PinState) -> Result<bool, EngineError> {
         let db = self.db();
         Ok(write_pin(&db, item_id, pin)?)

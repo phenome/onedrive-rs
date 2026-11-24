@@ -13,12 +13,6 @@ use super::{CatalogItem, Engine, EngineError, ItemKind};
 pub(super) const HEADER_BYTES: u64 = 64 * 1024;
 pub(super) const STREAM_BYTES: u64 = 2 * 1024 * 1024;
 const HEADER_BLOCK: i64 = -1;
-const XATTR_NAMES: [&str; 3] = [
-    "user.onedrive.state",
-    "user.onedrive.pin",
-    "user.onedrive.etag",
-];
-
 #[derive(Default)]
 struct RangeLocks(HashMap<(i64, u64), Weak<AsyncMutex<()>>>);
 
@@ -74,32 +68,6 @@ impl SparseCache {
 }
 
 impl Engine {
-    pub fn list_xattrs(&self, inode: u64) -> Result<&'static [&'static str], EngineError> {
-        self.getattr(inode)?.ok_or(EngineError::NotFound)?;
-        Ok(&XATTR_NAMES)
-    }
-
-    pub fn xattr(&self, inode: u64, name: &str) -> Result<Option<Vec<u8>>, EngineError> {
-        let db = self.db();
-        let item = super::item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?;
-        let value = match name {
-            "user.onedrive.state" => match item.sync_state {
-                super::SyncState::Conflict => "Conflict",
-                super::SyncState::Dirty | super::SyncState::Uploading => "Dirty",
-                super::SyncState::Clean if is_hydrated(&db, &item)? => "Hydrated",
-                super::SyncState::Clean => "Cloud-only",
-            },
-            "user.onedrive.pin" => match super::retention::effective_pin(&db, &item.item_id)? {
-                super::PinState::None => "none",
-                super::PinState::Pinned => "pinned",
-                super::PinState::UnpinOverride => "unpin_override",
-            },
-            "user.onedrive.etag" => item.etag.as_deref().unwrap_or_default(),
-            _ => return Ok(None),
-        };
-        Ok(Some(value.as_bytes().to_vec()))
-    }
-
     pub fn cache_capacity(&self) -> Result<rustix::fs::StatVfs, EngineError> {
         rustix::fs::statvfs(&self.cache.root).map_err(|err| io::Error::from(err).into())
     }
@@ -129,10 +97,13 @@ impl Engine {
             let end = offset.saturating_add(length as u64).min(item.size);
             let mut result = vec![0; (end - offset) as usize];
             let header_sniff = offset == 0 && length as u64 <= HEADER_BYTES;
-            if self
-                .read_generation(&item, generation, offset, header_sniff, &mut result)
+            if let Some(downloaded) = self
+                .read_generation(&item, generation, offset, header_sniff, &mut result, false)
                 .await?
             {
+                if downloaded {
+                    self.evict()?;
+                }
                 return Ok(result);
             }
         }
@@ -145,7 +116,9 @@ impl Engine {
         start: u64,
         header_sniff: bool,
         output: &mut [u8],
-    ) -> Result<bool, EngineError> {
+        pin_hydration: bool,
+    ) -> Result<Option<bool>, EngineError> {
+        let mut downloaded = false;
         let end = start + output.len() as u64;
         let mut offset = start;
         while offset < end {
@@ -155,8 +128,8 @@ impl Engine {
             let _guard = lock.lock().await;
             {
                 let db = self.db();
-                if generation_for(&db, item.inode)? != Some(generation) {
-                    return Ok(false);
+                if !generation_is_current(&db, item, generation, pin_hydration)? {
+                    return Ok(None);
                 }
                 let cached_end = if block_cached(&db, generation, stream_offset as i64)? {
                     Some(stream_offset + STREAM_BYTES)
@@ -175,17 +148,27 @@ impl Engine {
             }
 
             let (block, fetch_offset, length) = range_for_read(stream_offset, header_sniff);
+            let expected = length.min(item.size - fetch_offset) as usize;
+            if pin_hydration {
+                self.check_hydration_space(expected as u64)?;
+            }
             let bytes = self
                 .cloud
                 .read_range(&item.item_id, fetch_offset, length as usize)
                 .await;
             let mut db = self.db();
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if generation_for(&tx, item.inode)? != Some(generation) {
-                return Ok(false);
+            if !generation_is_current(&tx, item, generation, pin_hydration)? {
+                return Ok(None);
+            }
+            // Another Engine may have filled the range while the request was in flight.
+            if block_cached(&tx, generation, block)? {
+                continue;
             }
             let bytes = bytes?;
-            let expected = length.min(item.size - fetch_offset) as usize;
+            if pin_hydration {
+                self.check_hydration_space(expected as u64)?;
+            }
             if bytes.len() != expected {
                 return Err(EngineError::InvalidRange);
             }
@@ -201,9 +184,22 @@ impl Engine {
                 "INSERT OR IGNORE INTO sparse_ranges VALUES (?1, ?2)",
                 params![generation, block],
             )?;
+            self.touch_generation(&tx, generation)?;
             tx.commit()?;
+            downloaded = true;
         }
-        Ok(generation_for(&self.db(), item.inode)? == Some(generation))
+        let db = self.db();
+        Ok(self
+            .touch_generation(&db, generation)?
+            .then_some(downloaded))
+    }
+
+    fn touch_generation(&self, db: &Connection, generation: i64) -> rusqlite::Result<bool> {
+        Ok(db.execute(
+            "UPDATE items SET last_accessed_at = max(coalesce(last_accessed_at, 0), ?2)
+             WHERE inode = (SELECT inode FROM sparse_files WHERE generation = ?1)",
+            params![generation, self.access_time()],
+        )? != 0)
     }
 }
 
@@ -232,22 +228,25 @@ fn block_cached(db: &Connection, generation: i64, block: i64) -> rusqlite::Resul
     )
 }
 
+// Uses the current item's row as i. A generation with no chunks is complete
+// only for an empty file that has explicitly been hydrated.
+pub(super) const HAS_COMPLETE_CONTENT: &str = "EXISTS (
+    SELECT 1 FROM sparse_files f WHERE f.inode = i.inode AND (
+        (i.size <= ?2 AND EXISTS (
+            SELECT 1 FROM sparse_ranges WHERE generation = f.generation AND block = -1
+        ))
+        OR (SELECT count(*) FROM sparse_ranges WHERE generation = f.generation AND block >= 0)
+            = (i.size / ?3) + (i.size % ?3 <> 0)
+    )
+)";
+
 pub(super) fn is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
-    if item.kind != ItemKind::File {
-        return Ok(false);
-    }
-    let Some(generation) = generation_for(db, item.inode)? else {
-        return Ok(false);
-    };
-    if item.size <= HEADER_BYTES && block_cached(db, generation, HEADER_BLOCK)? {
-        return Ok(true);
-    }
-    let streams: u64 = db.query_row(
-        "SELECT COUNT(*) FROM sparse_ranges WHERE generation = ?1 AND block >= 0",
-        [generation],
-        |row| row.get(0),
-    )?;
-    Ok(streams == item.size.div_ceil(STREAM_BYTES))
+    db.prepare_cached(&format!(
+        "SELECT {HAS_COMPLETE_CONTENT} FROM items i WHERE inode = ?1 AND kind = 0",
+    ))?
+    .query_row(params![item.inode, HEADER_BYTES, STREAM_BYTES], |row| {
+        row.get(0)
+    })
 }
 
 pub(super) fn allocate_generation(db: &Connection, inode: u64) -> rusqlite::Result<i64> {
@@ -256,4 +255,27 @@ pub(super) fn allocate_generation(db: &Connection, inode: u64) -> rusqlite::Resu
         [inode],
     )?;
     Ok(generation_for(db, inode)?.expect("cache generation was allocated"))
+}
+
+fn generation_is_current(
+    db: &Connection,
+    item: &CatalogItem,
+    generation: i64,
+    pin_hydration: bool,
+) -> rusqlite::Result<bool> {
+    if generation_for(db, item.inode)? != Some(generation) {
+        return Ok(false);
+    }
+    if !pin_hydration {
+        return Ok(true);
+    }
+    let clean = db
+        .query_row(
+            "SELECT sync_state = 0 AND remote_missing = 0 FROM items WHERE inode = ?1",
+            [item.inode],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    Ok(clean && super::retention::effective_pin(db, &item.item_id)? == super::PinState::Pinned)
 }

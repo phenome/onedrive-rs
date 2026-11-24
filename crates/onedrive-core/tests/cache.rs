@@ -205,3 +205,104 @@ async fn in_flight_range_retries_after_delta_retires_its_generation() {
         ]
     );
 }
+
+#[tokio::test]
+async fn an_in_flight_pin_cannot_restore_a_purged_generation() {
+    let (temp, fake, engine, inode, _) = setup(STREAM + 200).await;
+    drop(engine);
+    let cloud = Arc::new(InFlightRange {
+        fake,
+        pause_once: AtomicBool::new(true),
+        captured: Notify::new(),
+        resume: Notify::new(),
+    });
+    let engine = Engine::open_with_config(
+        temp.path().join("metadata.db"),
+        temp.path().join("cache"),
+        cloud.clone(),
+        Arc::new(SystemClock),
+        onedrive_core::Config {
+            min_free_disk_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let purge = async {
+        cloud.captured.notified().await;
+        engine.purge("file").unwrap();
+        cloud.resume.notify_one();
+    };
+    let (pin, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(engine.pin("file"), purge)
+    })
+    .await
+    .unwrap();
+    pin.unwrap();
+    assert_eq!(
+        engine.pin_state("file").unwrap(),
+        onedrive_core::PinState::None
+    );
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Cloud-only"
+    );
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 0);
+}
+
+#[tokio::test]
+async fn cache_status_counts_sparse_holes_and_overlapping_headers_correctly() {
+    let (_temp, _fake, engine, inode, _) = setup(3 * STREAM + 17).await;
+    engine.read(inode, 0, 1).await.unwrap();
+    engine.read(inode, 3 * STREAM as u64, 1).await.unwrap();
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 65536 + 17);
+
+    engine.read(inode, HEADER as u64, 1).await.unwrap();
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 2097152 + 17);
+}
+
+#[tokio::test]
+async fn pin_drops_an_in_flight_download_when_a_local_upload_becomes_pending() {
+    use onedrive_core::{Config, EngineError, SyncState};
+
+    let (temp, fake, engine, inode, _) = setup(STREAM + 200).await;
+    engine.read(inode, 0, 1).await.unwrap();
+    drop(engine);
+
+    let cloud = Arc::new(InFlightRange {
+        fake,
+        pause_once: AtomicBool::new(true),
+        captured: Notify::new(),
+        resume: Notify::new(),
+    });
+    let engine = Engine::open_with_config(
+        temp.path().join("metadata.db"),
+        temp.path().join("cache"),
+        cloud.clone(),
+        Arc::new(SystemClock),
+        Config {
+            min_free_disk_bytes: 0,
+            ..Config::default()
+        },
+    )
+    .unwrap();
+    let begin_writeback = async {
+        cloud.captured.notified().await;
+        engine.set_sync_state("file", SyncState::Dirty).unwrap();
+        assert!(matches!(
+            engine.purge("file"),
+            Err(EngineError::PendingUpload { .. })
+        ));
+        cloud.resume.notify_one();
+    };
+    let (pin, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(engine.pin("file"), begin_writeback)
+    })
+    .await
+    .unwrap();
+    pin.unwrap();
+    assert_eq!(engine.cache_status().unwrap().pinned_bytes, 65536);
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Dirty"
+    );
+}

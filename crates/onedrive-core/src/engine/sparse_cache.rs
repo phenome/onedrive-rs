@@ -206,9 +206,22 @@ impl SparseCache {
 
     fn open_block(&self, generation: i64, block: Block, stamp: &[u8]) -> io::Result<Option<File>> {
         let path = self.block_path(generation, block);
-        // An unexpected FIFO must not block an Engine request.
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => (),
+            Ok(_) => return Ok(None),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        }
+        // A replacement FIFO must not block between the path and descriptor checks.
         let fd = match rustix::fs::open(
-            path,
+            &path,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
             Mode::empty(),
         ) {
@@ -216,7 +229,12 @@ impl SparseCache {
             Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
                 return Ok(None);
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+                    return Ok(None);
+                }
+                return Err(err.into());
+            }
         };
         let file = File::from(fd);
         Ok(matches_stamp(&file, stamp)?.then_some(file))
@@ -265,11 +283,11 @@ impl Engine {
     }
 
     pub(super) fn reclaim_sparse_cache(&self) -> Result<(), EngineError> {
-        let retired = retired_generations(&self.db())?;
-        if retired.is_empty() {
+        if retired_generations(&self.db())?.is_empty() {
             return Ok(());
         }
         let disk = self.cache.lock_disk()?;
+        let retired = retired_generations(&self.db())?;
         for generation in retired {
             if self.cache.remove_generation(generation) {
                 disk.sync_all()?;
@@ -407,10 +425,25 @@ impl Engine {
                 if !generation_is_current(&db, item, generation, kind)? {
                     return Ok(ReadOutcome::Retired);
                 }
-                let mut cached = block_stamp(&db, generation, stream)?.map(|stamp| (stream, stamp));
-                if cached.is_none() && offset < HEADER_BYTES {
-                    cached = block_stamp(&db, generation, Block::Header)?
-                        .map(|stamp| (Block::Header, stamp));
+                let mut cached = None;
+                for block in [stream, Block::Header] {
+                    let limit = block.offset() + block.capacity();
+                    if offset >= limit
+                        || (matches!(block, Block::Header)
+                            && kind == ReadKind::Pin
+                            && item.size > limit)
+                    {
+                        continue;
+                    }
+                    if let Some(stamp) = block_stamp(&db, generation, block)?
+                        && ((start >= block.offset()
+                            && end <= limit
+                            && (kind != ReadKind::Pin || item.size <= limit))
+                            || range_is_composable(&db, generation, block)?)
+                    {
+                        cached = Some((block, stamp));
+                        break;
+                    }
                 }
                 cached
             };
@@ -442,7 +475,8 @@ impl Engine {
             if kind == ReadKind::Pin {
                 self.check_hydration_space(block.capacity().min(item.size - block.offset()))?;
             }
-            let offset = block.offset();
+            let block_start = block.offset();
+            let block_end = block_start + block.capacity();
             let length = block.capacity() as usize;
             let versioned = if item.etag.is_some() || item.ctag.is_some() {
                 self.cloud
@@ -450,7 +484,7 @@ impl Engine {
                         &item.item_id,
                         item.etag.as_deref(),
                         item.ctag.as_deref(),
-                        offset,
+                        block_start,
                         length,
                     )
                     .await
@@ -458,11 +492,34 @@ impl Engine {
                 Err(crate::CloudError::Unsupported)
             };
             let bytes = match versioned {
-                Err(crate::CloudError::Unsupported) => self
-                    .cloud
-                    .read_range(&item.item_id, offset, length)
-                    .await
-                    .map(|bytes| (bytes, false)),
+                Err(crate::CloudError::Unsupported) => {
+                    if kind == ReadKind::Pin && item.size > block.capacity() {
+                        self.hydrate_unversioned_snapshot(item, generation).await?;
+                        return Ok(ReadOutcome::Retired);
+                    }
+                    if start < block_start || end > block_end {
+                        // Replace the entire read with one response. Bytes from
+                        // independent unverified responses cannot be combined.
+                        let bytes = self
+                            .cloud
+                            .read_range(&item.item_id, start, output.len())
+                            .await;
+                        let db = self.db();
+                        if !generation_is_current(&db, item, generation, kind)? {
+                            return Ok(ReadOutcome::Retired);
+                        }
+                        let bytes = bytes?;
+                        if bytes.len() != output.len() {
+                            return Err(EngineError::InvalidRange);
+                        }
+                        output.copy_from_slice(&bytes);
+                        return Ok(ReadOutcome::Downloaded);
+                    }
+                    self.cloud
+                        .read_range(&item.item_id, block_start, length)
+                        .await
+                        .map(|bytes| (bytes, false))
+                }
                 result => result.map(|bytes| (bytes, true)),
             };
             match self.publish_block(item, generation, block, kind, bytes)? {
@@ -484,6 +541,84 @@ impl Engine {
         })
     }
 
+    async fn hydrate_unversioned_snapshot(
+        &self,
+        item: &CatalogItem,
+        generation: i64,
+    ) -> Result<(), EngineError> {
+        self.check_hydration_space(item.size)?;
+        let length = usize::try_from(item.size).map_err(|_| EngineError::InvalidRange)?;
+        let bytes = self.cloud.read_range(&item.item_id, 0, length).await;
+        let directory = self.cache.lock_disk()?;
+        let (bytes, snapshot) = {
+            let mut db = self.db();
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !generation_is_current(&tx, item, generation, ReadKind::Pin)? {
+                return Ok(());
+            }
+            let bytes = bytes?;
+            if bytes.len() != length {
+                return Err(EngineError::InvalidRange);
+            }
+            self.check_hydration_space(item.size)?;
+            // Reserve a fresh generation and journal it for recovery before
+            // writing files. The disk lock prevents premature reclamation.
+            let snapshot: i64 = tx.query_row(
+                "UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = 'sparse_files' RETURNING seq",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute("INSERT INTO sparse_retired VALUES (?1)", [snapshot])?;
+            tx.commit()?;
+            (bytes, snapshot)
+        };
+        let result = (|| {
+            let mut ranges = Vec::new();
+            for (index, bytes) in bytes.chunks(STREAM_BYTES as usize).enumerate() {
+                let block = Block::Stream(index as u64 * STREAM_BYTES);
+                let stamp = self.cache.write_block(&directory, snapshot, block, bytes)?;
+                ranges.push((block, stamp));
+            }
+            let mut db = self.db();
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !generation_is_current(&tx, item, generation, ReadKind::Pin)? {
+                return Ok(());
+            }
+            // Publish all blocks as a unit, dropping any independent ranges.
+            tx.execute(
+                "DELETE FROM sparse_files WHERE generation = ?1",
+                [generation],
+            )?;
+            tx.execute(
+                "INSERT INTO sparse_files (inode, generation) VALUES (?1, ?2)",
+                params![item.inode, snapshot],
+            )?;
+            for (block, stamp) in ranges {
+                tx.execute(
+                    "INSERT INTO sparse_ranges VALUES (?1, ?2)",
+                    params![snapshot, block.key()],
+                )?;
+                tx.execute(
+                    "INSERT INTO sparse_range_files VALUES (?1, ?2, ?3)",
+                    params![snapshot, block.key(), stamp],
+                )?;
+                // NULL tags permit composition within this snapshot. They
+                // cannot satisfy a writeback base's version check.
+                tx.execute(
+                    "INSERT INTO sparse_range_versions VALUES (?1, ?2, NULL, NULL)",
+                    params![snapshot, block.key()],
+                )?;
+            }
+            self.touch_generation(&tx, snapshot)?;
+            forget_retired(&tx, snapshot)?;
+            tx.commit()?;
+            Ok::<_, EngineError>(())
+        })();
+        drop(directory);
+        let reclaimed = self.reclaim_sparse_cache();
+        result.and(reclaimed)
+    }
+
     fn publish_block(
         &self,
         item: &CatalogItem,
@@ -499,10 +634,16 @@ impl Engine {
             if !generation_is_current(&tx, item, generation, kind)? {
                 return Ok(ReadOutcome::Retired);
             }
-            if block_stamp(&tx, generation, block)?.is_some() {
-                return Ok(ReadOutcome::Cached);
-            }
             let (bytes, verified) = bytes?;
+            if block_stamp(&tx, generation, block)?.is_some() {
+                if !verified || range_is_composable(&tx, generation, block)? {
+                    return Ok(ReadOutcome::Cached);
+                }
+                tx.execute(
+                    "DELETE FROM sparse_ranges WHERE generation = ?1 AND block = ?2",
+                    params![generation, block.key()],
+                )?;
+            }
             let expected = block.capacity().min(item.size - block.offset()) as usize;
             if kind == ReadKind::Pin {
                 self.check_hydration_space(expected as u64)?;
@@ -679,6 +820,14 @@ pub(super) fn generation_for(db: &Connection, inode: u64) -> rusqlite::Result<Op
     .optional()
 }
 
+fn range_is_composable(db: &Connection, generation: i64, block: Block) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sparse_range_versions WHERE generation = ?1 AND block = ?2)",
+        params![generation, block.key()],
+        |row| row.get(0),
+    )
+}
+
 fn block_stamp(
     db: &Connection,
     generation: i64,
@@ -699,10 +848,30 @@ pub(super) const HAS_COMPLETE_CONTENT: &str = "EXISTS (
         (i.size <= ?2 AND EXISTS (
             SELECT 1 FROM sparse_ranges WHERE generation = f.generation AND block = -1
         ))
-        OR (SELECT count(*) FROM sparse_ranges WHERE generation = f.generation AND block >= 0)
+        OR (i.size <= ?3 AND EXISTS (
+            SELECT 1 FROM sparse_ranges WHERE generation = f.generation AND block = 0
+        ))
+        OR (SELECT count(*) FROM sparse_range_versions WHERE generation = f.generation AND block >= 0)
             = (i.size / ?3) + (i.size % ?3 <> 0)
     )
 )";
+
+pub(super) fn retire_stale_etag_ranges(db: &Connection) -> rusqlite::Result<()> {
+    let schema_version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version == 0 {
+        // Early catalogs kept ranges through eTag-only content changes.
+        db.execute(
+            "DELETE FROM sparse_files AS f WHERE EXISTS (
+                SELECT 1 FROM items i JOIN sparse_range_versions v ON v.generation = f.generation
+                WHERE i.inode = f.inode AND i.ctag IS NULL AND v.ctag IS NULL
+                    AND v.etag IS NOT NULL AND v.etag IS NOT i.etag
+            )",
+            [],
+        )?;
+        db.pragma_update(None, "user_version", 1)?;
+    }
+    Ok(())
+}
 
 pub(super) fn is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
     db.prepare_cached(&format!(

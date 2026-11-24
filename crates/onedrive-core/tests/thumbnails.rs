@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use onedrive_core::{
-    CloudDrive, CloudError, DeltaPage, DeltaRequest, Engine, EngineError, FakeCloudDrive, ItemKind,
-    RemoteItem, RemoteThumbnail, SystemClock,
+    CloudDrive, CloudError, DeltaPage, DeltaRequest, Engine, FakeCloudDrive, ItemKind, RemoteItem,
+    RemoteThumbnail, SystemClock,
 };
 use rustix::fs::inotify;
 use tokio::sync::Notify;
@@ -330,7 +330,7 @@ async fn concurrent_reads_after_ancestor_and_file_rename_seed_the_new_uri_once()
 }
 
 #[tokio::test]
-async fn corrupt_rendition_is_retried_without_creating_a_fail_marker() {
+async fn corrupt_rendition_uses_a_retryable_fail_marker() {
     let fixture = Fixture::new();
     fixture
         .drive
@@ -341,8 +341,13 @@ async fn corrupt_rendition_is_retried_without_creating_a_fail_marker() {
         .engine
         .readdir("root", Path::new(MOUNT), &fixture.cache())
         .await;
-    assert!(matches!(result, Err(EngineError::InvalidThumbnail(_))));
-    assert!(!fixture.cache().exists());
+    assert_eq!(result.unwrap().len(), 1);
+    assert_png(
+        &fixture.cache(),
+        "file:///tmp/OneDrive%20%234/photo.png",
+        MTIME,
+        true,
+    );
 
     fixture
         .drive
@@ -646,7 +651,7 @@ impl CloudDrive for InterruptedThumbnailDrive {
 }
 
 #[tokio::test]
-async fn seed_before_listing_withholds_unseeded_media_during_transient_errors() {
+async fn offline_listing_seeds_retryable_fail_markers_and_recovers_after_reconnect() {
     let dir = tempfile::tempdir().unwrap();
     let cache = dir.path().join("thumbnails");
     let drive = Arc::new(InterruptedThumbnailDrive {
@@ -668,6 +673,7 @@ async fn seed_before_listing_withholds_unseeded_media_during_transient_errors() 
         ItemKind::File,
     ));
     inner.upsert(item("code-file", Some("code"), "script.ts", ItemKind::File));
+    inner.upsert(item("notes", Some("unseeded"), "notes.txt", ItemKind::File));
     let rendition = thumbnail(image::ImageFormat::Jpeg);
     inner.set_thumbnail("good", rendition.clone());
     inner.set_thumbnail("retry", rendition);
@@ -679,33 +685,35 @@ async fn seed_before_listing_withholds_unseeded_media_during_transient_errors() 
     drive.offline.store(true, Ordering::Relaxed);
     assert_eq!(list("seeded").await.unwrap().len(), 1);
     assert_eq!(list("code").await.unwrap().len(), 1);
-    assert!(matches!(
-        list("unseeded").await,
-        Err(EngineError::Cloud(CloudError::Unavailable))
-    ));
-    assert!(!cache.join("fail").exists());
+    let offline = list("unseeded").await.unwrap();
+    assert_eq!(
+        offline
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["missing.png", "notes.txt", "retry.qoi"]
+    );
+    for name in ["missing.png", "retry.qoi"] {
+        assert_png(
+            &cache,
+            &format!("file:///tmp/OneDrive%20%234/unseeded/{name}"),
+            MTIME,
+            true,
+        );
+    }
 
     drive.offline.store(false, Ordering::Relaxed);
     drive.rendition_fails.store(true, Ordering::Relaxed);
-    assert!(matches!(
-        list("unseeded").await,
-        Err(EngineError::Cloud(CloudError::Unavailable))
-    ));
-    assert_eq!(
-        fs::read_dir(cache.join("fail/gnome-thumbnail-factory"))
-            .unwrap()
-            .count(),
-        1
-    );
+    assert_eq!(list("unseeded").await.unwrap().len(), 3);
     assert_png(
         &cache,
-        "file:///tmp/OneDrive%20%234/unseeded/missing.png",
+        "file:///tmp/OneDrive%20%234/unseeded/retry.qoi",
         MTIME,
         true,
     );
 
     drive.rendition_fails.store(false, Ordering::Relaxed);
-    assert_eq!(list("unseeded").await.unwrap().len(), 2);
+    assert_eq!(list("unseeded").await.unwrap().len(), 3);
     assert_png(
         &cache,
         "file:///tmp/OneDrive%20%234/unseeded/retry.qoi",
@@ -718,4 +726,30 @@ async fn seed_before_listing_withholds_unseeded_media_during_transient_errors() 
     );
     assert_eq!(inner.thumbnail_download_requests(), ["good", "retry"]);
     assert!(inner.range_requests().is_empty());
+}
+
+#[tokio::test]
+async fn thumbnail_reseeds_on_etag_change_only_without_ctag() {
+    let fixture = Fixture::new();
+    let mut tagged = item("tagged", Some("root"), "tagged.png", ItemKind::File);
+    tagged.ctag = Some("content".into());
+    let mut photo = item("photo", Some("root"), "photo.png", ItemKind::File);
+    for file in [&mut tagged, &mut photo] {
+        file.etag = Some("version-1".into());
+        fixture.drive.upsert(file.clone());
+        fixture
+            .drive
+            .set_thumbnail(&file.item_id, thumbnail(image::ImageFormat::Png));
+    }
+    fixture.engine.sync().await.unwrap();
+    fixture.readdir("root").await;
+    for mut file in [tagged, photo] {
+        file.etag = Some("version-2".into());
+        fixture.drive.upsert(file);
+    }
+    fixture.engine.sync().await.unwrap();
+    fixture.readdir("root").await;
+    let downloads = fixture.drive.thumbnail_download_requests();
+    assert_eq!(downloads.len(), 3);
+    assert_eq!(downloads[2], "photo");
 }

@@ -444,7 +444,7 @@ async fn failed_full_hydration_retry_keeps_low_disk_warning() {
     ));
     assert!(engine.cache_status().unwrap().hydration_paused_low_disk);
 
-    // Opening a socket as a cached range produces an I/O error before the disk check.
+    // A socket invalidates the cached range, so hydration still hits the disk floor.
     let namespace = std::fs::read_dir(fixture.temp.path().join("cache"))
         .unwrap()
         .next()
@@ -460,7 +460,7 @@ async fn failed_full_hydration_retry_keeps_low_disk_warning() {
     let header = generation.join("-1");
     std::fs::remove_file(&header).unwrap();
     let _socket = std::os::unix::net::UnixListener::bind(header).unwrap();
-    assert!(matches!(engine.sync().await, Err(EngineError::CacheIo(_))));
+    engine.sync().await.unwrap();
     assert!(engine.cache_status().unwrap().hydration_paused_low_disk);
 
     engine.purge("file").unwrap();
@@ -482,6 +482,17 @@ async fn failed_range_evicts_an_idle_hydrated_file_and_over_budget_partial_bytes
         ItemKind::File,
         2 * 1024 * 1024 + 1,
     );
+    fixture.drive.upsert(RemoteItem {
+        item_id: "interrupted".into(),
+        parent_id: Some("root".into()),
+        name: Some("interrupted".into()),
+        kind: ItemKind::File,
+        size: 2 * 1024 * 1024 + 1,
+        mtime: 1,
+        etag: Some("tag".into()),
+        ctag: None,
+        quickxor_hash: None,
+    });
     let engine = fixture.open();
     engine.sync().await.unwrap();
     engine.read(inode(&engine, "idle"), 0, 8).await.unwrap();

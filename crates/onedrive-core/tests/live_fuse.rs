@@ -271,7 +271,7 @@ fn exercise_mount(dir: &Path) {
         kind: ItemKind::File,
         size: bytes.len() as u64,
         etag: Some("\"version-1\"".into()),
-        ctag: Some("content-1".into()),
+        ctag: None,
         ..root.clone()
     };
     drive.upsert(root.clone());
@@ -371,7 +371,7 @@ fn exercise_mount(dir: &Path) {
     let accessed = fs::metadata(&path).unwrap();
     assert_eq!(accessed.atime(), 1_800_000_000);
     assert_eq!(accessed.atime_nsec(), 123_000_000);
-    // Reopening a cached page can result in zero FUSE read callbacks.
+    // Reopening a file with cached content refreshes its retention age.
     clock
         .0
         .store(6 * 86_400, std::sync::atomic::Ordering::Relaxed);
@@ -411,9 +411,8 @@ fn exercise_mount(dir: &Path) {
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(drive.range_requests().len(), 3);
 
-    // Content changes with unchanged size and mtime require explicit kernel
-    // invalidation. The old descriptor already has these pages resident.
-    file.ctag = Some("content-2".into());
+    // With no cTag and unchanged size and mtime, eTag is the only signal.
+    // The mapping is already resident when the replacement commits.
     file.etag = Some("\"version-2\"".into());
     drive.upsert(file.clone());
     let new_bytes = vec![147; bytes.len()];
@@ -673,6 +672,9 @@ fn exercise_thumbnails(dir: &Path, desktop: bool) {
         });
         drive.set_content(name, original.clone());
     }
+    if !desktop {
+        drive.set_thumbnail("retry.qoi", rendition.clone());
+    }
     drive.set_thumbnail(seeded.file_name().unwrap().to_str().unwrap(), rendition);
     let network = Arc::new(OfflineThumbnailDrive {
         inner: drive.clone(),
@@ -768,7 +770,7 @@ fn exercise_thumbnails(dir: &Path, desktop: bool) {
         }
     }
 
-    let gnome = command("python")
+    let gnome = command("python3")
         .args([
             "-c",
             r#"
@@ -812,23 +814,42 @@ assert not factory.can_thumbnail(failed, "image/x-jp2-codestream", 1700000000)
         "{code_listing:?}"
     );
     let unseen_folder = unseen.parent().unwrap();
-    let error = fs::read_dir(unseen_folder)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(
-        error.raw_os_error(),
-        Some(rustix::io::Errno::IO.raw_os_error())
+    let offline_listing = list(unseen_folder);
+    assert!(offline_listing.status.success(), "{offline_listing:?}");
+    assert!(
+        offline_listing.stdout.starts_with(b"retry.qoi\t"),
+        "{offline_listing:?}"
     );
-    let unavailable = list(unseen_folder);
-    assert!(unavailable.stdout.is_empty(), "{unavailable:?}");
+    let thumbnail_info = || {
+        let result = command("gio")
+            .args(["info", "-a", "thumbnail::*"])
+            .arg(&unseen)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        String::from_utf8(result.stdout).unwrap()
+    };
+    let offline_thumbnail = thumbnail_info();
+    assert!(
+        offline_thumbnail.contains("thumbnail::is-valid: TRUE"),
+        "{offline_thumbnail}"
+    );
+    assert!(
+        offline_thumbnail.contains("thumbnail::failed: TRUE"),
+        "{offline_thumbnail}"
+    );
     assert_eq!(drive.thumbnail_list_requests(), ["root"]);
 
     network.offline.store(false, Ordering::Relaxed);
     let retried = list(unseen_folder);
     assert!(retried.status.success(), "{retried:?}");
     assert!(retried.stdout.starts_with(b"retry.qoi\t"), "{retried:?}");
+    let online_thumbnail = thumbnail_info();
+    assert!(
+        online_thumbnail.contains("thumbnail::is-valid: TRUE"),
+        "{online_thumbnail}"
+    );
+    assert!(online_thumbnail.contains("/x-large/"), "{online_thumbnail}");
     assert_eq!(drive.thumbnail_list_requests(), ["root", "unseen"]);
     assert_eq!(events.next().unwrap_err(), rustix::io::Errno::AGAIN);
     assert!(drive.range_requests().is_empty());

@@ -203,8 +203,8 @@ impl Engine {
             .await
     }
 
-    // Withhold unseeded entries when seeding fails so desktop thumbnailers
-    // cannot fall back to downloading originals. A later listing retries.
+    // A temporary fail marker keeps the desktop thumbnailer away from the
+    // original while leaving the remote rendition eligible for retry.
     async fn seed_before_listing(
         &self,
         folder_id: &str,
@@ -223,24 +223,36 @@ impl Engine {
             }
             // A pending move may target a folder that does not yet exist on
             // OneDrive. Seed a temporary failure marker until it reaches Graph.
-            let renditions: HashMap<_, _> = if unseeded.iter().any(|target| !target.pending_move) {
+            let renditions = if unseeded.iter().any(|target| !target.pending_move) {
                 self.cloud
                     .list_thumbnails(folder_id)
-                    .await?
-                    .into_iter()
-                    .map(|thumbnail| (thumbnail.item_id.clone(), thumbnail))
-                    .collect()
+                    .await
+                    .map(|thumbnails| {
+                        thumbnails
+                            .into_iter()
+                            .map(|thumbnail| (thumbnail.item_id.clone(), thumbnail))
+                            .collect::<HashMap<_, _>>()
+                    })
             } else {
-                HashMap::new()
+                Ok(HashMap::new())
             };
             let results: Vec<_> = stream::iter(unseeded)
-                .map(|target| {
-                    let rendition = if target.pending_move {
-                        None
-                    } else {
-                        renditions.get(&target.item_id)
-                    };
-                    self.prepare_thumbnail(target, rendition, thumbnail_root)
+                .map(|target| async {
+                    if let Ok(renditions) = &renditions {
+                        let rendition = if target.pending_move {
+                            None
+                        } else {
+                            renditions.get(&target.item_id)
+                        };
+                        if let Ok(prepared) = self
+                            .prepare_thumbnail(target, rendition, thumbnail_root, false)
+                            .await
+                        {
+                            return Ok(prepared);
+                        }
+                    }
+                    self.prepare_thumbnail(target, None, thumbnail_root, true)
+                        .await
                 })
                 .buffer_unordered(CONCURRENT_THUMBNAILS)
                 .collect()
@@ -270,6 +282,7 @@ impl Engine {
         target: &Target,
         rendition: Option<&RemoteThumbnail>,
         thumbnail_root: &Path,
+        retry: bool,
     ) -> Result<PreparedThumbnail, EngineError> {
         let bytes = match rendition {
             Some(rendition) => Some(self.cloud.download_thumbnail(rendition).await?),
@@ -277,7 +290,12 @@ impl Engine {
         };
         let failed = bytes.is_none();
         let (path, other) = target.cache_paths(thumbnail_root, failed);
-        let metadata = target.metadata.clone();
+        let mut metadata = target.metadata.clone();
+        if retry {
+            // GIO uses URI and mtime. The seeder additionally checks the
+            // content key, so the temporary marker is retryable across restarts.
+            metadata.content.push_str(":retry");
+        }
         tokio::task::spawn_blocking(move || {
             let pixels = thumbnail_pixels(bytes)?;
             let directory = path.parent().expect("cache file has a parent directory");
@@ -324,8 +342,6 @@ impl PreparedThumbnail {
     }
 }
 
-// Only an absent rendition in the folder response creates a fail marker.
-// Cloud errors and invalid payloads leave the item eligible for a retry.
 fn thumbnail_pixels(bytes: Option<Vec<u8>>) -> Result<RgbaImage, EngineError> {
     let Some(bytes) = bytes else {
         return Ok(RgbaImage::new(1, 1));
@@ -354,7 +370,13 @@ impl Target {
         let mut content = format!(
             "{namespace}:{:x}:{:x}:{}",
             md5::compute(&entry.item_id),
-            md5::compute(entry.ctag.as_deref().unwrap_or_default()),
+            md5::compute(
+                entry
+                    .ctag
+                    .as_deref()
+                    .or(entry.etag.as_deref())
+                    .unwrap_or_default()
+            ),
             entry.size
         );
         if pending_move {

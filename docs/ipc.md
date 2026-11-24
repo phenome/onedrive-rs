@@ -72,7 +72,7 @@ catalog in `catalog.sqlite3.staging`. File content is cached under
 `$XDG_CACHE_HOME/onedrive-rs` (default `~/.cache/onedrive-rs`).
 
 Delta sync runs on startup and then every `delta_poll_interval_secs`, measured
-from the completion of the previous background pass. The default is 60 seconds.
+from the completion of the previous metadata pass. Pinned content downloads run independently, so a slow download can span several polls. The default is 60 seconds.
 `pause` prevents new background delta passes and suspends the upload worker.
 An active delta pass can finish. `sync` can run while paused and drains pending
 uploads after a successful delta pass. `resume` wakes both workers. SIGINT and

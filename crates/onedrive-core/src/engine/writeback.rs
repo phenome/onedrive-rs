@@ -542,8 +542,20 @@ impl Engine {
         if job(&db, inode)?.is_some_and(|job| job.deleted) {
             return Err(EngineError::NotFound);
         }
+        // Kernel cache hits need not issue a FUSE read, even across opens.
+        db.execute("UPDATE items SET last_accessed_at = max(coalesce(last_accessed_at, 0), ?2)
+                    WHERE inode = ?1 AND inode IN (SELECT inode FROM sparse_files WHERE inode = ?1)",
+            params![inode, self.access_time()])?;
         self.register_open(inode);
         Ok(())
+    }
+
+    pub(super) fn file_is_open(&self, inode: u64) -> bool {
+        self.writeback
+            .open_files
+            .lock()
+            .unwrap()
+            .contains_key(&inode)
     }
 
     fn register_open(&self, inode: u64) {

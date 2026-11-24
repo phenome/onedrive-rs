@@ -95,6 +95,12 @@ impl CloudDrive for IsolatedCloud {
         if_match: Option<&str>,
     ) -> Result<RemoteItem, CloudError> {
         self.check_upload_connection()?;
+        if let UploadTarget::Existing { item_id: "content" } = target
+            && self.dir.join("peer-edit-content").exists()
+        {
+            fs::remove_file(self.dir.join("peer-edit-content")).unwrap();
+            self.fake.upload(target, b"peer edit", None).await?;
+        }
         let uploaded = self.fake.upload_from(target, source, if_match).await?;
         let bytes = self
             .fake
@@ -102,6 +108,17 @@ impl CloudDrive for IsolatedCloud {
             .await?;
         fs::write(self.dir.join("uploaded-bytes"), bytes).unwrap();
         Ok(uploaded)
+    }
+
+    async fn move_if_match(
+        &self,
+        id: &str,
+        parent: &str,
+        name: &str,
+        etag: &str,
+    ) -> Result<RemoteItem, CloudError> {
+        self.check_upload_connection()?;
+        self.fake.move_if_match(id, parent, name, etag).await
     }
 }
 
@@ -404,6 +421,18 @@ fn mounted_daemon_observes_remote_deletion_on_the_next_poll() {
             .unwrap()
             .success()
     });
+    let mut pin = bounded_for("30s", env!("CARGO_BIN_EXE_onedrive-rs"));
+    sandbox.env(&mut pin);
+    let mut pin = pin
+        .args(["--json", "pin"])
+        .arg(sandbox.mount.join("blocked.txt"))
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(|| sandbox.dir().join("read-started").exists());
+    wait_for(|| sandbox.dir().join("resumed-cursor").exists());
+    // The first scheduled poll has found the persistent Pin. Even though its
+    // range request remains stalled, the following poll must apply this delta.
     fs::write(sandbox.dir().join("remote-delete-cached"), "").unwrap();
     wait_for(|| {
         !bounded("test")
@@ -414,6 +443,52 @@ fn mounted_daemon_observes_remote_deletion_on_the_next_poll() {
             .success()
     });
     assert!(mounted(&sandbox.mount));
+    sandbox.stop(Signal::TERM);
+    assert!(!pin.wait().unwrap().success());
+}
+
+#[test]
+fn uploads_lists_preserved_conflicts_after_the_queue_drains() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start(false);
+    let document = sandbox.mount.join("content.txt");
+    wait_for(|| {
+        bounded("test")
+            .arg("-f")
+            .arg(&document)
+            .status()
+            .unwrap()
+            .success()
+    });
+    fs::write(sandbox.dir().join("peer-edit-content"), "").unwrap();
+    assert!(
+        bounded("sh")
+            .args(["-c", "printf local > \"$1\"", "write"])
+            .arg(&document)
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for(|| {
+        !sandbox.dir().join("peer-edit-content").exists()
+            && sandbox.cli("status")["result"]["pending_upload_count"] == 0
+    });
+    let uploads = sandbox.cli("uploads");
+    let entries = uploads["result"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["sync_state"], "conflict");
+    let relative = entries[0]["path"]
+        .as_str()
+        .unwrap()
+        .strip_prefix('/')
+        .unwrap();
+    let copy = sandbox.mount.join(relative);
+    assert_eq!(xattr(&copy, "state"), "Conflict");
+    assert_eq!(bounded("cat").arg(copy).output().unwrap().stdout, b"local");
+    assert_eq!(
+        bounded("cat").arg(document).output().unwrap().stdout,
+        b"peer edit"
+    );
     sandbox.stop(Signal::TERM);
 }
 

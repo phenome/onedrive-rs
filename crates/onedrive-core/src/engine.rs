@@ -236,6 +236,12 @@ impl Engine {
     }
 
     pub async fn sync(&self) -> Result<(), EngineError> {
+        self.sync_catalog().await?;
+        self.hydrate_pending_pins().await
+    }
+
+    /// Commit remote metadata independently of potentially slow content transfers.
+    pub async fn sync_catalog(&self) -> Result<(), EngineError> {
         let _sync = self.syncing.lock().await;
         // Age-based eviction also runs when the cloud is unavailable.
         self.evict()?;
@@ -263,11 +269,7 @@ impl Engine {
                 Err(error) => return Err(error.into()),
             };
             if self.commit_page(page, revision)? {
-                self.evict()?;
-                return match self.hydrate_pins(None).await {
-                    Err(EngineError::LowDisk) => Ok(()),
-                    result => result,
-                };
+                return self.evict();
             }
         }
     }

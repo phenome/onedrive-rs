@@ -55,6 +55,14 @@ fn live_thumbnail_validation() {
     supervise_mount("live_thumbnail_validation", exercise_thumbnail_validation);
 }
 
+#[test]
+#[ignore = "requires Nautilus 51, Xvfb, nautilus-python and ImageMagick"]
+fn live_nautilus_preview() {
+    supervise_mount("live_nautilus_preview", |dir| {
+        exercise_thumbnails(dir, true)
+    });
+}
+
 fn supervise_mount(test: &str, exercise: fn(&Path)) {
     if let Some(dir) = std::env::var_os(WORKER_DIR) {
         exercise(Path::new(&dir));
@@ -75,7 +83,7 @@ fn supervise_mount(test: &str, exercise: fn(&Path)) {
     let result = worker
         .args(["-k", "3s", "45s"])
         .arg(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
+        .args(["--exact", test, "--nocapture", "--include-ignored"])
         .env("XDG_CACHE_HOME", temp.path().join("xdg-cache"))
         .env("GIO_USE_VFS", "local")
         .env("GSETTINGS_BACKEND", "memory")
@@ -435,6 +443,10 @@ impl CloudDrive for OfflineThumbnailDrive {
 }
 
 fn exercise_thumbnail_validation(dir: &Path) {
+    exercise_thumbnails(dir, false);
+}
+
+fn exercise_thumbnails(dir: &Path, desktop: bool) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mount = dir.join("mount");
     let drive = Arc::new(FakeCloudDrive::new(100));
@@ -451,25 +463,27 @@ fn exercise_thumbnail_validation(dir: &Path) {
     };
     drive.upsert(root.clone());
     let seeded = mount.join("café; #%.png");
-    let failed = mount.join("failed.j2k");
+    let failed = mount.join(if desktop { "failed.png" } else { "failed.j2k" });
     let unseen = mount.join("unseen/retry.qoi");
     let code = mount.join("code/script.ts");
-    for folder in ["unseen", "code"] {
-        drive.upsert(RemoteItem {
-            item_id: folder.into(),
-            parent_id: Some("root".into()),
-            name: Some(folder.into()),
-            ..root.clone()
-        });
-    }
-    for (name, folder) in [("retry.qoi", "unseen"), ("script.ts", "code")] {
-        drive.upsert(RemoteItem {
-            item_id: name.into(),
-            parent_id: Some(folder.into()),
-            name: Some(name.into()),
-            kind: ItemKind::File,
-            ..root.clone()
-        });
+    if !desktop {
+        for folder in ["unseen", "code"] {
+            drive.upsert(RemoteItem {
+                item_id: folder.into(),
+                parent_id: Some("root".into()),
+                name: Some(folder.into()),
+                ..root.clone()
+            });
+        }
+        for (name, folder) in [("retry.qoi", "unseen"), ("script.ts", "code")] {
+            drive.upsert(RemoteItem {
+                item_id: name.into(),
+                parent_id: Some(folder.into()),
+                name: Some(name.into()),
+                kind: ItemKind::File,
+                ..root.clone()
+            });
+        }
     }
     let mut rendition = Cursor::new(Vec::new());
     image::RgbImage::from_pixel(800, 400, image::Rgb([0, 100, 200]))
@@ -501,6 +515,43 @@ fn exercise_thumbnail_validation(dir: &Path) {
     let mounted = FuseAdapter::new(engine, runtime.handle().clone())
         .mount(&mount)
         .unwrap();
+
+    if desktop {
+        let probe =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../desktop/nautilus/tests/desktop.sh");
+        assert!(
+            Command::new("timeout")
+                .args(["-k", "3s", "30s", "bash"])
+                .arg(probe)
+                .arg(dir)
+                .arg(&mount)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(drive.thumbnail_list_requests(), ["root"]);
+        let mut reads = drive.range_requests();
+        reads.sort();
+        assert_eq!(
+            reads,
+            [
+                ("café; #%.png".into(), 0, HEADER),
+                ("failed.png".into(), 0, HEADER)
+            ]
+        );
+        println!("Nautilus source reads before Pin: {reads:?}");
+        assert!(
+            command("fusermount3")
+                .arg("-u")
+                .arg(&mount)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(mount_type(&mount).is_none());
+        mounted.join().unwrap();
+        return;
+    }
 
     let watch =
         inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();

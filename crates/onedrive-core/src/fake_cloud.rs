@@ -59,9 +59,13 @@ impl FakeCloudDrive {
         while let Some(parent) = removed.pop() {
             state.contents.remove(&parent);
             state.items.remove(&parent);
-            removed.extend(state.items.iter().filter_map(|(id, item)| {
-                (item.parent_id.as_deref() == Some(&parent)).then(|| id.clone())
-            }));
+            removed.extend(
+                state
+                    .items
+                    .values()
+                    .filter(|item| item.parent_id.as_deref() == Some(&parent))
+                    .map(|item| item.item_id.clone()),
+            );
         }
         state.changes.push(DeltaChange::Delete(item_id.into()));
     }

@@ -424,6 +424,18 @@ impl Filesystem for FuseAdapter {
         }
     }
 
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Namespace mutations commit synchronously to the catalog.
+        reply.ok();
+    }
+
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         match self.engine.cache_capacity() {
             Ok(space) => reply.statfs(

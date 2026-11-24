@@ -17,6 +17,7 @@ use crate::{CloudError, DeltaChange, DeltaCursor, DeltaRequest, RemoteItem, Uplo
 pub(super) struct Writeback {
     root: PathBuf,
     changed: Arc<Notify>,
+    uploading: tokio::sync::Mutex<()>,
     open_files: Mutex<HashMap<u64, usize>>,
 }
 
@@ -52,6 +53,7 @@ impl Writeback {
         Ok(Self {
             root,
             changed: Arc::new(Notify::new()),
+            uploading: tokio::sync::Mutex::new(()),
             open_files: Mutex::default(),
         })
     }
@@ -514,12 +516,17 @@ impl Engine {
 
     /// Drain currently runnable work. The catalog lock is released during all cloud calls.
     pub async fn drain_uploads(&self) -> Result<usize, EngineError> {
-        // Delta must not apply a snapshot taken before an upload acknowledgment.
-        let _sync = self.syncing.lock().await;
+        let _uploading = self.writeback.uploading.lock().await;
         let mut completed = 0;
         let mut skipped = HashSet::new();
         let mut first_error = None;
-        while let Some(work) = self.next_upload(&skipped)? {
+        loop {
+            // Serialize each upload acknowledgment with delta so it can't apply a
+            // stale snapshot. Other delta work can proceed between uploads.
+            let _sync = self.syncing.lock().await;
+            let Some(work) = self.next_upload(&skipped)? else {
+                break;
+            };
             match self.upload(&work).await {
                 Ok(()) => completed += 1,
                 Err(EngineError::Cloud(CloudError::Conflict))

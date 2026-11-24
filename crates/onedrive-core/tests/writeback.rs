@@ -42,6 +42,7 @@ async fn staged_bytes_survive_restart_and_upload_keeps_the_inode() {
     assert_ne!(uploaded.item_id, file.item_id);
     assert_eq!(uploaded.sync_state, SyncState::Clean);
     assert!(uploaded.etag.is_some() && uploaded.ctag.is_some());
+    assert_eq!(uploaded.mtime, 1_700_000_001);
     drive.set_online(false);
     assert_eq!(engine.read(file.inode, 0, 20).await.unwrap(), b"\0\0draft");
 }

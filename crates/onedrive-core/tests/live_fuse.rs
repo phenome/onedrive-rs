@@ -304,6 +304,7 @@ fn exercise_writeback(dir: &Path) {
     fs::write(mount.join("work/final"), b"previous").unwrap();
     let old_handle = File::open(mount.join("work/final")).unwrap();
     fs::rename(&draft, mount.join("work/final")).unwrap();
+    File::open(mount.join("work")).unwrap().sync_all().unwrap();
     assert!(!draft.exists());
     assert_eq!(old_handle.metadata().unwrap().nlink(), 0);
     let mut previous = Vec::new();

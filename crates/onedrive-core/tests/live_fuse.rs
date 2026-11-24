@@ -13,11 +13,15 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use async_trait::async_trait;
 
 use rustix::fs::inotify;
 
 use onedrive_core::{
-    Engine, FakeCloudDrive, FuseAdapter, ItemKind, PinState, RemoteItem, SystemClock,
+    CloudDrive, CloudError, DeltaPage, DeltaRequest, Engine, FakeCloudDrive, FuseAdapter, ItemKind,
+    PinState, RemoteItem, RemoteThumbnail, SystemClock,
 };
 
 const WORKER_DIR: &str = "ONEDRIVE_LIVE_FUSE_WORKER_DIR";
@@ -86,6 +90,17 @@ fn supervise_mount(test: &str, exercise: fn(&Path)) {
             panic!("could not unmount {}", retained.join("mount").display());
         }
     }
+    let directory = temp.keep();
+    assert!(
+        command("rm")
+            .args(["-rf", "--"])
+            .arg(&directory)
+            .status()
+            .unwrap()
+            .success(),
+        "could not remove {}",
+        directory.display(),
+    );
     assert!(result.unwrap().success());
 }
 
@@ -266,6 +281,38 @@ fn assert_xattrs(path: &Path, state: &[u8], pin: &[u8], etag: &[u8]) {
     assert_eq!(xattr::get(path, "user.onedrive.missing").unwrap(), None);
 }
 
+struct OfflineThumbnailDrive {
+    inner: Arc<FakeCloudDrive>,
+    offline: AtomicBool,
+}
+
+#[async_trait]
+impl CloudDrive for OfflineThumbnailDrive {
+    async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
+        self.inner.delta(request).await
+    }
+
+    async fn read_range(
+        &self,
+        id: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        self.inner.read_range(id, offset, length).await
+    }
+
+    async fn list_thumbnails(&self, folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
+        if self.offline.load(Ordering::Relaxed) {
+            return Err(CloudError::Unavailable);
+        }
+        self.inner.list_thumbnails(folder_id).await
+    }
+
+    async fn download_thumbnail(&self, rendition: &RemoteThumbnail) -> Result<Vec<u8>, CloudError> {
+        self.inner.download_thumbnail(rendition).await
+    }
+}
+
 fn exercise_thumbnail_validation(dir: &Path) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mount = dir.join("mount");
@@ -283,7 +330,26 @@ fn exercise_thumbnail_validation(dir: &Path) {
     };
     drive.upsert(root.clone());
     let seeded = mount.join("café; #%.png");
-    let failed = mount.join("failed.png");
+    let failed = mount.join("failed.j2k");
+    let unseen = mount.join("unseen/retry.qoi");
+    let code = mount.join("code/script.ts");
+    for folder in ["unseen", "code"] {
+        drive.upsert(RemoteItem {
+            item_id: folder.into(),
+            parent_id: Some("root".into()),
+            name: Some(folder.into()),
+            ..root.clone()
+        });
+    }
+    for (name, folder) in [("retry.qoi", "unseen"), ("script.ts", "code")] {
+        drive.upsert(RemoteItem {
+            item_id: name.into(),
+            parent_id: Some(folder.into()),
+            name: Some(name.into()),
+            kind: ItemKind::File,
+            ..root.clone()
+        });
+    }
     let mut rendition = Cursor::new(Vec::new());
     image::RgbImage::from_pixel(800, 400, image::Rgb([0, 100, 200]))
         .write_to(&mut rendition, image::ImageFormat::Png)
@@ -304,8 +370,12 @@ fn exercise_thumbnail_validation(dir: &Path) {
         drive.set_content(name, original.clone());
     }
     drive.set_thumbnail(seeded.file_name().unwrap().to_str().unwrap(), rendition);
+    let network = Arc::new(OfflineThumbnailDrive {
+        inner: drive.clone(),
+        offline: AtomicBool::new(false),
+    });
     let engine =
-        Arc::new(Engine::open(dir.join("db"), drive.clone(), Arc::new(SystemClock)).unwrap());
+        Arc::new(Engine::open(dir.join("db"), network.clone(), Arc::new(SystemClock)).unwrap());
     runtime.block_on(engine.sync()).unwrap();
     let mounted = FuseAdapter::new(engine, runtime.handle().clone())
         .mount(&mount)
@@ -313,7 +383,7 @@ fn exercise_thumbnail_validation(dir: &Path) {
 
     let watch =
         inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
-    for path in [&seeded, &failed] {
+    for path in [&seeded, &failed, &unseen, &code] {
         inotify::add_watch(
             &watch,
             path,
@@ -326,7 +396,7 @@ fn exercise_thumbnail_validation(dir: &Path) {
 
     let directory = fs::read_dir(&mount).unwrap();
     assert!(drive.thumbnail_list_requests().is_empty());
-    assert_eq!(directory.collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+    assert_eq!(directory.collect::<Result<Vec<_>, _>>().unwrap().len(), 4);
 
     for path in [&seeded, &failed] {
         let gio = command("gio")
@@ -361,7 +431,7 @@ seeded, failed = (Gio.File.new_for_path(path).get_uri() for path in sys.argv[1:]
 factory = GnomeDesktop.DesktopThumbnailFactory.new(GnomeDesktop.DesktopThumbnailSize.XLARGE)
 assert factory.lookup(seeded, 1700000000)
 assert factory.has_valid_failed_thumbnail(failed, 1700000000)
-assert not factory.can_thumbnail(failed, "image/png", 1700000000)
+assert not factory.can_thumbnail(failed, "image/x-jp2-codestream", 1700000000)
 "#,
         ])
         .arg(&seeded)
@@ -374,6 +444,33 @@ assert not factory.can_thumbnail(failed, "image/png", 1700000000)
         String::from_utf8_lossy(&gnome.stderr)
     );
 
+    network.offline.store(true, Ordering::Relaxed);
+    let list = |path: &Path| {
+        command("gio")
+            .args(["list", "-a", "standard::name"])
+            .arg(path)
+            .output()
+            .unwrap()
+    };
+    assert!(list(&mount).status.success());
+    assert!(list(code.parent().unwrap()).status.success());
+    let unseen_folder = unseen.parent().unwrap();
+    let error = fs::read_dir(unseen_folder)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(rustix::io::Errno::IO.raw_os_error())
+    );
+    let unavailable = list(unseen_folder);
+    assert!(unavailable.stdout.is_empty(), "{unavailable:?}");
+    assert_eq!(drive.thumbnail_list_requests(), ["root"]);
+
+    network.offline.store(false, Ordering::Relaxed);
+    assert!(list(unseen.parent().unwrap()).status.success());
+    assert_eq!(drive.thumbnail_list_requests(), ["root", "unseen"]);
     assert_eq!(events.next().unwrap_err(), rustix::io::Errno::AGAIN);
     assert!(drive.range_requests().is_empty());
 

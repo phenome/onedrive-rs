@@ -26,8 +26,8 @@ resulting package and the optional `nautilus-python` dependency to enable status
 emblems and Pin and Purge actions on individually selected OneDrive items.
 
 With a Secret Service keyring available, authenticate with `onedrive-rs auth login`.
-Start the mount and register the
-OneDrive sidebar bookmark for the current user.
+Start the mount and register the OneDrive sidebar bookmark for the current user.
+After signing in to a different account, restart the service to switch the mount.
 
 ```sh
 systemctl --user enable --now onedrive-rs.service

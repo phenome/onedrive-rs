@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 
 use super::{Engine, writeback::Writeback};
@@ -13,6 +14,17 @@ fn sqlite_companion(database: &Path, suffix: &str) -> PathBuf {
 }
 
 impl Engine {
+    /// Inspect an offline catalog without opening its cache or staging directory.
+    pub fn stored_root_id(database: &Path) -> rusqlite::Result<Option<String>> {
+        let db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.query_row(
+            "SELECT item_id FROM items WHERE inode = 1 AND parent_id IS NULL AND kind = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
     /// Relocate an offline catalog on the same filesystem. The caller owns
     /// exclusive locks on both storage directories for the entire operation.
     pub fn relocate_catalog(source: &Path, destination: &Path) -> io::Result<()> {

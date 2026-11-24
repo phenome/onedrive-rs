@@ -9,6 +9,7 @@ use std::time::Duration;
 use onedrive_core::{
     CloudDrive, Config, Engine, FuseAdapter, SyncState as ItemSyncState, SystemClock,
 };
+use onedrive_graph::GraphDrive;
 use rustix::fs::{FlockOperation, flock};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
@@ -52,11 +53,34 @@ fn xdg_home(variable: &str, fallback: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Set {variable} or HOME to an absolute path"))
 }
 
+mod drive_storage;
+
 /// Run the foreground daemon with the selected cloud backend.
 pub async fn run(
     config: Config,
     cli_mount: Option<&Path>,
     cloud: Arc<dyn CloudDrive>,
+) -> Result<(), String> {
+    run_daemon(config, cli_mount, Backend::Injected(cloud)).await
+}
+
+pub async fn run_graph(
+    config: Config,
+    cli_mount: Option<&Path>,
+    cloud: GraphDrive,
+) -> Result<(), String> {
+    run_daemon(config, cli_mount, Backend::Graph(Box::new(cloud))).await
+}
+
+enum Backend {
+    Graph(Box<GraphDrive>),
+    Injected(Arc<dyn CloudDrive>),
+}
+
+async fn run_daemon(
+    config: Config,
+    cli_mount: Option<&Path>,
+    backend: Backend,
 ) -> Result<(), String> {
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
@@ -73,21 +97,35 @@ pub async fn run(
         .map_err(|error| format!("Cannot bind OneDrive IPC socket ({error})"))?;
     let listener = server.async_listener().map_err(|error| error.to_string())?;
     let _data_lock = prepare_storage(&data, &cache)?;
-    let _legacy_lock = match xdg_home("XDG_STATE_HOME", ".local/state") {
-        Ok(state) => migrate_legacy_catalog(&state.join("onedrive-rs"), &data)
-            .map_err(|error| format!("Cannot migrate OneDrive catalog ({error})"))?,
-        Err(_) => None,
+    let legacy_state = xdg_home("XDG_STATE_HOME", ".local/state")
+        .ok()
+        .map(|state| state.join("onedrive-rs"));
+    let (engine, _legacy_lock) = match backend {
+        Backend::Graph(cloud) => {
+            let engine =
+                drive_storage::open(&data, &cache, legacy_state.as_deref(), *cloud, config)
+                    .await
+                    .map_err(|error| format!("Cannot open OneDrive catalog ({error})"))?;
+            (engine, None)
+        }
+        Backend::Injected(cloud) => {
+            let legacy_lock = match legacy_state {
+                Some(state) => migrate_legacy_catalog(&state, &data)
+                    .map_err(|error| format!("Cannot migrate OneDrive catalog ({error})"))?,
+                None => None,
+            };
+            let engine = Engine::open_with_config(
+                data.join("catalog.sqlite3"),
+                cache,
+                cloud,
+                Arc::new(SystemClock),
+                config,
+            )
+            .map_err(|error| format!("Cannot open OneDrive catalog at {data:?} ({error})"))?;
+            (engine, legacy_lock)
+        }
     };
-    let engine = Arc::new(
-        Engine::open_with_config(
-            data.join("catalog.sqlite3"),
-            cache,
-            cloud,
-            Arc::new(SystemClock),
-            config,
-        )
-        .map_err(|error| format!("Cannot open OneDrive catalog at {data:?} ({error})"))?,
-    );
+    let engine = Arc::new(engine);
     prepare_mount(&mount)
         .map_err(|error| format!("Cannot prepare mount at {mount:?} ({error})"))?;
     let (shutdown, fuse_shutdown) = watch::channel(());

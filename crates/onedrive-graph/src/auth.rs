@@ -283,6 +283,19 @@ impl Auth {
         })
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_with_authority(
+        authority: &str,
+        store: Arc<FakeTokenStore>,
+    ) -> Result<Self, AuthError> {
+        Self::with_authority(
+            "synthetic-client",
+            Url::parse(authority).map_err(|_| AuthError::Initialize)?,
+            store,
+        )
+    }
+
     pub async fn login(&self) -> Result<(), AuthError> {
         self.login_with(open_system_browser).await
     }

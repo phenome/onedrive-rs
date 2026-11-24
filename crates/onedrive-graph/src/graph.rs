@@ -10,6 +10,8 @@ use reqwest::header::{self, HeaderValue};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Instant, sleep_until};
 
 use crate::{Auth, AuthError};
@@ -24,19 +26,49 @@ pub struct GraphDrive {
     base: Url,
     client: Client,
     pause_until: Mutex<Instant>,
+    binding: DriveBinding,
+    verified: AsyncMutex<Option<(String, String)>>,
+}
+
+enum DriveBinding {
+    Unselected,
+    Selected(String),
+    #[cfg(test)]
+    Unchecked,
 }
 
 impl GraphDrive {
     pub fn new(auth: Arc<Auth>) -> Result<Self, CloudError> {
-        Self::with_base(auth, Url::parse(GRAPH_BASE).expect("constant Graph URL"))
+        Self::build(
+            auth,
+            Url::parse(GRAPH_BASE).expect("constant Graph URL"),
+            DriveBinding::Unselected,
+        )
     }
 
+    #[cfg(test)]
     fn with_base(auth: Arc<Auth>, base: Url) -> Result<Self, CloudError> {
+        Self::build(auth, base, DriveBinding::Unchecked)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_with_base(auth: Arc<Auth>, base: &str) -> Result<Self, CloudError> {
+        let base = Url::parse(base).map_err(|_| CloudError::InvalidResponse)?;
+        if base.host_str() != Some("127.0.0.1") {
+            return Err(CloudError::InvalidResponse);
+        }
+        Self::build(auth, base, DriveBinding::Unselected)
+    }
+
+    fn build(auth: Arc<Auth>, base: Url, binding: DriveBinding) -> Result<Self, CloudError> {
         Ok(Self {
             auth,
             base,
             client: crate::http_client().map_err(|_| CloudError::Unavailable)?,
             pause_until: Mutex::new(Instant::now()),
+            binding,
+            verified: AsyncMutex::new(None),
         })
     }
 
@@ -50,8 +82,24 @@ impl GraphDrive {
     }
 
     fn continuation(&self, value: &str) -> Result<Url, CloudError> {
-        let url = parse_url(value)?;
+        let url = self.parse_url(value)?;
         if url.origin() != self.base.origin() {
+            return Err(CloudError::InvalidResponse);
+        }
+        Ok(url)
+    }
+
+    fn parse_url(&self, value: &str) -> Result<Url, CloudError> {
+        let url = Url::parse(value).map_err(|_| CloudError::InvalidResponse)?;
+        let loopback = cfg!(any(test, feature = "test-support"))
+            && self.base.host_str() == Some("127.0.0.1")
+            && url.scheme() == "http"
+            && url.host_str() == Some("127.0.0.1");
+        if (url.scheme() != "https" && !loopback)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
             return Err(CloudError::InvalidResponse);
         }
         Ok(url)
@@ -67,22 +115,109 @@ impl GraphDrive {
         }
     }
 
-    async fn graph(&self, request: RequestBuilder) -> Result<Response, CloudError> {
+    /// A filesystem-safe key derived from the authenticated personal drive ID.
+    pub async fn discover_drive(&self) -> Result<String, CloudError> {
         self.wait_until_allowed().await;
-        let bearer = self.auth.bearer().await.map_err(|error| match error {
+        let bearer = self.bearer().await?;
+        self.identify(&bearer).await
+    }
+
+    /// Keep the namespace fixed for the lifetime of the mounted Engine.
+    pub fn bind(mut self, drive_key: String) -> Self {
+        self.binding = DriveBinding::Selected(drive_key);
+        self
+    }
+
+    pub async fn root_id(&self) -> Result<String, CloudError> {
+        let root: DriveItem = decode(
+            self.graph(self.client.get(self.endpoint(&["root"])))
+                .await?,
+        )
+        .await?;
+        if root.id.is_empty() || root.folder.is_none() || root.deleted.is_some() {
+            return Err(CloudError::InvalidResponse);
+        }
+        Ok(root.id)
+    }
+
+    async fn bearer(&self) -> Result<String, CloudError> {
+        self.auth.bearer().await.map_err(|error| match error {
             AuthError::LoginRequired
             | AuthError::GrantRejected
             | AuthError::Denied
             | AuthError::MissingClientId => CloudError::Authentication,
             AuthError::InvalidToken => CloudError::InvalidResponse,
             _ => CloudError::Unavailable,
-        })?;
-        self.send(request.bearer_auth(bearer)).await
+        })
+    }
+
+    async fn identify(&self, bearer: &str) -> Result<String, CloudError> {
+        let mut verified = self.verified.lock().await;
+        if let Some((token, drive)) = verified.as_ref()
+            && token == bearer
+        {
+            return Ok(drive.clone());
+        }
+        self.wait_until_allowed().await;
+        #[derive(Deserialize)]
+        struct Drive {
+            id: String,
+        }
+        let mut url = self.endpoint(&[]);
+        url.query_pairs_mut().append_pair("$select", "id");
+        let drive: Drive = decode(
+            self.dispatch(self.client.get(url).bearer_auth(bearer))
+                .await?,
+        )
+        .await?;
+        if drive.id.is_empty() {
+            return Err(CloudError::InvalidResponse);
+        }
+        let key = format!("{:x}", Sha256::digest(drive.id.as_bytes()));
+        *verified = Some((bearer.to_owned(), key.clone()));
+        Ok(key)
+    }
+
+    async fn bound_bearer(&self) -> Result<String, CloudError> {
+        let bound = match &self.binding {
+            DriveBinding::Selected(bound) => bound,
+            DriveBinding::Unselected => return Err(CloudError::Authentication),
+            #[cfg(test)]
+            DriveBinding::Unchecked => return self.bearer().await,
+        };
+        loop {
+            self.wait_until_allowed().await;
+            let bearer = self.bearer().await?;
+            if self.identify(&bearer).await? != *bound {
+                return Err(CloudError::Authentication);
+            }
+            // The identity probe may take time. Recheck the credentials before
+            // using this bearer or dispatching a signed URL without a bearer.
+            if self.bearer().await? == bearer && *self.pause_until.lock().unwrap() <= Instant::now()
+            {
+                return Ok(bearer);
+            }
+        }
+    }
+
+    async fn graph(&self, request: RequestBuilder) -> Result<Response, CloudError> {
+        self.wait_until_allowed().await;
+        let bearer = self.bound_bearer().await?;
+        self.dispatch(request.bearer_auth(bearer)).await
     }
 
     async fn send(&self, request: RequestBuilder) -> Result<Response, CloudError> {
-        let request = request.build().map_err(|_| CloudError::InvalidResponse)?;
         self.wait_until_allowed().await;
+        #[cfg(test)]
+        if matches!(self.binding, DriveBinding::Unchecked) {
+            return self.dispatch(request).await;
+        }
+        self.bound_bearer().await?;
+        self.dispatch(request).await
+    }
+
+    async fn dispatch(&self, request: RequestBuilder) -> Result<Response, CloudError> {
+        let request = request.build().map_err(|_| CloudError::InvalidResponse)?;
         let response = self
             .client
             .execute(request)
@@ -110,7 +245,7 @@ impl GraphDrive {
         // A signed URL may keep serving an old version after its item changes.
         let url = self.endpoint(&["items", item_id]);
         let metadata: Metadata = decode(self.graph(self.client.get(url)).await?).await?;
-        parse_url(&metadata.download_url)
+        self.parse_url(&metadata.download_url)
     }
 
     async fn resumable_upload(
@@ -134,7 +269,7 @@ impl GraphDrive {
         };
         let request = conditional(self.client.post(url).json(&body), if_match);
         let session: Session = decode(self.graph(request).await?).await?;
-        let url = parse_url(&session.upload_url)?;
+        let url = self.parse_url(&session.upload_url)?;
         let mut start = 0;
         let mut recoveries = 0;
         let mut final_uncertain = false;
@@ -254,7 +389,7 @@ impl GraphDrive {
                 .download_url
                 .as_deref()
                 .ok_or(CloudError::Unavailable)
-                .and_then(parse_url)?;
+                .and_then(|url| self.parse_url(url))?;
             let request = self
                 .client
                 .get(url)
@@ -389,7 +524,7 @@ impl CloudDrive for GraphDrive {
     }
 
     async fn download_thumbnail(&self, thumbnail: &RemoteThumbnail) -> Result<Vec<u8>, CloudError> {
-        let url = parse_url(&thumbnail.url)?;
+        let url = self.parse_url(&thumbnail.url)?;
         let response = successful(self.send(self.client.get(url)).await?)?;
         response
             .bytes()
@@ -578,19 +713,6 @@ fn retry_after(response: &Response) -> Duration {
         })
         .filter(|delay| Instant::now().checked_add(*delay).is_some())
         .unwrap_or(Duration::from_secs(1))
-}
-
-fn parse_url(value: &str) -> Result<Url, CloudError> {
-    let url = Url::parse(value).map_err(|_| CloudError::InvalidResponse)?;
-    let loopback = cfg!(test) && url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
-    if (url.scheme() != "https" && !loopback)
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(CloudError::InvalidResponse);
-    }
-    Ok(url)
 }
 
 fn conditional(request: RequestBuilder, if_match: Option<&str>) -> RequestBuilder {

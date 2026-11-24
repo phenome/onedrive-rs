@@ -200,7 +200,7 @@ async fn secret_service_replaces_synthetic_refresh_token_across_store_instances(
 
 #[tokio::test]
 async fn refresh_outage_and_rejected_grant_have_distinct_graph_errors() {
-    use onedrive_core::{CloudDrive, CloudError, DeltaRequest};
+    use onedrive_core::CloudError;
 
     for (status, expected) in [
         (503, CloudError::Unavailable),
@@ -216,10 +216,7 @@ async fn refresh_outage_and_rejected_grant_have_distinct_graph_errors() {
             .mount(&server)
             .await;
         let graph = crate::GraphDrive::new(Arc::new(mock_auth(&server, store))).unwrap();
-        assert_eq!(
-            graph.delta(DeltaRequest::Initial).await.err(),
-            Some(expected)
-        );
+        assert_eq!(graph.discover_drive().await.err(), Some(expected));
     }
 }
 

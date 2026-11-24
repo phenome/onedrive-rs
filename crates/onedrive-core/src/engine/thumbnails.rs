@@ -175,11 +175,13 @@ impl Directory {
                     Ok((row.get::<_, u64>(0)?, (row.get(1)?, row.get(2)?)))
                 })?
                 .collect::<Result<HashMap<u64, (bool, bool)>, _>>()?;
+            let namespace: String =
+                snapshot.query_row("SELECT name FROM sparse_namespace", [], |row| row.get(0))?;
             let relative = path_for(&snapshot, folder_id)?.ok_or(EngineError::NotFound)?;
             let path = mountpoint.join(relative.strip_prefix("/").expect("absolute catalog path"));
             targets.extend(media.filter_map(|entry| {
                 let (staged, moved) = pending.get(&entry.inode).copied().unwrap_or_default();
-                (!staged).then(|| Target::new(entry, &path, moved))
+                (!staged).then(|| Target::new(entry, &path, moved, &namespace))
             }));
         }
         Ok(Self { entries, targets })
@@ -345,12 +347,12 @@ fn thumbnail_pixels(bytes: Option<Vec<u8>>) -> Result<RgbaImage, EngineError> {
 }
 
 impl Target {
-    fn new(entry: &CatalogItem, folder: &Path, pending_move: bool) -> Self {
+    fn new(entry: &CatalogItem, folder: &Path, pending_move: bool, namespace: &str) -> Self {
         let uri = file_uri(&folder.join(&entry.name));
         let filename = format!("{:x}.png", md5::compute(&uri));
         // A different item or content generation can occupy the same URI and second.
         let mut content = format!(
-            "{:x}:{:x}:{}",
+            "{namespace}:{:x}:{:x}:{}",
             md5::compute(&entry.item_id),
             md5::compute(entry.ctag.as_deref().unwrap_or_default()),
             entry.size

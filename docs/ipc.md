@@ -61,15 +61,26 @@ shape `{"ok":true,"result":{"signed_in":false}}`.
 Auth operations in the same desktop D-Bus session coordinate by client ID.
 Logout waits for any credential rotation already in progress, then deletes
 the stored credential. The daemon rechecks the credential before using cached
-access. Requests that have already obtained an access token can still finish.
+access. Every new access token is checked against the authenticated personal
+drive before the daemon sends file operations, delta continuations, or uses
+signed URLs. Requests dispatched before a credential change can finish.
 
-After signing in, run `onedrive-rs daemon` in the foreground. The default mount
-is `$XDG_RUNTIME_DIR/onedrive`. The daemon creates the mount directory if needed
-and requires it to be empty. The catalog and delta checkpoint are stored in
-`$XDG_DATA_HOME/onedrive-rs/catalog.sqlite3` (default
-`~/.local/share/onedrive-rs/catalog.sqlite3`). Dirty staging lives beside the
-catalog in `catalog.sqlite3.staging`. File content is cached under
-`$XDG_CACHE_HOME/onedrive-rs` (default `~/.cache/onedrive-rs`).
+The default mount is `$XDG_RUNTIME_DIR/onedrive`. The daemon creates the mount
+directory if needed and requires it to be empty. After signing in to a different
+account, restart the daemon to mount that account's drive. With the systemd unit,
+run `systemctl --user restart onedrive-rs.service`. The current mount keeps its own
+local data and queues writes offline until credentials for its drive are restored
+or the daemon restarts. Switching back restores the original drive's catalog
+and Dirty queue. When startup cannot verify credentials or reach Graph, the
+daemon opens the last verified drive for offline use. A first start without a
+verified drive mounts an empty filesystem. Sign in and restart to populate it.
+
+The catalog and delta checkpoint live at
+`$XDG_DATA_HOME/onedrive-rs/drives/<drive-key>/catalog.sqlite3`
+(default data home `~/.local/share`). The key is the SHA-256 digest of the
+verified drive ID. Dirty staging lives beside the catalog in
+`catalog.sqlite3.staging`. Each catalog owns a separate sparse content
+namespace under `$XDG_CACHE_HOME/onedrive-rs` (default `~/.cache/onedrive-rs`).
 
 Delta sync runs on startup and then every `delta_poll_interval_secs`, measured
 from the completion of the previous background pass. The default is 60 seconds.
@@ -78,9 +89,14 @@ An active delta pass can finish. `sync` can run while paused and drains pending
 uploads after a successful delta pass. `resume` wakes both workers. SIGINT and
 SIGTERM end requests in flight, unmount the filesystem, and remove the socket.
 Committed delta pages, dirty staging, and cache files survive the restart.
-A catalog from the earlier XDG state layout is checkpointed and moved when
-the two directories are on the same filesystem. Startup reports an error if
-both locations contain catalogs or if the filesystem move fails.
+The daemon can adopt an earlier unscoped catalog from
+`$XDG_DATA_HOME/onedrive-rs/catalog.sqlite3` or
+`$XDG_STATE_HOME/onedrive-rs/catalog.sqlite3` (default state home
+`~/.local/state`). Adoption requires exactly one source whose root item ID
+matches the authenticated drive root, an unused destination, and a same-filesystem
+move. The daemon checkpoints SQLite and moves Dirty staging with the catalog.
+When the root is unknown or the catalogs conflict, the daemon logs the paths
+and leaves the catalog, WAL, and staging bytes in place for recovery.
 
 Status reports cached content bytes, the cache filesystem's free disk floor,
 and the count of queued uploads. A second sync request returns an error while

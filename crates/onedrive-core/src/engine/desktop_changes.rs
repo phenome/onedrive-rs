@@ -139,7 +139,7 @@ mod tests {
         let root = RemoteItem {
             item_id: "root".into(),
             parent_id: None,
-            name: None,
+            name: Some("root".into()),
             kind: ItemKind::Folder,
             size: 0,
             mtime: 1,

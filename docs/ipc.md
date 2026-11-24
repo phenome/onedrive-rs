@@ -67,8 +67,8 @@ After signing in, run `onedrive-rs daemon` in the foreground. The default mount
 is `$XDG_RUNTIME_DIR/onedrive`. The daemon creates the mount directory if needed
 and requires it to be empty. The catalog and delta checkpoint are stored in
 `$XDG_DATA_HOME/onedrive-rs/catalog.sqlite3` (default
-`~/.local/share/onedrive-rs/catalog.sqlite3`). Dirty staging lives beside the catalog in
-`catalog.sqlite3.staging`. File content is cached under
+`~/.local/share/onedrive-rs/catalog.sqlite3`). Dirty staging lives beside the
+catalog in `catalog.sqlite3.staging`. File content is cached under
 `$XDG_CACHE_HOME/onedrive-rs` (default `~/.cache/onedrive-rs`).
 
 Delta sync runs on startup and then every `delta_poll_interval_secs`, measured
@@ -83,7 +83,7 @@ the two directories are on the same filesystem. Startup reports an error if
 both locations contain catalogs or if the filesystem move fails.
 
 Status reports cached content bytes, the cache filesystem's free disk floor,
-and the count of queued uploads. A second sync
-request returns an error while a delta pass is active. Pin and sync requests
-can run for up to five minutes. The daemon reserves connection capacity for
-short requests while these operations run.
+and the count of queued uploads. A second sync request returns an error while
+a delta pass is active. Pin and sync requests can run for up to five minutes.
+The daemon reserves connection capacity for short requests while these
+operations run.

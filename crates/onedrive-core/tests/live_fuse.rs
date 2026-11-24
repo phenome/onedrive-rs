@@ -700,6 +700,17 @@ fn exercise_writeback(dir: &Path) {
     });
     let open =
         || Arc::new(Engine::open(dir.join("db"), drive.clone(), Arc::new(SystemClock)).unwrap());
+    drive.upsert(RemoteItem {
+        item_id: "cloud-image".into(),
+        parent_id: Some("root".into()),
+        name: Some("cloud.png".into()),
+        kind: ItemKind::File,
+        size: 5,
+        mtime: 100,
+        etag: None,
+        ctag: None,
+        quickxor_hash: None,
+    });
     let engine = open();
     runtime.block_on(engine.sync()).unwrap();
     drive.set_online(false);
@@ -740,9 +751,9 @@ with open(sys.argv[1], 'r+b') as file:
     assert_eq!(fs::read(&draft).unwrap(), b"fYrst\0\0!");
 
     fs::create_dir(mount.join("work")).unwrap();
-    fs::write(mount.join("work/final"), b"previous").unwrap();
-    let old_handle = File::open(mount.join("work/final")).unwrap();
-    fs::rename(&draft, mount.join("work/final")).unwrap();
+    fs::write(mount.join("work/final.png"), b"previous").unwrap();
+    let old_handle = File::open(mount.join("work/final.png")).unwrap();
+    fs::rename(&draft, mount.join("work/final.png")).unwrap();
     File::open(mount.join("work")).unwrap().sync_all().unwrap();
     assert!(!draft.exists());
     assert_eq!(old_handle.metadata().unwrap().nlink(), 0);
@@ -751,8 +762,33 @@ with open(sys.argv[1], 'r+b') as file:
     assert_eq!(previous, b"previous");
     drop(old_handle);
 
-    let file = engine.resolve_path("/work/final").unwrap().unwrap();
-    assert_xattrs(&mount.join("work/final"), b"Dirty", b"none", b"");
+    let file = engine.resolve_path("/work/final.png").unwrap().unwrap();
+    assert_xattrs(&mount.join("work/final.png"), b"Dirty", b"none", b"");
+    let names: Vec<_> = fs::read_dir(mount.join("work"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["final.png"]);
+    let cloud_image = mount.join("cloud.png");
+    let moved_image = mount.join("work/cloud.png");
+    fs::rename(&cloud_image, &moved_image).unwrap();
+    let mut names: Vec<_> = fs::read_dir(mount.join("work"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["cloud.png", "final.png"]);
+    let info = command("gio")
+        .args(["info", "-a", "thumbnail::*"])
+        .arg(&moved_image)
+        .output()
+        .unwrap();
+    assert!(info.status.success(), "{info:?}");
+    let info = String::from_utf8(info.stdout).unwrap();
+    assert!(info.contains("thumbnail::failed: TRUE"), "{info}");
+    assert!(info.contains("thumbnail::is-valid: TRUE"), "{info}");
+    assert!(drive.range_requests().is_empty());
+    fs::rename(&moved_image, &cloud_image).unwrap();
     assert!(matches!(
         engine.check_purge(&file.item_id),
         Err(EngineError::PendingUpload { .. })
@@ -770,17 +806,25 @@ with open(sys.argv[1], 'r+b') as file:
     let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
         .mount(&mount)
         .unwrap();
-    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fYrst\0\0!");
     assert_eq!(
-        fs::metadata(mount.join("work/final")).unwrap().mode() & 0o777,
+        fs::read(mount.join("work/final.png")).unwrap(),
+        b"fYrst\0\0!"
+    );
+    assert_eq!(
+        fs::metadata(mount.join("work/final.png")).unwrap().mode() & 0o777,
         0o640
     );
-    assert_xattrs(&mount.join("work/final"), b"Dirty", b"none", b"");
+    assert_xattrs(&mount.join("work/final.png"), b"Dirty", b"none", b"");
+    let names: Vec<_> = fs::read_dir(mount.join("work"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["final.png"]);
     let worker = runtime.spawn(Engine::run_upload_worker(Arc::downgrade(&engine)));
     drive.set_online(true);
     let deadline = Instant::now() + Duration::from_secs(7);
     let uploaded = loop {
-        let item = engine.resolve_path("/work/final").unwrap().unwrap();
+        let item = engine.resolve_path("/work/final.png").unwrap().unwrap();
         if item.sync_state == SyncState::Clean {
             break item;
         }
@@ -793,20 +837,27 @@ with open(sys.argv[1], 'r+b') as file:
     engine.check_purge(&uploaded.item_id).unwrap();
     runtime.block_on(engine.sync()).unwrap();
     assert_eq!(
-        engine.resolve_path("/work/final").unwrap().unwrap().inode,
+        engine
+            .resolve_path("/work/final.png")
+            .unwrap()
+            .unwrap()
+            .inode,
         file.inode
     );
-    assert_eq!(engine.list_children("root").unwrap().len(), 1);
-    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fYrst\0\0!");
+    assert_eq!(engine.list_children("root").unwrap().len(), 2);
+    assert_eq!(
+        fs::read(mount.join("work/final.png")).unwrap(),
+        b"fYrst\0\0!"
+    );
     assert_ne!(
-        xattr::get(mount.join("work/final"), "user.onedrive.state")
+        xattr::get(mount.join("work/final.png"), "user.onedrive.state")
             .unwrap()
             .unwrap(),
         b"Dirty"
     );
 
     let folder = engine.resolve_path("/work").unwrap().unwrap();
-    fs::remove_file(mount.join("work/final")).unwrap();
+    fs::remove_file(mount.join("work/final.png")).unwrap();
     fs::remove_dir(mount.join("work")).unwrap();
     assert!(engine.resolve_path("/work").unwrap().is_none());
     let deadline = Instant::now() + Duration::from_secs(7);

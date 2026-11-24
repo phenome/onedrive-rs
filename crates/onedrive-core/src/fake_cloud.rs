@@ -368,6 +368,7 @@ impl CloudDrive for FakeCloudDrive {
     async fn list_thumbnails(&self, folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
         tokio::task::yield_now().await;
         let mut state = self.state.lock().unwrap();
+        state.online()?;
         state.thumbnail_list_requests.push(folder_id.into());
         Ok(state
             .items
@@ -386,6 +387,7 @@ impl CloudDrive for FakeCloudDrive {
     async fn download_thumbnail(&self, thumbnail: &RemoteThumbnail) -> Result<Vec<u8>, CloudError> {
         tokio::task::yield_now().await;
         let mut state = self.state.lock().unwrap();
+        state.online()?;
         state
             .thumbnail_download_requests
             .push(thumbnail.item_id.clone());

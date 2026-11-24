@@ -1,8 +1,11 @@
+use std::os::unix::fs::symlink;
+use std::process::{self, Command};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use onedrive_core::{CloudDrive, CloudError, EngineError, ItemKind, RemoteThumbnail, UploadTarget};
 use onedrive_graph::{Auth, FakeTokenStore, TokenStore};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -97,6 +100,10 @@ impl Fixture {
     }
 
     async fn open(&self) -> Engine {
+        self.try_open().await.unwrap()
+    }
+
+    async fn try_open(&self) -> Result<Engine, StorageError> {
         let _lock = super::super::lock_storage(&self.data).unwrap();
         open(
             &self.data,
@@ -109,7 +116,6 @@ impl Fixture {
             },
         )
         .await
-        .unwrap()
     }
 }
 
@@ -342,4 +348,145 @@ async fn adopts_only_a_verified_legacy_root_and_keeps_its_dirty_bytes() {
         fs::read(orphan.join("unidentified")).unwrap(),
         b"unknown contents"
     );
+}
+
+#[test]
+fn interrupt_legacy_marker_write() {
+    let Some(source) = std::env::var_os("ONEDRIVE_TEST_INTERRUPT_MARKER_SOURCE") else {
+        return;
+    };
+    let db =
+        Connection::open_with_flags(Path::new(&source), OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+    db.execute_batch(
+        "PRAGMA synchronous = FULL;
+         PRAGMA cache_size = 2;
+         BEGIN IMMEDIATE;
+         INSERT INTO catalog_relocation VALUES (1, X'00');
+         UPDATE items SET item_id = 'root-b' WHERE inode = 1;
+         INSERT INTO test_spill VALUES (zeroblob(524288));",
+    )
+    .unwrap();
+    // Exit without dropping the connection, after SQLite spills dirty pages.
+    process::exit(42);
+}
+
+#[tokio::test]
+async fn adoption_recovers_interrupted_marker_and_checks_the_committed_drive_identity() {
+    let fixture = Fixture::new().await;
+    drop(super::super::prepare_storage(&fixture.state, &fixture.cache).unwrap());
+    let source = fixture.state.join(CATALOG);
+    fixture.sign_in("a").await;
+    let key_a = fixture.graph().discover_drive().await.unwrap();
+    let legacy = Engine::open_with_cache(
+        &source,
+        &fixture.cache,
+        Arc::new(fixture.graph().bind(key_a.clone())),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    legacy.sync().await.unwrap();
+    let draft = legacy.create(1, "interrupted.txt", ItemKind::File).unwrap();
+    let bytes = b"legacy dirty bytes across rollback";
+    legacy.write(draft.inode, 0, bytes, false).await.unwrap();
+    drop(legacy);
+    Engine::checkpoint_for_relocation(&source).unwrap();
+    Connection::open(&source)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE catalog_relocation (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 destination BLOB NOT NULL
+             );
+             CREATE TABLE test_spill (payload BLOB);",
+        )
+        .unwrap();
+    let crash = || {
+        let _legacy_lock = super::super::lock_storage(&fixture.state).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::drive_storage::tests::interrupt_legacy_marker_write",
+                "--nocapture",
+            ])
+            .env("ONEDRIVE_TEST_INTERRUPT_MARKER_SOURCE", &source)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(42));
+
+        let readonly =
+            Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let result = readonly.query_row("SELECT item_id FROM items WHERE inode = 1", [], |row| {
+            row.get::<_, String>(0)
+        });
+        assert!(matches!(
+            result,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK
+        ));
+    };
+    crash();
+    let journal = source.with_file_name(format!("{CATALOG}-journal"));
+    let saved = fixture.state.join("saved-journal");
+    let destination = fixture.data.join("drives").join(&key_a).join(CATALOG);
+
+    // An unsafe journal entry prevents recovery. Preserve both files for a retry.
+    fs::rename(&journal, &saved).unwrap();
+    symlink(&saved, &journal).unwrap();
+    let source_before = fs::read(&source).unwrap();
+    let journal_before = fs::read(&saved).unwrap();
+    let error = fixture.try_open().await.err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("Cannot recover legacy OneDrive catalog")
+    );
+    assert_eq!(fs::read(&source).unwrap(), source_before);
+    assert_eq!(fs::read(&saved).unwrap(), journal_before);
+    assert!(!Engine::catalog_storage_present(&destination).unwrap());
+    assert!(
+        selected_drive(&fixture.data.join("active-drive"))
+            .unwrap()
+            .is_none()
+    );
+    fs::remove_file(&journal).unwrap();
+    fs::rename(saved, &journal).unwrap();
+
+    fixture.sign_in("b").await;
+    let foreign = fixture.open().await;
+    assert!(foreign.root().unwrap().is_none());
+    foreign.sync().await.unwrap();
+    assert_root(&foreign, "root-b");
+    assert!(foreign.pending_uploads().unwrap().is_empty());
+    assert!(source.is_file());
+    assert!(source.with_added_extension("staging").is_dir());
+    assert!(!journal.exists());
+    drop(foreign);
+
+    crash();
+    fixture.sign_in("a").await;
+    let adopted = fixture.open().await;
+    assert_root(&adopted, "root-a");
+    assert_eq!(adopted.pending_uploads().unwrap().len(), 1);
+    assert_eq!(
+        adopted.read(draft.inode, 0, bytes.len()).await.unwrap(),
+        bytes
+    );
+    assert!(!Engine::catalog_storage_present(&source).unwrap());
+    assert!(destination.is_file());
+}
+
+#[tokio::test]
+async fn drive_open_preserves_an_orphaned_destination_rollback_journal() {
+    let fixture = Fixture::new().await;
+    fixture.sign_in("a").await;
+    let key = fixture.graph().discover_drive().await.unwrap();
+    let directory = fixture.data.join("drives").join(key);
+    ensure_private_directory(&directory).unwrap();
+    let journal = directory.join(format!("{CATALOG}-journal"));
+    fs::write(&journal, b"preserve for recovery").unwrap();
+
+    let error = fixture.try_open().await.err().unwrap();
+    assert!(error.to_string().contains("catalog missing"));
+    assert_eq!(fs::read(journal).unwrap(), b"preserve for recovery");
+    assert!(!directory.join(CATALOG).exists());
 }

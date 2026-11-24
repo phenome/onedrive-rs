@@ -49,9 +49,10 @@ fn live_nautilus_retention() {
     let runner =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../desktop/nautilus/tests/retention.sh");
     let status = Command::new("timeout")
-        .args(["-k", "10s", "45s", "bash"])
+        .args(["-k", "10s", "55s", "bash"])
         .arg(runner)
         .arg(env::current_exe().unwrap())
+        .arg(env!("CARGO_BIN_EXE_onedrive-rs"))
         .status()
         .unwrap();
     assert!(
@@ -78,13 +79,19 @@ fn desktop_fixture_worker() {
         quickxor_hash: None,
     };
     fake.upsert(folder.clone());
+    fake.upsert(RemoteItem {
+        item_id: "media".into(),
+        parent_id: Some("root".into()),
+        name: Some("media".into()),
+        ..folder.clone()
+    });
     let preview = fs::read(root.join("fixture.png")).unwrap();
     let mut original = preview.clone();
     original.resize(12 * 1024 * 1024, 0);
     for name in ["café; #%.png", "failed.png"] {
         fake.upsert(RemoteItem {
             item_id: name.into(),
-            parent_id: Some("root".into()),
+            parent_id: Some("media".into()),
             name: Some(name.into()),
             kind: ItemKind::File,
             size: original.len() as u64,

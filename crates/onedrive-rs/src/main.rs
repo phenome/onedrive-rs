@@ -229,6 +229,7 @@ fn render_reply(request: Request, result: Value) -> Result<String, String> {
         Request::Sync {} => "Sync completed".into(),
         Request::Pause {} => "Paused background sync".into(),
         Request::Resume {} => "Resumed background sync".into(),
+        Request::DesktopChanges { .. } => unreachable!("desktop-only IPC request"),
     };
     Ok(output)
 }

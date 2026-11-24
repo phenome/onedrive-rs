@@ -709,14 +709,23 @@ fn exercise_thumbnails(dir: &Path, desktop: bool) {
             ]
         );
         println!("Nautilus source reads before Pin: {reads:?}");
-        assert!(
-            command("fusermount3")
-                .arg("-u")
+        // Bubblewrap can release the desktop process's FUSE references just
+        // after its launcher exits. Retry regular unmount within the worker deadline.
+        let mut unmounted = false;
+        for _ in 0..3 {
+            if Command::new("timeout")
+                .args(["-k", "1s", "2s", "fusermount3", "-u"])
                 .arg(&mount)
                 .status()
                 .unwrap()
                 .success()
-        );
+            {
+                unmounted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        assert!(unmounted, "could not unmount the desktop fixture");
         assert!(mount_type(&mount).is_none());
         mounted.join().unwrap();
         return;

@@ -16,6 +16,8 @@ use crate::{
 };
 
 mod catalog_invalidation;
+mod desktop_changes;
+pub use desktop_changes::DesktopChanges;
 mod relocation;
 mod retention;
 mod sparse_cache;
@@ -214,6 +216,7 @@ impl Engine {
         retention::initialize_cached_access_times(&transaction, clock.as_ref())?;
         transaction.commit()?;
         catalog_invalidation::install(&db)?;
+        desktop_changes::install(&db)?;
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
         let writeback = writeback::Writeback::open(database.as_ref(), &mut db)?;
         let engine = Self {

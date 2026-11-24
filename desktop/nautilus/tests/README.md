@@ -32,7 +32,10 @@ cargo test --locked -p onedrive-rs --test nautilus_fixture live_nautilus_retenti
 This runs the real daemon against the fake cloud and checks its read telemetry
 before Pin. It opens the native context menu and activates Pin and Purge through
 keyboard input. The fixture checks both socket replies, FUSE xattrs, the
-emblem rendered in the same window, and pinned byte counts.
+emblem rendered in the same window, and pinned byte counts. It then runs CLI
+Sticky Pin, Unpin, and Purge along with POSIX read hydration. After each change,
+it checks the rendered emblem and context actions on the same visible tile
+without navigating or reopening the folder.
 The runner signals only its daemon worker, checks that the socket and mount are
 gone, and removes the temporary files. It reports a retained mount path if
 fallback unmount also fails. For a screenshot when assertions fail, set

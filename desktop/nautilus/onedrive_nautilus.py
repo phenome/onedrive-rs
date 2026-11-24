@@ -22,7 +22,9 @@ STATE_EMBLEMS = {
 PIN_EMBLEM = "starred-symbolic"
 PIN_VALUES = {"none", "pinned", "unpin_override"}
 MAX_RESPONSE_BYTES = 64 * 1024
-FILE_TYPE = "standard::type"
+FILE_IDENTITY = "standard::type,unix::inode"
+OBSERVATION_INTERVAL_MS = 750
+MAX_STATUS_CHECKS = 8
 STATE_XATTR = "xattr::onedrive.state"
 PIN_XATTR = "xattr::onedrive.pin"
 PRIORITY = GLib.PRIORITY_DEFAULT
@@ -78,10 +80,11 @@ def read_status(path, mount, cancellable, complete):
     """Check each path component without following links, then read item xattrs."""
     relative = path.relative_to(mount)
     components = iter(relative.parts)
+    inodes = []
 
     def query(component):
         parent = component != path
-        attributes = FILE_TYPE if parent else f"{FILE_TYPE},{STATE_XATTR},{PIN_XATTR}"
+        attributes = FILE_IDENTITY if parent else f"{FILE_IDENTITY},{STATE_XATTR},{PIN_XATTR}"
         Gio.File.new_for_path(os.fspath(component)).query_info_async(
             attributes, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, PRIORITY,
             cancellable, finish_query, component,
@@ -93,6 +96,7 @@ def read_status(path, mount, cancellable, complete):
         except GLib.Error:
             complete(None)
             return
+        inodes.append(info.get_attribute_uint64("unix::inode"))
         if component != path:
             if info.get_file_type() != Gio.FileType.DIRECTORY:
                 complete(None)
@@ -105,19 +109,24 @@ def read_status(path, mount, cancellable, complete):
         state = info.get_attribute_string(STATE_XATTR)
         pin = info.get_attribute_string(PIN_XATTR)
         status = Status.parse(f"{state}:{pin}")
-        complete(("/" + "/".join(relative.parts), status) if status else None)
+        complete(("/" + "/".join(relative.parts), status, tuple(inodes)) if status else None)
 
     query(mount)
 
 
 def request(socket_path, operation, path, complete):
     # A folder Pin can wait for recursive hydration.
-    client = Gio.SocketClient(enable_proxy=False, timeout=300)
+    exchange(socket_path, {"op": operation, "path": path}, 300, None,
+             lambda _result, error: complete(error))
+
+
+def exchange(socket_path, message, timeout, cancellable, complete):
+    client = Gio.SocketClient(enable_proxy=False, timeout=timeout)
     address = Gio.UnixSocketAddress.new(os.fspath(socket_path))
     try:
-        payload = json.dumps({"op": operation, "path": path}, ensure_ascii=False).encode() + b"\n"
+        payload = json.dumps(message, ensure_ascii=False).encode() + b"\n"
     except UnicodeEncodeError:
-        complete("The OneDrive path must be valid UTF-8")
+        complete(None, "The OneDrive path must be valid UTF-8")
         return
     response_bytes = bytearray()
 
@@ -125,24 +134,24 @@ def request(socket_path, operation, path, complete):
         try:
             connection = client.connect_finish(result)
         except GLib.Error as error:
-            complete(str(error))
+            complete(None, str(error))
             return
         connection.get_output_stream().write_all_async(
-            payload, PRIORITY, None, sent, connection
+            payload, PRIORITY, cancellable, sent, connection
         )
 
     def sent(stream, result, connection):
         try:
             stream.write_all_finish(result)
         except GLib.Error as error:
-            finished(connection, str(error))
+            finished(connection, None, str(error))
             return
         read(connection)
 
     def read(connection):
         connection.get_input_stream().read_bytes_async(
             min(4096, MAX_RESPONSE_BYTES + 1 - len(response_bytes)),
-            PRIORITY, None, received, connection,
+            PRIORITY, cancellable, received, connection,
         )
 
     def received(stream, result, connection):
@@ -155,26 +164,33 @@ def request(socket_path, operation, path, complete):
             if not separator:
                 read(connection)
                 return
-            error = response_error(line)
+            value, error = response_result(line)
         except (GLib.Error, ValueError) as failure:
-            error = str(failure)
-        finished(connection, error)
+            value, error = None, str(failure)
+        finished(connection, value, error)
 
-    def finished(connection, error):
+    def finished(connection, value, error):
         connection.close_async(PRIORITY, None, None)
-        complete(error)
+        complete(value, error)
 
-    client.connect_async(address, None, connected)
+    client.connect_async(address, cancellable, connected)
 
 
-def response_error(line):
+def response_result(line):
     response = json.loads(line)
     if isinstance(response, dict):
         if response.get("ok") is True and "result" in response:
-            return None
+            return response["result"], None
         if response.get("ok") is False and isinstance(response.get("error"), str):
-            return response["error"]
+            return None, response["error"]
     raise ValueError("Invalid daemon response")
+
+
+@dataclass
+class ObservedFile:
+    file_ref: object
+    status: Status | None
+    inodes: tuple[int, ...]
 
 
 class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProvider):
@@ -189,10 +205,18 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
         self.pending = {}
         self.active_paths = set()
         self.observed_files = {}
+        self.observation = None
+        self.observation_timer = 0
+        self.cursor = (None, None)
+        self.status_checks = {}
+        self.checking = set()
 
-    def observe(self, file_info):
+    def observe(self, file_info, status, inodes):
         key = hash(file_info)
-        if key in self.observed_files:
+        previous = self.observed_files.get(key)
+        if previous is not None:
+            previous.status = status
+            previous.inodes = inodes
             return
         provider_ref = ref(self)
 
@@ -200,14 +224,130 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
             provider = provider_ref()
             if provider is not None:
                 provider.observed_files.pop(key, None)
+                provider.status_checks.pop(key, None)
+                if not provider.observed_files:
+                    provider.stop_observing()
 
-        # Keep a GObject weak reference so tracking follows the native object's lifetime.
-        self.observed_files[key] = file_info.weak_ref(forget)
+        self.observed_files[key] = ObservedFile(file_info.weak_ref(forget), status, inodes)
+        if self.observation is None:
+            self.observation = Gio.Cancellable()
+            self.schedule_observation()
+
+    def stop_observing(self):
+        if self.observation_timer:
+            GLib.source_remove(self.observation_timer)
+            self.observation_timer = 0
+        self.observation.cancel()
+        self.observation = None
+        self.cursor = (None, None)
+        self.status_checks.clear()
+        self.checking.clear()
+
+    def schedule_observation(self, delay=OBSERVATION_INTERVAL_MS):
+        if self.observation is None:
+            return
+        provider_ref = ref(self)
+
+        def poll():
+            provider = provider_ref()
+            if provider is not None:
+                provider.observation_timer = 0
+                provider.poll_changes()
+            return GLib.SOURCE_REMOVE
+
+        self.observation_timer = GLib.timeout_add(delay, poll)
+
+    def poll_changes(self):
+        provider_ref = ref(self)
+        session = self.observation
+        epoch, since = self.cursor
+
+        def received(result, error):
+            provider = provider_ref()
+            if provider is None or provider.observation is not session:
+                return
+            if error is None and isinstance(result, dict):
+                provider.accept_changes(result)
+                provider.schedule_observation()
+            else:
+                provider.schedule_observation(delay=3000)
+
+        exchange(self.socket_path, {
+            "op": "desktop_changes", "mount": os.fspath(self.mount),
+            "epoch": epoch, "since": since,
+        }, 2, session, received)
+
+    def accept_changes(self, result):
+        epoch, revision, changes = result.get("epoch"), result.get("revision"), result.get("inodes")
+        if not isinstance(epoch, str) or type(revision) is not int:
+            return
+        if changes is not None and (
+            not isinstance(changes, list) or any(
+                not isinstance(change, list) or len(change) != 2
+                or type(change[0]) is not int or type(change[1]) is not bool
+                for change in changes
+            )
+        ):
+            return
+        cursor = (epoch, revision)
+        if cursor == self.cursor:
+            return
+        self.cursor = cursor
+        direct = set()
+        subtrees = set()
+        if changes is not None:
+            for inode, subtree in changes:
+                direct.add(inode)
+                if subtree:
+                    subtrees.add(inode)
+        for key, observed in self.observed_files.items():
+            if (changes is None or observed.inodes[-1] in direct
+                    or subtrees.intersection(observed.inodes)):
+                self.status_checks[key] = None
+        self.check_status_changes()
+
+    def check_status_changes(self):
+        while self.status_checks and len(self.checking) < MAX_STATUS_CHECKS:
+            key = next((key for key in self.status_checks if key not in self.checking), None)
+            if key is None:
+                return
+            del self.status_checks[key]
+            observed = self.observed_files.get(key)
+            file_info = observed.file_ref() if observed is not None else None
+            path = mount_candidate(file_info, self.mount) if file_info is not None else None
+            if path is not None:
+                self.check_status_change(key, path)
+
+    def check_status_change(self, key, path):
+        self.checking.add(key)
+        checked = self.observed_files[key]
+        provider_ref = ref(self)
+        session = self.observation
+
+        def complete(result):
+            provider = provider_ref()
+            if provider is None or provider.observation is not session:
+                return
+            provider.checking.discard(key)
+            observed = provider.observed_files.get(key)
+            file_info = observed.file_ref() if observed is not None else None
+            if observed is checked and file_info is not None and (
+                mount_candidate(file_info, provider.mount) == path
+            ):
+                status = result[1] if result else None
+                if result:
+                    observed.inodes = result[2]
+                if status != observed.status:
+                    observed.status = status
+                    file_info.invalidate_extension_info()
+            provider.check_status_changes()
+
+        read_status(path, self.mount, session, complete)
 
     def invalidate_affected(self, path, selected):
         affected = {selected}
-        for file_ref in tuple(self.observed_files.values()):
-            file_info = file_ref()
+        for observation in tuple(self.observed_files.values()):
+            file_info = observation.file_ref()
             if file_info is None:
                 continue
             observed = mount_candidate(file_info, self.mount)
@@ -224,12 +364,15 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
         path = mount_candidate(file_info, self.mount)
         if path is None:
             return Nautilus.OperationResult.COMPLETE
-        self.observe(file_info)
+        cursor = self.cursor
         cancellable = Gio.Cancellable()
         self.pending[handle] = cancellable
 
         def complete(result):
             self.finish_update(provider, handle, closure, file_info, cancellable, result)
+            if result and cursor != self.cursor and hash(file_info) in self.observed_files:
+                self.status_checks[hash(file_info)] = None
+                self.check_status_changes()
 
         read_status(path, self.mount, cancellable, complete)
         return Nautilus.OperationResult.IN_PROGRESS
@@ -244,7 +387,8 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
             return
         del self.pending[handle]
         if result:
-            _, status = result
+            _, status, inodes = result
+            self.observe(file_info, status, inodes)
             file_info.add_string_attribute(STATUS_ATTRIBUTE, f"{status.state}:{status.pin}")
             for emblem in status.emblems():
                 file_info.add_emblem(emblem)
@@ -263,7 +407,6 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
         if status is None:
             return []
 
-        self.observe(file_info)
         items = []
         for operation, (sensitive, tip) in status.actions().items():
             item = Nautilus.MenuItem(
@@ -296,7 +439,7 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
             if result is None:
                 finish("This item is no longer available in the OneDrive mount")
                 return
-            daemon_path, status = result
+            daemon_path, status, _ = result
             allowed, tip = status.actions().get(operation, (False, "The item's status has changed"))
             if not allowed:
                 finish(tip)

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
+use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
@@ -12,6 +13,16 @@ use crate::{
     Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
     RemoteItem,
 };
+
+mod catalog_invalidation;
+mod sparse_cache;
+mod thumbnails;
+
+pub(crate) use catalog_invalidation::{CatalogInvalidation, CatalogObserver};
+
+use sparse_cache::SparseCache;
+use thumbnails::ThumbnailCache;
+pub(crate) use thumbnails::default_thumbnail_root;
 
 // Recover within the same call when both the saved cursor and the first
 // replacement continuation expire, while keeping repeated expiry bounded.
@@ -25,6 +36,20 @@ pub enum EngineError {
     WalUnavailable,
     #[error("another engine advanced the delta checkpoint")]
     SyncSuperseded,
+    #[error("item does not exist")]
+    NotFound,
+    #[error("cannot read a directory as a file")]
+    IsDirectory,
+    #[error("sparse cache I/O error")]
+    CacheIo(#[from] io::Error),
+    #[error("thumbnail cache I/O error")]
+    ThumbnailIo(#[source] io::Error),
+    #[error("invalid cloud thumbnail")]
+    InvalidThumbnail(#[from] image::ImageError),
+    #[error("could not encode thumbnail PNG")]
+    ThumbnailEncoding(#[from] png::EncodingError),
+    #[error("cloud range did not match the catalog file size")]
+    InvalidRange,
     #[error(transparent)]
     Cloud(#[from] CloudError),
 }
@@ -84,9 +109,12 @@ impl FromSql for SyncState {
 
 pub struct Engine {
     db: Mutex<Connection>,
+    cache: SparseCache,
+    thumbnails: ThumbnailCache,
     cloud: Arc<dyn CloudDrive>,
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
+    observers: Mutex<Vec<Weak<catalog_invalidation::Observer>>>,
 }
 
 const ITEM_COLUMNS: &str =
@@ -99,7 +127,20 @@ impl Engine {
         cloud: Arc<dyn CloudDrive>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, EngineError> {
+        let database = database.as_ref();
+        let mut cache = database.as_os_str().to_owned();
+        cache.push(".cache");
+        Self::open_with_cache(database, PathBuf::from(cache), cloud, clock)
+    }
+
+    pub fn open_with_cache(
+        database: impl AsRef<Path>,
+        cache_dir: impl AsRef<Path>,
+        cloud: Arc<dyn CloudDrive>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, EngineError> {
         let mut db = Connection::open(database)?;
+        db.pragma_update(None, "foreign_keys", true)?;
         let journal: String = db.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         if !journal.eq_ignore_ascii_case("wal") {
             return Err(EngineError::WalUnavailable);
@@ -109,11 +150,16 @@ impl Engine {
         transaction.execute_batch(include_str!("schema.sql"))?;
         crate::namespace::migrate(&transaction)?;
         transaction.commit()?;
+        catalog_invalidation::install(&db)?;
+        let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
         Ok(Self {
+            cache,
+            thumbnails: ThumbnailCache::default(),
             db: Mutex::new(db),
             cloud,
             clock,
             syncing: tokio::sync::Mutex::new(()),
+            observers: Mutex::default(),
         })
     }
 
@@ -181,56 +227,90 @@ impl Engine {
     }
 
     fn commit_page(&self, page: DeltaPage, revision: i64) -> Result<bool, EngineError> {
-        let mut db = self.db();
-        let transaction = db.transaction()?;
-        let (link, complete) = match page.cursor {
-            DeltaCursor::Next(link) => (link, false),
-            DeltaCursor::Complete(link) => (link, true),
-        };
-        advance_checkpoint(&transaction, revision, Some(&link))?;
-        let full_scan = transaction.query_row(
-            "SELECT full_scan FROM delta_checkpoint WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let mut affected = AffectedNames::default();
-        for (position, change) in page.changes.into_iter().enumerate() {
-            apply_change(
-                &transaction,
-                change,
-                full_scan,
-                &mut affected,
-                revision + 1,
-                position,
+        let complete = self.update_catalog(|transaction| {
+            let (link, complete) = match page.cursor {
+                DeltaCursor::Next(link) => (link, false),
+                DeltaCursor::Complete(link) => (link, true),
+            };
+            advance_checkpoint(transaction, revision, Some(&link))?;
+            let full_scan = transaction.query_row(
+                "SELECT full_scan FROM delta_checkpoint WHERE singleton = 1",
+                [],
+                |row| row.get(0),
             )?;
-        }
-        if complete {
-            reconcile_catalog(&transaction, full_scan, &mut affected)?;
-            transaction.execute("UPDATE delta_checkpoint SET full_scan = 0", [])?;
-        }
-        affected.reconcile(&transaction, complete)?;
-        transaction.commit()?;
+            let mut affected = AffectedNames::default();
+            for (position, change) in page.changes.into_iter().enumerate() {
+                apply_change(
+                    transaction,
+                    change,
+                    full_scan,
+                    &mut affected,
+                    revision + 1,
+                    position,
+                )?;
+            }
+            if complete {
+                reconcile_catalog(transaction, full_scan, &mut affected)?;
+                transaction.execute("UPDATE delta_checkpoint SET full_scan = 0", [])?;
+            }
+            affected.reconcile(transaction, complete)?;
+            Ok(complete)
+        })?;
+        self.reclaim_sparse_cache()?;
         Ok(complete)
     }
 
-    fn restart_full_sync(&self, revision: i64) -> Result<(), EngineError> {
+    fn update_catalog<T>(
+        &self,
+        update: impl FnOnce(&Transaction<'_>) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
         let mut db = self.db();
         let transaction = db.transaction()?;
-        advance_checkpoint(&transaction, revision, None)?;
-        let mut affected = AffectedNames::default();
-        affected.extend(
-            &transaction,
-            "SELECT parent_id, name
-            FROM delta_deletions JOIN items USING (item_id)",
-        )?;
-        transaction.execute_batch(
-            "UPDATE delta_checkpoint SET full_scan = 1;
-             DELETE FROM delta_deletions;
-             DELETE FROM full_sync_seen;",
-        )?;
-        affected.reconcile(&transaction, false)?;
+        transaction.execute("DELETE FROM changed_inodes", [])?;
+        transaction.execute("DELETE FROM changed_entries", [])?;
+        let result = update(&transaction)?;
+        let observers: Vec<_> = {
+            let mut observers = self.observers.lock().unwrap();
+            observers.retain(|observer| observer.strong_count() > 0);
+            observers.iter().filter_map(Weak::upgrade).collect()
+        };
+        let invalidations = if observers.is_empty() {
+            Vec::new()
+        } else {
+            catalog_invalidation::collect(&transaction)?
+        };
         transaction.commit()?;
-        Ok(())
+        drop(db);
+        for observer in observers {
+            observer(&invalidations);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn observe_catalog(&self, observer: &CatalogObserver) {
+        self.observers
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(observer));
+    }
+
+    fn restart_full_sync(&self, revision: i64) -> Result<(), EngineError> {
+        self.update_catalog(|transaction| {
+            advance_checkpoint(transaction, revision, None)?;
+            let mut affected = AffectedNames::default();
+            affected.extend(
+                transaction,
+                "SELECT parent_id, name
+                FROM delta_deletions JOIN items USING (item_id)",
+            )?;
+            transaction.execute_batch(
+                "UPDATE delta_checkpoint SET full_scan = 1;
+                 DELETE FROM delta_deletions;
+                 DELETE FROM full_sync_seen;",
+            )?;
+            affected.reconcile(transaction, false)?;
+            Ok(())
+        })
     }
 
     /// Store the explicit directive. Effective sticky pin policy belongs in Engine.
@@ -278,13 +358,7 @@ impl Engine {
     }
 
     pub fn getattr(&self, inode: u64) -> Result<Option<CatalogItem>, EngineError> {
-        Ok(self
-            .db()
-            .prepare_cached(&format!(
-                "SELECT {ITEM_COLUMNS} FROM items WHERE inode = ?1"
-            ))?
-            .query_row([inode], catalog_item)
-            .optional()?)
+        Ok(item_by_inode(&self.db(), inode)?)
     }
 
     pub fn item(&self, item_id: &str) -> Result<Option<CatalogItem>, EngineError> {
@@ -292,12 +366,22 @@ impl Engine {
     }
 
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<CatalogItem>, EngineError> {
+        Ok(list_children(&self.db(), parent_id)?)
+    }
+
+    pub(crate) fn list_directory_entries(
+        &self,
+        parent_id: &str,
+    ) -> Result<Vec<(u64, ItemKind, String)>, EngineError> {
         Ok(self
             .db()
-            .prepare_cached(&format!(
-                "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 ORDER BY coalesce(alias, name), inode"
-            ))?
-            .query_map([parent_id], catalog_item)?
+            .prepare_cached(
+                "SELECT inode, kind, coalesce(alias, name)
+                 FROM items WHERE parent_id = ?1 ORDER BY coalesce(alias, name), inode",
+            )?
+            .query_map([parent_id], |row| {
+                Ok((row.get(0)?, item_kind(row, 1)?, row.get(2)?))
+            })?
             .collect::<Result<_, _>>()?)
     }
 
@@ -327,27 +411,38 @@ impl Engine {
     pub fn path_for(&self, item_id: &str) -> Result<Option<PathBuf>, EngineError> {
         let db = self.db();
         let snapshot = db.unchecked_transaction()?;
-        let mut current = item_by_id(&snapshot, item_id)?;
-        let mut seen = HashSet::new();
-        let mut names = Vec::new();
-        while let Some(item) = current {
-            let Some(parent_id) = item.parent_id else {
-                if item.kind != ItemKind::Folder {
-                    return Ok(None);
-                }
-                let mut path = PathBuf::from("/");
-                path.extend(names.into_iter().rev());
-                return Ok(Some(path));
-            };
-            if !seen.insert(item.item_id) {
+        path_for(&snapshot, item_id)
+    }
+}
+
+fn list_children(db: &Connection, parent_id: &str) -> rusqlite::Result<Vec<CatalogItem>> {
+    db.prepare_cached(&format!(
+        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 ORDER BY coalesce(alias, name), inode"
+    ))?
+    .query_map([parent_id], catalog_item)?
+    .collect()
+}
+
+fn path_for(db: &Connection, item_id: &str) -> Result<Option<PathBuf>, EngineError> {
+    let mut current = item_by_id(db, item_id)?;
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    while let Some(item) = current {
+        let Some(parent_id) = item.parent_id else {
+            if item.kind != ItemKind::Folder {
                 return Ok(None);
             }
-            names.push(item.name);
-            current =
-                item_by_id(&snapshot, &parent_id)?.filter(|parent| parent.kind == ItemKind::Folder);
+            let mut path = PathBuf::from("/");
+            path.extend(names.into_iter().rev());
+            return Ok(Some(path));
+        };
+        if !seen.insert(item.item_id) {
+            return Ok(None);
         }
-        Ok(None)
+        names.push(item.name);
+        current = item_by_id(db, &parent_id)?.filter(|parent| parent.kind == ItemKind::Folder);
     }
+    Ok(None)
 }
 
 fn root(db: &Connection) -> rusqlite::Result<Option<CatalogItem>> {
@@ -374,17 +469,29 @@ fn item_by_id(db: &Connection, item_id: &str) -> rusqlite::Result<Option<Catalog
     .optional()
 }
 
+fn item_by_inode(db: &Connection, inode: u64) -> rusqlite::Result<Option<CatalogItem>> {
+    db.prepare_cached(&format!(
+        "SELECT {ITEM_COLUMNS} FROM items WHERE inode = ?1"
+    ))?
+    .query_row([inode], catalog_item)
+    .optional()
+}
+
+fn item_kind(row: &Row<'_>, index: usize) -> rusqlite::Result<ItemKind> {
+    Ok(if row.get::<_, bool>(index)? {
+        ItemKind::Folder
+    } else {
+        ItemKind::File
+    })
+}
+
 fn catalog_item(row: &Row<'_>) -> rusqlite::Result<CatalogItem> {
     Ok(CatalogItem {
         inode: row.get(0)?,
         item_id: row.get(1)?,
         parent_id: row.get(2)?,
         name: row.get(3)?,
-        kind: if row.get::<_, bool>(4)? {
-            ItemKind::Folder
-        } else {
-            ItemKind::File
-        },
+        kind: item_kind(row, 4)?,
         size: row.get(5)?,
         mtime: row.get(6)?,
         etag: row.get(7)?,

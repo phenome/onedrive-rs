@@ -156,10 +156,12 @@ impl FuseAdapter {
                         .into_iter()
                         .map(|entry| (entry.inode, entry.kind, entry.name))
                         .collect()
-                }),
-            None => self.engine.list_directory_entries(&directory.item_id),
-        }
-        .map_err(errno)?;
+                })?,
+            None => self
+                .engine
+                .list_directory_entries(&directory.item_id)
+                .map_err(errno)?,
+        };
         Ok([
             (ino, FileType::Directory, ".".into()),
             (INodeNo(parent), FileType::Directory, "..".into()),
@@ -341,7 +343,9 @@ fn attributes(item: &CatalogItem) -> FileAttr {
         ino: INodeNo(item.inode),
         size: item.size,
         blocks: item.size.div_ceil(512),
-        atime: item.last_accessed_at.map_or(mtime, unix_time),
+        atime: item.last_accessed_at.map_or(mtime, |milliseconds| {
+            UNIX_EPOCH + Duration::from_millis(milliseconds.max(0) as u64)
+        }),
         mtime,
         ctime: mtime,
         crtime: UNIX_EPOCH,

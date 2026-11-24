@@ -14,20 +14,34 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
-
 use rustix::fs::inotify;
 
 use onedrive_core::{
-    CloudDrive, CloudError, DeltaPage, DeltaRequest, Engine, EngineError, FakeCloudDrive,
-    FuseAdapter, ItemKind, PinState, RemoteItem, RemoteThumbnail, SyncState, SystemClock,
+    Clock, CloudDrive, CloudError, Config, DeltaPage, DeltaRequest, Engine, EngineError,
+    FakeCloudDrive, FuseAdapter, ItemKind, PinState, RemoteItem, RemoteThumbnail, SyncState,
+    SystemClock,
 };
 
 const WORKER_DIR: &str = "ONEDRIVE_LIVE_FUSE_WORKER_DIR";
 const DELTA_PAGE_SIZE: usize = 100;
 const HEADER: usize = 64 * 1024;
 const STREAM: usize = 2 * 1024 * 1024;
+
+struct FixedClock;
+
+#[async_trait::async_trait]
+impl Clock for FixedClock {
+    fn now(&self) -> Duration {
+        Duration::new(1_800_000_000, 123_000_000)
+    }
+
+    async fn sleep(&self, _: Duration) {
+        unreachable!("no retry expected")
+    }
+}
 
 fn command(program: &str) -> Command {
     let mut command = Command::new("timeout");
@@ -155,8 +169,17 @@ fn exercise_mount(dir: &Path) {
     }
     drive.set_content("file", bytes.clone());
     let engine = Arc::new(
-        Engine::open_with_cache(dir.join("db"), &cache, drive.clone(), Arc::new(SystemClock))
-            .unwrap(),
+        Engine::open_with_config(
+            dir.join("db"),
+            &cache,
+            drive.clone(),
+            Arc::new(FixedClock),
+            Config {
+                min_free_disk_bytes: 0,
+                ..Config::default()
+            },
+        )
+        .unwrap(),
     );
     runtime.block_on(engine.sync()).unwrap();
     let delta_requests = drive.requests();
@@ -188,6 +211,7 @@ fn exercise_mount(dir: &Path) {
     eprintln!("Mounted lookup and stat: {:?}", lookup_started.elapsed());
     assert_eq!(metadata.len(), bytes.len() as u64);
     assert_eq!(metadata.mtime(), file.mtime);
+    assert_eq!(metadata.atime(), file.mtime);
     assert_eq!(metadata.ino(), engine.item("file").unwrap().unwrap().inode);
     assert_eq!(drive.requests(), delta_requests);
     assert!(drive.range_requests().is_empty());
@@ -218,6 +242,9 @@ fn exercise_mount(dir: &Path) {
     let mut sniff = vec![0; 32768];
     handle.read_exact(&mut sniff).unwrap();
     assert_eq!(sniff, bytes[..32768]);
+    let accessed = fs::metadata(&path).unwrap();
+    assert_eq!(accessed.atime(), 1_800_000_000);
+    assert_eq!(accessed.atime_nsec(), 123_000_000);
     assert_eq!(drive.range_requests(), [("file".into(), 0, HEADER)]);
     handle.read_exact_at(&mut sniff, 32768).unwrap();
     assert_eq!(sniff, bytes[32768..HEADER]);
@@ -236,7 +263,7 @@ fn exercise_mount(dir: &Path) {
             ("file".into(), STREAM as u64, STREAM),
         ]
     );
-    engine.set_pin_state("file", PinState::Pinned).unwrap();
+    runtime.block_on(engine.pin("root")).unwrap();
     assert_xattrs(&path, b"Hydrated", b"pinned", b"\"version-1\"");
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(drive.range_requests().len(), 3);
@@ -250,19 +277,26 @@ fn exercise_mount(dir: &Path) {
     drive.set_content("file", new_bytes.clone());
     runtime.block_on(engine.sync()).unwrap();
     assert_eq!(fs::metadata(&path).unwrap().mtime(), file.mtime);
-    assert_xattrs(&path, b"Cloud-only", b"pinned", b"\"version-2\"");
-    let mut updated = vec![0; HEADER];
-    handle.read_exact_at(&mut updated, 0).unwrap();
-    assert_eq!(updated, new_bytes[..HEADER]);
+    assert_xattrs(&path, b"Hydrated", b"pinned", b"\"version-2\"");
+    handle.read_exact_at(&mut sniff, 0).unwrap();
+    assert_eq!(sniff, new_bytes[..32768]);
+    assert_eq!(drive.range_requests().len(), 5);
+    mapping.stdin.take().unwrap().write_all(b"r").unwrap();
+    assert_mapped_bytes(&mut mapping, &new_bytes[..HEADER]);
+    assert!(mapping.wait().unwrap().success());
+    assert_eq!(drive.range_requests().len(), 5);
+
+    engine.purge("file").unwrap();
+    assert_xattrs(&path, b"Cloud-only", b"unpin_override", b"\"version-2\"");
+    runtime.block_on(engine.sync()).unwrap();
+    assert_xattrs(&path, b"Cloud-only", b"unpin_override", b"\"version-2\"");
+    handle.read_exact_at(&mut sniff, 0).unwrap();
+    assert_eq!(sniff, new_bytes[..32768]);
+    assert_eq!(drive.range_requests().len(), 6);
     assert_eq!(
         drive.range_requests().last().unwrap(),
         &("file".into(), 0, HEADER)
     );
-    assert_eq!(drive.range_requests().len(), 4);
-    mapping.stdin.take().unwrap().write_all(b"r").unwrap();
-    assert_mapped_bytes(&mut mapping, &new_bytes[..HEADER]);
-    assert!(mapping.wait().unwrap().success());
-    assert_eq!(drive.range_requests().len(), 4);
 
     assert!(!mount.join("renamed").exists());
     assert!(mount.join("folder").is_dir());

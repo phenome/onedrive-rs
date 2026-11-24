@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -10,15 +11,17 @@ use thiserror::Error;
 
 use crate::namespace::AffectedNames;
 use crate::{
-    Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem,
+    Clock, CloudDrive, CloudError, Config, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest,
+    ItemKind, RemoteItem,
 };
 
 mod catalog_invalidation;
+mod retention;
 mod sparse_cache;
 mod thumbnails;
 
 pub(crate) use catalog_invalidation::{CatalogInvalidation, CatalogObserver};
+pub use retention::CacheStatus;
 
 use sparse_cache::SparseCache;
 use thumbnails::ThumbnailCache;
@@ -38,6 +41,12 @@ pub enum EngineError {
     SyncSuperseded,
     #[error("item does not exist")]
     NotFound,
+    #[error("cannot purge {item_id}: pending upload")]
+    PendingUpload { item_id: String },
+    #[error("cannot purge {item_id}: unresolved conflict")]
+    UnresolvedConflict { item_id: String },
+    #[error("cache hydration paused to preserve the free-disk floor")]
+    LowDisk,
     #[error("cannot read a directory as a file")]
     IsDirectory,
     #[error("sparse cache I/O error")]
@@ -67,6 +76,7 @@ pub struct CatalogItem {
     pub etag: Option<String>,
     pub ctag: Option<String>,
     pub quickxor_hash: Option<String>,
+    /// Milliseconds since the Unix epoch.
     pub last_accessed_at: Option<i64>,
     pub pin_state: PinState,
     pub sync_state: SyncState,
@@ -114,6 +124,9 @@ pub struct Engine {
     cloud: Arc<dyn CloudDrive>,
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
+    config: Config,
+    hydrating: tokio::sync::Mutex<()>,
+    hydration_paused_low_disk: AtomicBool,
     observers: Mutex<Vec<Weak<catalog_invalidation::Observer>>>,
 }
 
@@ -139,6 +152,16 @@ impl Engine {
         cloud: Arc<dyn CloudDrive>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, EngineError> {
+        Self::open_with_config(database, cache_dir, cloud, clock, Config::default())
+    }
+
+    pub fn open_with_config(
+        database: impl AsRef<Path>,
+        cache_dir: impl AsRef<Path>,
+        cloud: Arc<dyn CloudDrive>,
+        clock: Arc<dyn Clock>,
+        config: Config,
+    ) -> Result<Self, EngineError> {
         let mut db = Connection::open(database)?;
         db.pragma_update(None, "foreign_keys", true)?;
         let journal: String = db.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
@@ -149,6 +172,7 @@ impl Engine {
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("schema.sql"))?;
         crate::namespace::migrate(&transaction)?;
+        retention::initialize_cached_access_times(&transaction, clock.as_ref())?;
         transaction.commit()?;
         catalog_invalidation::install(&db)?;
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
@@ -158,7 +182,10 @@ impl Engine {
             db: Mutex::new(db),
             cloud,
             clock,
+            config,
             syncing: tokio::sync::Mutex::new(()),
+            hydrating: tokio::sync::Mutex::new(()),
+            hydration_paused_low_disk: AtomicBool::new(false),
             observers: Mutex::default(),
         })
     }
@@ -169,6 +196,8 @@ impl Engine {
 
     pub async fn sync(&self) -> Result<(), EngineError> {
         let _sync = self.syncing.lock().await;
+        // Age-based eviction also runs when the cloud is unavailable.
+        self.evict()?;
         let mut restarts = 0;
         loop {
             let (link, revision) = self.ready_checkpoint().await?;
@@ -193,7 +222,11 @@ impl Engine {
                 Err(error) => return Err(error.into()),
             };
             if self.commit_page(page, revision)? {
-                return Ok(());
+                self.evict()?;
+                return match self.hydrate_pins(None).await {
+                    Err(EngineError::LowDisk) => Ok(()),
+                    result => result,
+                };
             }
         }
     }
@@ -313,21 +346,10 @@ impl Engine {
         })
     }
 
-    /// Store the explicit directive. Effective sticky pin policy belongs in Engine.
+    /// Store a directive without fetching or removing content. Use pin, unpin, or purge for user actions.
     pub fn set_pin_state(&self, item_id: &str, pin: PinState) -> Result<bool, EngineError> {
         let db = self.db();
-        let changed = match pin {
-            PinState::None => {
-                db.execute("DELETE FROM pin_directives WHERE item_id = ?1", [item_id])?
-            }
-            _ => db.execute(
-                "INSERT INTO pin_directives (item_id, pin_state)
-                 SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM items WHERE item_id = ?1)
-                 ON CONFLICT(item_id) DO UPDATE SET pin_state = excluded.pin_state",
-                params![item_id, pin as i64],
-            )?,
-        };
-        Ok(changed != 0)
+        Ok(write_pin(&db, item_id, pin)?)
     }
 
     pub fn pin_state(&self, item_id: &str) -> Result<PinState, EngineError> {
@@ -653,4 +675,17 @@ fn prune_remote_deletions(
          RETURNING parent_id, name",
     )?;
     affected.read(&mut prune.query([])?)
+}
+
+fn write_pin(db: &Connection, item_id: &str, pin: PinState) -> rusqlite::Result<bool> {
+    let changed = match pin {
+        PinState::None => db.execute("DELETE FROM pin_directives WHERE item_id = ?1", [item_id])?,
+        _ => db.execute(
+            "INSERT INTO pin_directives (item_id, pin_state)
+             SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM items WHERE item_id = ?1)
+             ON CONFLICT(item_id) DO UPDATE SET pin_state = excluded.pin_state",
+            params![item_id, pin as i64],
+        )?,
+    };
+    Ok(changed != 0)
 }

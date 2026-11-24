@@ -24,10 +24,12 @@ pub(super) struct Writeback {
 }
 
 impl Writeback {
+    pub(super) fn staging_directory(database: &Path) -> PathBuf {
+        database.with_added_extension("staging")
+    }
+
     pub(super) fn open(database: &Path, db: &mut Connection) -> Result<Self, EngineError> {
-        let mut root = database.as_os_str().to_owned();
-        root.push(".staging");
-        let root = PathBuf::from(root);
+        let root = Self::staging_directory(database);
         fs::create_dir_all(&root)?;
         // Persist the directory entry before any transaction can reference it.
         File::open(

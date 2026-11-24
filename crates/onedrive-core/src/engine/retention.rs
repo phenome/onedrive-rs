@@ -16,6 +16,8 @@ pub struct CacheStatus {
     pub pinned_bytes: u64,
     pub unpinned_bytes: u64,
     pub available_disk_bytes: u64,
+    /// Disk is below the configured floor or a hydration pass is paused.
+    pub free_disk_floor_warning: bool,
     /// A Pin hydration pass reached the free-disk floor since the last full pass completed.
     pub hydration_paused_low_disk: bool,
 }
@@ -236,11 +238,15 @@ impl Engine {
     /// Cached content bytes, excluding sparse holes and counting overlapping ranges once.
     pub fn cache_status(&self) -> Result<CacheStatus, EngineError> {
         let space = self.cache_capacity()?;
+        let available_disk_bytes = space.f_bavail.saturating_mul(space.f_frsize);
+        let hydration_paused_low_disk = self.hydration_paused_low_disk.load(Ordering::Relaxed);
         let mut status = CacheStatus {
             pinned_bytes: 0,
             unpinned_bytes: 0,
-            available_disk_bytes: space.f_bavail.saturating_mul(space.f_frsize),
-            hydration_paused_low_disk: self.hydration_paused_low_disk.load(Ordering::Relaxed),
+            available_disk_bytes,
+            hydration_paused_low_disk,
+            free_disk_floor_warning: hydration_paused_low_disk
+                || available_disk_bytes < self.config.min_free_disk_bytes,
         };
         for entry in cached_files(&self.db(), false)? {
             if entry.pinned {

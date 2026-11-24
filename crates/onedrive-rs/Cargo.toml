@@ -8,7 +8,10 @@ workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-rustix = { version = "1", features = ["process"] }
+onedrive-core = { path = "../onedrive-core" }
+onedrive-graph = { path = "../onedrive-graph" }
+rustix = { version = "1", features = ["fs", "net", "process"] }
+tokio = { version = "1", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

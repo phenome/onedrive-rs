@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -15,7 +16,7 @@ fn cli(runtime: &Path, args: &[&str]) -> Output {
 
 #[test]
 fn status_renders_the_same_daemon_data_as_human_text_and_json() {
-    let runtime = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
     let server = IpcServer::bind(&socket_path(runtime.path())).unwrap();
     let status = json!({
         "sync_state": "idle",
@@ -81,7 +82,7 @@ fn with_server<T: Send>(
 
 #[test]
 fn control_commands_dispatch_to_the_socket_and_preserve_errors() {
-    let runtime = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
     let server = IpcServer::bind(&socket_path(runtime.path())).unwrap();
     let uploads = json!([
         {"path": "/draft.txt", "sync_state": "dirty"},
@@ -186,7 +187,7 @@ fn control_commands_dispatch_to_the_socket_and_preserve_errors() {
 
 #[test]
 fn rejects_paths_outside_the_mount_and_parent_components_before_connecting() {
-    let runtime = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
     for (path, expected) in [
         ("onedrive-sibling/file", "outside the OneDrive mount"),
         ("onedrive/../file", "parent components"),
@@ -203,26 +204,12 @@ fn rejects_paths_outside_the_mount_and_parent_components_before_connecting() {
 }
 
 #[test]
-fn local_commands_parse_and_report_unavailable_runtime_in_both_formats() {
-    let runtime = tempfile::tempdir().unwrap();
-    let commands: &[(&[&str], &str)] = &[
-        (
-            &["auth", "login"],
-            "Authentication is not available in this build",
-        ),
-        (
-            &["auth", "status"],
-            "Authentication is not available in this build",
-        ),
-        (
-            &["auth", "logout"],
-            "Authentication is not available in this build",
-        ),
-        (
-            &["daemon"],
-            "The daemon runtime is not available in this build",
-        ),
-    ];
+fn daemon_command_reports_unavailable_runtime_in_both_formats() {
+    let runtime = private_runtime();
+    let commands: &[(&[&str], &str)] = &[(
+        &["daemon"],
+        "The daemon runtime is not available in this build",
+    )];
     for (args, message) in commands {
         let human = cli(runtime.path(), args);
         assert_eq!(human.status.code(), Some(1));
@@ -242,7 +229,7 @@ fn local_commands_parse_and_report_unavailable_runtime_in_both_formats() {
 
 #[test]
 fn argument_and_transport_failures_produce_structured_errors() {
-    let runtime = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
     for (args, exit_code, message) in [
         (&["pin", "--json"][..], 2, "<PATH>"),
         (&["auth", "invalid", "--json"], 2, "unrecognized subcommand"),
@@ -262,4 +249,11 @@ fn argument_and_transport_failures_produce_structured_errors() {
             "{response}"
         );
     }
+}
+
+fn private_runtime() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
 }

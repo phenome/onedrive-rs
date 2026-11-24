@@ -6,11 +6,14 @@ its terminating newline. The server closes the connection after each reply.
 Requests may be up to 64 KiB including the newline. Unknown operations and
 fields, invalid paths, and malformed requests receive an error envelope.
 
-The socket is mode `0600` in a directory owned by the effective user with mode
-`0700`. Dropping the Rust server removes its socket file and leaves the
-directory available for the next start. Binding fails if the socket path is
-already occupied, including after an abrupt exit that left the socket file
-behind.
+The socket is mode `0600`. Both `XDG_RUNTIME_DIR` and its `onedrive-rs`
+subdirectory must be owned by the effective user with mode `0700`. The server
+rejects symlinked directories and holds an exclusive lock on the opened
+socket directory until it shuts down. A restart reclaims a same-user socket at
+the reserved path only when a connection is refused and the socket entry still
+matches the inspected inode. A live listener, a symlink, or a regular file at
+that path prevents binding. On a graceful stop, the server removes its own
+socket from the opened directory.
 
 ## Requests and results
 
@@ -47,6 +50,17 @@ response envelope as IPC. Human-readable errors go to stderr. Exit status is
 `0` on success, `1` on command failure and `2` on invalid arguments. Help and
 version output are human-readable.
 
-The current binary parses `daemon` and `auth login|status|logout` and reports
-that their integrations are unavailable. The transport tests supply a
-dispatcher in the test process and exercise the production CLI against it.
+`auth login` opens the browser and stores the refresh credential in the desktop
+Secret Service. The CLI reads the client ID from the XDG configuration or the
+build-time default. See [Entra setup](entra-setup.md). `auth status` reports
+whether a credential exists for that client ID. `auth logout` deletes that
+credential and can be run again after sign-out. JSON auth results have the
+shape `{"ok":true,"result":{"signed_in":false}}`.
+
+Auth operations in the same desktop D-Bus session coordinate by client ID.
+Logout waits for any credential rotation already in progress, then deletes
+the stored credential. The daemon rechecks the credential before using cached
+access. Requests that have already obtained an access token can still finish.
+
+The `daemon` subcommand reports that the runtime is unavailable until the
+daemon, FUSE, and production dispatch are integrated.

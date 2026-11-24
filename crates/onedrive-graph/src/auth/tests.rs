@@ -354,3 +354,31 @@ async fn xdg_open_fixture_worker() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn logout_invalidates_cached_access_in_other_auth_instances() {
+    let server = MockServer::start().await;
+    let store = Arc::new(FakeTokenStore::default());
+    store
+        .replace_refresh_token("synthetic-refresh")
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path(TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token":"synthetic-access","expires_in":3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let daemon = mock_auth(&server, store.clone());
+    let cli = mock_auth(&server, store);
+    assert_eq!(daemon.bearer().await.unwrap(), "synthetic-access");
+    cli.logout().await.unwrap();
+    assert!(!cli.is_signed_in().await.unwrap());
+    assert!(matches!(
+        daemon.bearer().await,
+        Err(AuthError::LoginRequired)
+    ));
+    assert!(daemon.access.lock().await.is_none());
+}

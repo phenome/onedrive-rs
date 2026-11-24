@@ -1,10 +1,18 @@
-use std::fs::{self, DirBuilder, Permissions};
+use std::ffi::OsString;
+use std::fs::{self, File, Permissions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rustix::fs::{
+    AtFlags, CWD, FlockOperation, Mode, OFlags, ResolveFlags, flock, mkdirat, openat, openat2,
+    unlinkat,
+};
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -136,48 +144,115 @@ impl IpcClient {
 
 pub struct IpcServer {
     listener: UnixListener,
-    path: PathBuf,
-    device: u64,
-    inode: u64,
+    directory: OwnedFd,
+    name: OsString,
+    socket: File,
 }
 
 impl IpcServer {
     pub fn bind(path: &Path) -> io::Result<Self> {
-        let parent = path
+        SocketAddrUnix::new(path)?;
+        let (runtime, parent, name) = path
             .parent()
-            .filter(|parent| path.is_absolute() && *parent != Path::new("/"))
+            .and_then(|parent| Some((parent.parent()?, parent.file_name()?, path.file_name()?)))
+            .filter(|(runtime, _, _)| path.is_absolute() && *runtime != Path::new("/"))
+            .filter(|_| {
+                !path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+            })
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "socket needs an absolute path in a private directory",
+                    "socket needs a private runtime directory",
                 )
             })?;
-        match DirBuilder::new().mode(0o700).create(parent) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+
+        // Resolve the runtime path without symlinks, then anchor all socket
+        // operations to the opened directory even if a path above it moves.
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let runtime = File::from(openat2(
+            CWD,
+            runtime,
+            flags,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )?);
+        validate_private_directory(&runtime)?;
+        match mkdirat(&runtime, parent, Mode::RWXU) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
         }
-        let directory = fs::symlink_metadata(parent)?;
-        if !directory.is_dir()
-            || directory.uid() != rustix::process::geteuid().as_raw()
-            || directory.mode() & 0o777 != 0o700
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "socket directory must be owned by the effective user and have mode 0700",
-            ));
+        let directory = File::from(openat(&runtime, parent, flags, Mode::empty())?);
+        validate_private_directory(&directory)?;
+        match flock(&directory, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(Errno::WOULDBLOCK) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "another server owns the socket directory",
+                ));
+            }
+            Err(error) => return Err(error.into()),
         }
 
-        // The private directory protects the socket while its permissions are set.
-        let listener = UnixListener::bind(path)?;
-        let metadata = fs::symlink_metadata(path)?;
+        // AF_UNIX has no bindat/connectat. The procfs path pins the parent
+        // directory for both operations without changing the process cwd.
+        let anchored = fd_path(directory.as_raw_fd()).join(name);
+        match open_socket_entry(&directory, name) {
+            Ok(entry) => {
+                let metadata = entry.metadata()?;
+                if !metadata.file_type().is_socket()
+                    || metadata.uid() != rustix::process::geteuid().as_raw()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "socket path is occupied",
+                    ));
+                }
+                let probe = socket_with(
+                    AddressFamily::UNIX,
+                    SocketType::STREAM,
+                    SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+                    None,
+                )?;
+                let address = SocketAddrUnix::new(&anchored)?;
+                if connect(&probe, &address) != Err(Errno::CONNREFUSED) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "socket may still be in use",
+                    ));
+                }
+                if !same_entry(&directory, name, &entry)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "socket path changed during startup",
+                    ));
+                }
+                unlinkat(&directory, name, AtFlags::empty())?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let listener = UnixListener::bind(&anchored)?;
+        let socket = open_socket_entry(&directory, name)?;
+        if !socket.metadata()?.file_type().is_socket() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "socket path changed during bind",
+            ));
+        }
         let server = Self {
             listener,
-            path: path.to_path_buf(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            directory: directory.into(),
+            name: name.to_owned(),
+            socket,
         };
-        fs::set_permissions(path, Permissions::from_mode(0o600))?;
+        fs::set_permissions(
+            fd_path(server.socket.as_raw_fd()),
+            Permissions::from_mode(0o600),
+        )?;
         Ok(server)
     }
 
@@ -207,14 +282,49 @@ impl IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        if let Ok(metadata) = fs::symlink_metadata(&self.path)
-            && metadata.file_type().is_socket()
-            && metadata.dev() == self.device
-            && metadata.ino() == self.inode
-        {
-            let _ = fs::remove_file(&self.path);
+        if same_entry(&self.directory, &self.name, &self.socket).unwrap_or(false) {
+            let _ = unlinkat(&self.directory, &self.name, AtFlags::empty());
         }
     }
+}
+
+fn validate_private_directory(file: &File) -> io::Result<()> {
+    let directory = file.metadata()?;
+    if directory.uid() == rustix::process::geteuid().as_raw() && directory.mode() & 0o777 == 0o700 {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "runtime and socket directories must be owned by the effective user and have mode 0700",
+    ))
+}
+
+fn fd_path(fd: std::os::fd::RawFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{fd}"))
+}
+
+fn open_socket_entry(
+    directory: impl std::os::fd::AsFd,
+    name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    Ok(File::from(openat(
+        directory,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?))
+}
+
+fn same_entry(
+    directory: impl std::os::fd::AsFd,
+    name: &std::ffi::OsStr,
+    entry: &File,
+) -> io::Result<bool> {
+    let expected = entry.metadata()?;
+    let found = open_socket_entry(directory, name)?.metadata()?;
+    Ok(found.file_type().is_socket()
+        && found.dev() == expected.dev()
+        && found.ino() == expected.ino())
 }
 
 fn read_request(stream: &UnixStream) -> io::Result<Request> {

@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+import sys
+import urllib.parse
+import urllib.request
+
+authorize = urllib.parse.urlsplit(sys.argv[1])
+assert authorize.scheme == "https"
+assert authorize.netloc == "login.microsoftonline.com"
+assert authorize.path == "/consumers/oauth2/v2.0/authorize"
+query = urllib.parse.parse_qs(authorize.query)
+assert query["client_id"] == ["synthetic-cli-client"]
+assert query["scope"] == ["Files.ReadWrite offline_access"]
+assert query["code_challenge_method"] == ["S256"]
+redirect = urllib.parse.urlsplit(query["redirect_uri"][0])
+assert redirect.scheme == "http" and redirect.hostname == "localhost"
+callback = urllib.parse.urlunsplit(
+    ("http", redirect.netloc, "/", urllib.parse.urlencode(
+        {"state": query["state"][0], "error": "access_denied"}
+    ), "")
+)
+with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(callback, timeout=3) as reply:
+    assert reply.status == 200

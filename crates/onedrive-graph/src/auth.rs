@@ -17,7 +17,10 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::{Mutex, oneshot};
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, sleep, timeout};
+use zbus::Connection;
+use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
+use zbus::names::WellKnownName;
 
 const AUTHORITY: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/";
 const SCOPES: &str = "Files.ReadWrite offline_access";
@@ -54,17 +57,39 @@ pub enum AuthError {
 pub trait TokenStore: Send + Sync {
     async fn load_refresh_token(&self) -> Result<Option<String>, AuthError>;
     async fn replace_refresh_token(&self, token: &str) -> Result<(), AuthError>;
+
+    async fn clear_refresh_token(&self) -> Result<(), AuthError> {
+        Err(AuthError::Store)
+    }
+
+    /// Return a store that holds exclusive access to this credential scope,
+    /// when coordination outside this Auth instance is required.
+    async fn begin_transaction(&self) -> Result<Option<Box<dyn TokenStore>>, AuthError> {
+        Ok(None)
+    }
 }
 
 pub struct SecretServiceStore {
     client_id: String,
+    connection: Option<Connection>,
 }
 
 impl SecretServiceStore {
     pub fn new(client_id: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
+            connection: None,
         }
+    }
+
+    async fn service(&self) -> Result<SecretService<'_>, AuthError> {
+        match &self.connection {
+            Some(connection) => {
+                SecretService::connect_with_existing(EncryptionType::Dh, connection.clone()).await
+            }
+            None => SecretService::connect(EncryptionType::Dh).await,
+        }
+        .map_err(|_| AuthError::Store)
     }
 
     fn attributes(&self) -> HashMap<&str, &str> {
@@ -78,9 +103,7 @@ impl SecretServiceStore {
 #[async_trait]
 impl TokenStore for SecretServiceStore {
     async fn load_refresh_token(&self) -> Result<Option<String>, AuthError> {
-        let service = SecretService::connect(EncryptionType::Dh)
-            .await
-            .map_err(|_| AuthError::Store)?;
+        let service = self.service().await?;
         let collection = service
             .get_default_collection()
             .await
@@ -102,9 +125,7 @@ impl TokenStore for SecretServiceStore {
     }
 
     async fn replace_refresh_token(&self, token: &str) -> Result<(), AuthError> {
-        let service = SecretService::connect(EncryptionType::Dh)
-            .await
-            .map_err(|_| AuthError::Store)?;
+        let service = self.service().await?;
         let collection = service
             .get_default_collection()
             .await
@@ -124,6 +145,56 @@ impl TokenStore for SecretServiceStore {
             .map_err(|_| AuthError::Store)?;
         Ok(())
     }
+
+    async fn clear_refresh_token(&self) -> Result<(), AuthError> {
+        let service = self.service().await?;
+        let collection = service
+            .get_default_collection()
+            .await
+            .map_err(|_| AuthError::Store)?;
+        for item in collection
+            .search_items(self.attributes())
+            .await
+            .map_err(|_| AuthError::Store)?
+        {
+            if item.is_locked().await.map_err(|_| AuthError::Store)? {
+                item.unlock().await.map_err(|_| AuthError::Store)?;
+            }
+            item.delete().await.map_err(|_| AuthError::Store)?;
+        }
+        Ok(())
+    }
+
+    async fn begin_transaction(&self) -> Result<Option<Box<dyn TokenStore>>, AuthError> {
+        // The bus releases this name when the owning connection closes, including
+        // when a process dies during a refresh. Secret operations use that connection.
+        let scope = format!("{:x}", Sha256::digest(self.client_id.as_bytes()));
+        let name = format!("org.onedrive_rs.Auth.Client_{scope}");
+        let name = WellKnownName::try_from(name).map_err(|_| AuthError::Store)?;
+        let connection = Connection::session().await.map_err(|_| AuthError::Store)?;
+        let bus = DBusProxy::new(&connection)
+            .await
+            .map_err(|_| AuthError::Store)?;
+        timeout(Duration::from_secs(135), async {
+            loop {
+                let reply = bus
+                    .request_name(name.clone(), RequestNameFlags::DoNotQueue.into())
+                    .await
+                    .map_err(|_| AuthError::Store)?;
+                match reply {
+                    RequestNameReply::PrimaryOwner => return Ok(()),
+                    RequestNameReply::Exists => sleep(Duration::from_millis(25)).await,
+                    _ => return Err(AuthError::Store),
+                }
+            }
+        })
+        .await
+        .map_err(|_| AuthError::Store)??;
+        Ok(Some(Box::new(Self {
+            client_id: self.client_id.clone(),
+            connection: Some(connection.clone()),
+        })))
+    }
 }
 
 #[derive(Default)]
@@ -141,6 +212,11 @@ impl TokenStore for FakeTokenStore {
         *self.refresh_token.lock().await = Some(token.to_owned());
         Ok(())
     }
+
+    async fn clear_refresh_token(&self) -> Result<(), AuthError> {
+        *self.refresh_token.lock().await = None;
+        Ok(())
+    }
 }
 
 pub struct Auth {
@@ -154,6 +230,7 @@ pub struct Auth {
 
 struct AccessToken {
     value: String,
+    refresh: String,
     fresh_until: Instant,
 }
 
@@ -272,6 +349,8 @@ impl Auth {
         .await
         .map_err(|_| AuthError::Timeout)??;
 
+        let transaction = self.store.begin_transaction().await?;
+        let store = transaction.as_deref().unwrap_or(self.store.as_ref());
         let grant = self
             .exchange(&[
                 ("grant_type", "authorization_code"),
@@ -280,27 +359,46 @@ impl Auth {
                 ("code_verifier", &verifier),
             ])
             .await?;
-        *access = Some(self.persist(grant, true).await?);
+        *access = Some(Self::persist(store, grant, None).await?);
         Ok(())
+    }
+
+    pub async fn is_signed_in(&self) -> Result<bool, AuthError> {
+        let transaction = self.store.begin_transaction().await?;
+        let store = transaction.as_deref().unwrap_or(self.store.as_ref());
+        Ok(store.load_refresh_token().await?.is_some())
+    }
+
+    pub async fn logout(&self) -> Result<(), AuthError> {
+        let mut access = self.access.lock().await;
+        *access = None;
+        let transaction = self.store.begin_transaction().await?;
+        let store = transaction.as_deref().unwrap_or(self.store.as_ref());
+        store.clear_refresh_token().await
     }
 
     pub(crate) async fn bearer(&self) -> Result<String, AuthError> {
         let mut access = self.access.lock().await;
+        let transaction = self.store.begin_transaction().await?;
+        let store = transaction.as_deref().unwrap_or(self.store.as_ref());
+        let refresh = match store.load_refresh_token().await {
+            Ok(Some(refresh)) => refresh,
+            result => {
+                *access = None;
+                return Err(result.err().unwrap_or(AuthError::LoginRequired));
+            }
+        };
         if let Some(token) = access
             .as_ref()
-            .filter(|token| Instant::now() < token.fresh_until)
+            .filter(|token| token.refresh == refresh && Instant::now() < token.fresh_until)
         {
             return Ok(token.value.clone());
         }
-        let refresh = self
-            .store
-            .load_refresh_token()
-            .await?
-            .ok_or(AuthError::LoginRequired)?;
+        *access = None;
         let grant = self
             .exchange(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)])
             .await?;
-        let token = self.persist(grant, false).await?;
+        let token = Self::persist(store, grant, Some(refresh)).await?;
         let value = token.value.clone();
         *access = Some(token);
         Ok(value)
@@ -335,7 +433,11 @@ impl Auth {
         response.json().await.map_err(|_| AuthError::InvalidToken)
     }
 
-    async fn persist(&self, grant: Grant, require_refresh: bool) -> Result<AccessToken, AuthError> {
+    async fn persist(
+        store: &dyn TokenStore,
+        grant: Grant,
+        previous_refresh: Option<String>,
+    ) -> Result<AccessToken, AuthError> {
         if grant.access_token.is_empty() || grant.expires_in == 0 {
             return Err(AuthError::InvalidToken);
         }
@@ -343,13 +445,17 @@ impl Auth {
         let fresh_until = Instant::now()
             .checked_add(lifetime)
             .ok_or(AuthError::InvalidToken)?;
-        match grant.refresh_token {
-            Some(token) if !token.is_empty() => self.store.replace_refresh_token(&token).await?,
-            None if !require_refresh => {}
+        let refresh = match grant.refresh_token {
+            Some(token) if !token.is_empty() => {
+                store.replace_refresh_token(&token).await?;
+                token
+            }
+            None => previous_refresh.ok_or(AuthError::InvalidToken)?,
             _ => return Err(AuthError::InvalidToken),
-        }
+        };
         Ok(AccessToken {
             value: grant.access_token,
+            refresh,
             fresh_until,
         })
     }
@@ -359,11 +465,14 @@ impl Auth {
         let mut auth = Self::with_authority(
             "synthetic-client",
             Url::parse(AUTHORITY).unwrap(),
-            Arc::new(FakeTokenStore::default()),
+            Arc::new(FakeTokenStore {
+                refresh_token: Mutex::new(Some("synthetic-refresh".to_owned())),
+            }),
         )
         .unwrap();
         auth.access = Mutex::new(Some(AccessToken {
             value: "synthetic-access".to_owned(),
+            refresh: "synthetic-refresh".to_owned(),
             fresh_until: Instant::now() + Duration::from_secs(3600),
         }));
         auth

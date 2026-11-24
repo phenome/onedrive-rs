@@ -3,8 +3,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use onedrive_core::Config;
+use onedrive_graph::Auth;
 use onedrive_rs::ipc::{IpcClient, MountPath, Request, Response, Status, Upload, socket_path};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(version, about = "Control the OneDrive user daemon")]
@@ -128,11 +130,36 @@ impl Cli {
     }
 
     fn run_local_command(&self, command: &LocalCommand) -> Result<String, String> {
-        let message = match command {
-            LocalCommand::Auth { .. } => "Authentication is not available in this build",
-            LocalCommand::Daemon => "The daemon runtime is not available in this build",
-        };
-        Err(message.into())
+        match command {
+            LocalCommand::Auth { action } => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("Cannot initialize OneDrive authentication ({error})"))?
+                .block_on(self.run_auth(action)),
+            LocalCommand::Daemon => Err("The daemon runtime is not available in this build".into()),
+        }
+    }
+
+    async fn run_auth(&self, action: &AuthAction) -> Result<String, String> {
+        let config = Config::load().map_err(|error| error.to_string())?;
+        let auth = Auth::new(&config).map_err(|error| error.to_string())?;
+        let signed_in = match action {
+            AuthAction::Login => auth.login().await.map(|()| true),
+            AuthAction::Status => auth.is_signed_in().await,
+            AuthAction::Logout => auth.logout().await.map(|()| false),
+        }
+        .map_err(|error| error.to_string())?;
+        if self.json {
+            return Ok(Response::Success(json!({"signed_in": signed_in}))
+                .into_json()
+                .to_string());
+        }
+        Ok(if signed_in {
+            "Signed in to OneDrive"
+        } else {
+            "Signed out of OneDrive"
+        }
+        .into())
     }
 }
 

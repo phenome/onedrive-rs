@@ -49,11 +49,24 @@ pub(super) async fn open(
             report_preserved(&source);
         }
     }
-    if !database.try_exists()? && has_catalog_companions(&database)? {
+    if !database.try_exists()? && Engine::catalog_storage_present(&database)? {
         return Err(io::Error::other(format!(
             "OneDrive catalog missing beside its staging files or WAL at {database:?}"
         ))
         .into());
+    }
+    // A previous adoption may have renamed the catalog before a directory
+    // sync failed. Discovery no longer sees that catalog at its legacy path.
+    if database.try_exists()? {
+        File::open(&directory)?.sync_all()?;
+        File::open(data)?.sync_all()?;
+        if let Some(state) = legacy_state.filter(|state| *state != data) {
+            match File::open(state) {
+                Ok(directory) => directory.sync_all()?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     // Sparse content already uses a persistent, randomly named namespace
     // belonging to the catalog. Reuse it when a verified catalog is moved.
@@ -105,19 +118,11 @@ fn legacy_catalogs(data: &Path, legacy_state: Option<&Path>) -> io::Result<Vec<P
         let database = directory.join(CATALOG);
         // Also surface an orphaned stage or WAL instead of opening a new
         // catalog beside it and having writeback clean up unrecognized bytes.
-        if (database.try_exists()? || has_catalog_companions(&database)?)
-            && !sources.contains(&database)
-        {
+        if Engine::catalog_storage_present(&database)? && !sources.contains(&database) {
             sources.push(database);
         }
     }
     Ok(sources)
-}
-
-fn has_catalog_companions(database: &Path) -> io::Result<bool> {
-    let mut wal = database.as_os_str().to_owned();
-    wal.push("-wal");
-    Ok(database.with_added_extension("staging").try_exists()? || Path::new(&wal).try_exists()?)
 }
 
 async fn adopt_legacy(

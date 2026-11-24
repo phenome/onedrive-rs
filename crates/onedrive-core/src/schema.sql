@@ -189,3 +189,16 @@ CREATE TABLE IF NOT EXISTS sparse_range_versions (
     PRIMARY KEY (generation, block),
     FOREIGN KEY (generation, block) REFERENCES sparse_ranges(generation, block) ON DELETE CASCADE
 );
+
+
+-- Delta pages can report an edge before the catalog can safely attach it.
+CREATE TABLE IF NOT EXISTS deferred_remote_parents (
+    inode INTEGER PRIMARY KEY REFERENCES items(inode) ON DELETE CASCADE,
+    parent_id TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS supersede_deferred_parent_on_local_edit
+AFTER INSERT ON writeback_queue
+BEGIN
+    DELETE FROM deferred_remote_parents WHERE inode = NEW.inode;
+END;

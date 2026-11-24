@@ -1411,7 +1411,7 @@ impl Engine {
                     params![target, if ordinary { SyncState::Conflict } else { SyncState::Clean } as i64],
                 )?;
                 let revision = tx.query_row("SELECT revision FROM delta_checkpoint", [], |row| row.get(0))?;
-                super::upsert_remote_item(tx, remote, revision, 0)?;
+                super::upsert_remote_item(tx, remote, revision, 0, &mut affected)?;
             }
             tx.execute("INSERT INTO changed_inodes VALUES (?1, 1)", [target])?;
             tx.execute("INSERT INTO changed_entries VALUES (?1, ?2)", params![work.item.parent_id, work.item.name])?;
@@ -1465,7 +1465,12 @@ impl Engine {
             });
             let follow_remote_path = matches!(work.action, Action::Upload)
                 && current.parent_id == queued.remote_parent
-                && Some(current.intended_name.as_str()) == queued.remote_name.as_deref();
+                && Some(current.intended_name.as_str()) == queued.remote_name.as_deref()
+                && if let Some(remote) = &remote {
+                    !super::parent_would_cycle(tx, &current.item_id, remote.parent_id.as_deref())?
+                } else {
+                    false
+                };
             let ready = publication_ready(tx, inode, queued.stage.as_deref())?;
             if observed_move
                 && let (Some(attempt), Some(remote)) = (&work.move_attempt, &remote)
@@ -1907,7 +1912,7 @@ impl Engine {
                     affected.insert(original.parent_id.clone(), name.clone());
                 }
                 let revision = tx.query_row("SELECT revision FROM delta_checkpoint", [], |row| row.get(0))?;
-                super::upsert_remote_item(tx, original, revision, 0)?;
+                super::upsert_remote_item(tx, original, revision, 0, &mut affected)?;
             }
             affected.reconcile(tx, false)?;
             Ok(())

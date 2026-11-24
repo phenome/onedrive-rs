@@ -335,6 +335,7 @@ impl Engine {
                     position,
                 )?;
             }
+            retry_deferred_parents(transaction, &mut affected)?;
             if complete {
                 reconcile_catalog(transaction, full_scan, &mut affected)?;
                 transaction.execute("UPDATE delta_checkpoint SET full_scan = 0", [])?;
@@ -647,9 +648,8 @@ fn apply_change(
                 params![item.item_id, item.parent_id, item.name],
                 |row| row.get::<_, bool>(0),
             )?;
-            if !suppressed && let Some(name) = &item.name {
-                affected.insert(item.parent_id.clone(), name.clone());
-                upsert_remote_item(transaction, item, revision, position)?;
+            if !suppressed && item.name.is_some() {
+                upsert_remote_item(transaction, item, revision, position, affected)?;
             }
         }
     }
@@ -658,11 +658,17 @@ fn apply_change(
 
 fn upsert_remote_item(
     transaction: &Transaction<'_>,
-    item: RemoteItem,
+    mut item: RemoteItem,
     revision: i64,
     position: usize,
+    affected: &mut AffectedNames,
 ) -> rusqlite::Result<()> {
-    transaction
+    let inode = reserved_inode(&item);
+    let deferred_parent = defer_cyclic_remote_parent(transaction, &mut item)?;
+    transaction.prepare_cached(
+        "DELETE FROM deferred_remote_parents WHERE inode = (SELECT inode FROM items WHERE item_id = ?1)",
+    )?.execute([&item.item_id])?;
+    let updated = transaction
         .prepare_cached(
             "INSERT INTO items (inode, item_id, parent_id, name, kind, size, mtime, etag, ctag,
                             quickxor_hash, claim_revision, claim_position)
@@ -678,7 +684,7 @@ fn upsert_remote_item(
            AND items.inode NOT IN (SELECT inode FROM writeback_queue)",
         )?
         .execute(params![
-            reserved_inode(&item),
+            inode,
             item.item_id,
             item.parent_id,
             item.name,
@@ -691,7 +697,114 @@ fn upsert_remote_item(
             revision,
             position
         ])?;
+    if updated != 0 {
+        if let Some(name) = item.name {
+            affected.insert(item.parent_id, name);
+        }
+        if let Some(parent) = deferred_parent {
+            transaction
+                .prepare_cached(
+                    "INSERT INTO deferred_remote_parents
+                 SELECT inode, ?2 FROM items WHERE item_id = ?1",
+                )?
+                .execute(params![item.item_id, parent])?;
+        }
+    }
     Ok(())
+}
+
+fn defer_cyclic_remote_parent(
+    db: &Connection,
+    item: &mut RemoteItem,
+) -> rusqlite::Result<Option<String>> {
+    if !parent_would_cycle(db, &item.item_id, item.parent_id.as_deref())? {
+        return Ok(None);
+    }
+    let previous_parent = db
+        .query_row(
+            "SELECT parent_id FROM items WHERE item_id = ?1",
+            [&item.item_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    // Keep the previous edge so a queued descendant keeps its parent chain.
+    // An item without a usable previous edge can attach directly to the root.
+    let fallback = if previous_parent.is_some()
+        && !parent_would_cycle(db, &item.item_id, previous_parent.as_deref())?
+    {
+        previous_parent
+    } else {
+        db.query_row("SELECT item_id FROM items WHERE inode = 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?
+    };
+    Ok(std::mem::replace(&mut item.parent_id, fallback))
+}
+
+fn parent_would_cycle(
+    db: &Connection,
+    item_id: &str,
+    parent: Option<&str>,
+) -> rusqlite::Result<bool> {
+    db.prepare_cached(
+        "WITH RECURSIVE ancestors(item_id) AS (
+             SELECT ?2 WHERE ?2 IS NOT NULL
+             UNION
+             SELECT items.parent_id FROM items JOIN ancestors USING (item_id)
+             WHERE items.parent_id IS NOT NULL AND ancestors.item_id <> ?1
+         )
+         SELECT EXISTS (SELECT 1 FROM ancestors WHERE item_id = ?1)",
+    )?
+    .query_row(params![item_id, parent], |row| row.get(0))
+}
+
+fn retry_deferred_parents(
+    db: &Transaction<'_>,
+    affected: &mut AffectedNames,
+) -> rusqlite::Result<()> {
+    let mut select = db.prepare_cached(
+        "SELECT items.inode, items.item_id, deferred.parent_id, items.name
+         FROM deferred_remote_parents AS deferred JOIN items USING (inode)
+         JOIN items AS parent ON parent.item_id = deferred.parent_id
+         WHERE items.sync_state IN (0, 3) AND parent.kind = 1 AND parent.remote_missing = 0
+           AND NOT EXISTS (SELECT 1 FROM writeback_queue WHERE inode = items.inode)
+         ORDER BY items.claim_revision, items.claim_position, items.inode",
+    )?;
+    // One reparent can release an edge considered earlier in this pass.
+    loop {
+        let pending = select
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut progressed = false;
+        for (inode, item_id, parent, name) in pending {
+            if parent_would_cycle(db, &item_id, Some(&parent))? {
+                continue;
+            }
+            affected.record_item(db, &item_id)?;
+            db.execute(
+                "UPDATE items SET parent_id = ?2, alias = NULL WHERE inode = ?1",
+                params![inode, parent],
+            )?;
+            db.execute(
+                "DELETE FROM deferred_remote_parents WHERE inode = ?1",
+                [inode],
+            )?;
+            affected.insert(Some(parent), name);
+            progressed = true;
+        }
+        if !progressed {
+            return Ok(());
+        }
+    }
 }
 
 fn reserved_inode(item: &RemoteItem) -> Option<u64> {

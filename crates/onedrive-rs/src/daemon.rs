@@ -78,7 +78,6 @@ pub async fn run(
             .map_err(|error| format!("Cannot migrate OneDrive catalog ({error})"))?,
         Err(_) => None,
     };
-    let min_free_disk_bytes = config.min_free_disk_bytes;
     let engine = Arc::new(
         Engine::open_with_config(
             data.join("catalog.sqlite3"),
@@ -97,7 +96,7 @@ pub async fn run(
         .mount(&mount)
         .map_err(|error| format!("Cannot mount OneDrive at {mount:?} ({error})"))?;
 
-    let delta = Arc::new(DeltaSync::new(engine, min_free_disk_bytes));
+    let delta = Arc::new(DeltaSync::new(engine));
     let mut clients = JoinSet::new();
     let result = tokio::select! {
         _ = interrupt.recv() => Ok(()),
@@ -171,47 +170,10 @@ fn migrate_legacy_catalog(
         return Ok(None);
     }
     let legacy_lock = lock_storage(state)?;
-    let source = state.join("catalog.sqlite3");
-    let destination = data.join("catalog.sqlite3");
-    if !source.try_exists()? {
-        if state.join("catalog.sqlite3-wal").try_exists()? {
-            return Err("the legacy WAL exists without its catalog".into());
-        }
-        return Ok(Some(legacy_lock));
-    }
-    if !fs::symlink_metadata(&source)?.is_file() {
-        return Err("the legacy catalog is not a regular file".into());
-    }
-    if destination.try_exists()?
-        || data.join("catalog.sqlite3-wal").try_exists()?
-        || data.join("catalog.sqlite3-shm").try_exists()?
-    {
-        return Err("catalog files exist in both XDG_STATE_HOME and XDG_DATA_HOME".into());
-    }
-    Engine::checkpoint_for_relocation(&source)?;
-    let target = File::open(data)?;
-    let source_stage = state.join("catalog.sqlite3.staging");
-    if source_stage.try_exists()? {
-        let destination_stage = data.join("catalog.sqlite3.staging");
-        rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            &source_stage,
-            rustix::fs::CWD,
-            &destination_stage,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )?;
-        target.sync_all()?;
-        legacy_lock.sync_all()?;
-    }
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        &source,
-        rustix::fs::CWD,
-        &destination,
-        rustix::fs::RenameFlags::NOREPLACE,
+    Engine::relocate_catalog(
+        &state.join("catalog.sqlite3"),
+        &data.join("catalog.sqlite3"),
     )?;
-    target.sync_all()?;
-    legacy_lock.sync_all()?;
     Ok(Some(legacy_lock))
 }
 
@@ -253,17 +215,15 @@ struct PollState {
 
 struct DeltaSync {
     engine: Arc<Engine>,
-    min_free_disk_bytes: u64,
     poll_state: watch::Sender<PollState>,
     last_result: Mutex<SyncState>,
     long_jobs: Semaphore,
 }
 
 impl DeltaSync {
-    fn new(engine: Arc<Engine>, min_free_disk_bytes: u64) -> Self {
+    fn new(engine: Arc<Engine>) -> Self {
         Self {
             engine,
-            min_free_disk_bytes,
             poll_state: watch::channel(PollState::default()).0,
             last_result: Mutex::new(SyncState::Starting),
             long_jobs: Semaphore::new(MAX_LONG_JOBS),
@@ -392,8 +352,7 @@ impl DeltaSync {
                         .into(),
                     unpinned_cache_bytes: status.unpinned_bytes,
                     pinned_cache_bytes: status.pinned_bytes,
-                    free_disk_floor_warning: status.available_disk_bytes < self.min_free_disk_bytes
-                        || status.hydration_paused_low_disk,
+                    free_disk_floor_warning: status.free_disk_floor_warning,
                     pending_upload_count: self
                         .engine
                         .pending_upload_count()
@@ -499,7 +458,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let sync = Arc::new(DeltaSync::new(engine.clone(), 0));
+        let sync = Arc::new(DeltaSync::new(engine.clone()));
         let poller = tokio::spawn({
             let sync = sync.clone();
             async move {

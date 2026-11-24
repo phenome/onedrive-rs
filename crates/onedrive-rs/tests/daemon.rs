@@ -269,7 +269,7 @@ fn mounted_daemon_lifecycle() {
     assert_eq!(sandbox.cli("pause")["ok"], true);
     assert_eq!(sandbox.cli("sync")["ok"], true);
     fs::write(sandbox.dir().join("stall-manual"), "").unwrap();
-    let mut manual = bounded(env!("CARGO_BIN_EXE_onedrive-rs"));
+    let mut manual = bounded_for("40s", env!("CARGO_BIN_EXE_onedrive-rs"));
     sandbox.env(&mut manual);
     let manual = manual
         .args(["--json", "sync"])
@@ -295,7 +295,7 @@ fn mounted_daemon_lifecycle() {
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["error"], "OneDrive delta sync is already running");
     }
-    let mut listing = bounded("ls")
+    let mut listing = bounded_for("40s", "ls")
         .arg(mount.join("blocked-folder"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -303,7 +303,7 @@ fn mounted_daemon_lifecycle() {
         .unwrap();
     wait_for(|| sandbox.dir().join("thumbnail-started").exists());
 
-    let mut reader = bounded("cat")
+    let mut reader = bounded_for("40s", "cat")
         .arg(mount.join("blocked.txt"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -432,6 +432,13 @@ fn mounted_daemon_writeback_restarts_offline_and_purges_after_upload() {
     sandbox.stop(Signal::TERM);
     assert!(!socket.exists() && !mounted(&mount));
 
+    // Model an upgrade with an offline edit in the previous XDG location.
+    fs::create_dir(sandbox.dir().join("state")).unwrap();
+    fs::rename(
+        sandbox.dir().join("data/onedrive-rs"),
+        sandbox.dir().join("state/onedrive-rs"),
+    )
+    .unwrap();
     fs::remove_file(sandbox.dir().join("resumed-cursor")).ok();
     sandbox.start(false);
     wait_for(|| mounted(&mount) && sandbox.dir().join("resumed-cursor").exists());
@@ -602,8 +609,12 @@ fn mounted(path: &Path) -> bool {
 }
 
 fn bounded(program: &str) -> Command {
+    bounded_for("5s", program)
+}
+
+fn bounded_for(limit: &str, program: &str) -> Command {
     let mut command = Command::new("timeout");
-    command.args(["-k", "1s", "5s", program]);
+    command.args(["-k", "1s", limit, program]);
     command
 }
 

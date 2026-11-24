@@ -148,3 +148,19 @@ CREATE TABLE IF NOT EXISTS writeback_temporary_names (
     name TEXT PRIMARY KEY,
     item_id TEXT NOT NULL
 );
+
+-- The stage remains available to reads and conflict recovery until publication.
+CREATE TABLE IF NOT EXISTS writeback_publication (
+    inode INTEGER PRIMARY KEY REFERENCES writeback_queue(inode) ON DELETE CASCADE,
+    stage TEXT
+);
+
+-- Both regular moves and rename-cycle steps can succeed before a local acknowledgment.
+CREATE TABLE IF NOT EXISTS writeback_moves (
+    inode INTEGER PRIMARY KEY REFERENCES writeback_queue(inode) ON DELETE CASCADE,
+    parent_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    etag TEXT,
+    ctag TEXT,
+    temporary INTEGER NOT NULL
+);

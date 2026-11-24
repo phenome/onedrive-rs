@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod catalog_invalidation;
+mod relocation;
 mod retention;
 mod sparse_cache;
 mod thumbnails;

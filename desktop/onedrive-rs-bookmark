@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Register a OneDrive GTK sidebar bookmark for the current user."""
+
+import argparse
+import fcntl
+import os
+from pathlib import Path
+
+
+def add_bookmark(config_home, mount):
+    bookmarks = config_home / "gtk-3.0" / "bookmarks"
+    bookmarks.parent.mkdir(parents=True, exist_ok=True)
+    uri = mount.as_uri().encode("ascii")
+    with bookmarks.open("a+b") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.seek(0)
+        contents = stream.read()
+        if any(line.partition(b" ")[0] == uri for line in contents.splitlines()):
+            return
+        separator = b"\n" if contents and not contents.endswith(b"\n") else b""
+        stream.write(separator + uri + b" OneDrive\n")
+        stream.flush()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mount", type=Path, help="Absolute path to a custom mount")
+    args = parser.parse_args()
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    mount = args.mount or runtime / "onedrive"
+    if not mount.is_absolute():
+        parser.error("the mount path must be absolute")
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", ""))
+    if not config_home.is_absolute():
+        config_home = Path.home() / ".config"
+    try:
+        add_bookmark(config_home, mount)
+    except OSError as error:
+        parser.exit(1, f"{parser.prog}: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

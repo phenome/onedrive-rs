@@ -185,6 +185,7 @@ impl FuseAdapter {
 
 impl Filesystem for FuseAdapter {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+        let _ = config.add_capabilities(fuser::InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP);
         // fuser requires a positive byte limit. One byte rounds down to zero
         // pages on Linux, keeping cached mmap and MIME sniffing demand-driven.
         let _ = config.set_max_readahead(1);
@@ -271,12 +272,16 @@ impl Filesystem for FuseAdapter {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _kill_suid_gid: bool,
         reply: ReplyOpen,
     ) {
-        match self.engine.open_file(ino.0) {
-            Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_KEEP_CACHE),
+        let writable = flags.0 & rustix::fs::OFlags::ACCMODE.bits() as i32 != 0;
+        match self.engine.open_file(ino.0, writable) {
+            // The kernel page cache expands small reads to cover whole pages.
+            // An offline sparse stage may only have the requested bytes.
+            Ok(true) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_DIRECT_IO),
+            Ok(false) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_KEEP_CACHE),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -652,6 +657,7 @@ fn send_empty(reply: ReplyEmpty, result: Result<(), Errno>) {
 fn errno(error: EngineError) -> Errno {
     match error {
         EngineError::NotFound => Errno::ENOENT,
+        EngineError::OriginalVersionUnavailable => Errno::ESTALE,
         EngineError::IsDirectory => Errno::EISDIR,
         EngineError::CacheIo(error) => {
             Errno::from_i32(error.raw_os_error().unwrap_or(Errno::EIO.code()))

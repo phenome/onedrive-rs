@@ -71,6 +71,8 @@ pub enum EngineError {
     InvalidThumbnail(#[from] image::ImageError),
     #[error("could not encode thumbnail PNG")]
     ThumbnailEncoding(#[from] png::EncodingError),
+    #[error("original cloud version unavailable; staged edits are retained")]
+    OriginalVersionUnavailable,
     #[error("cloud range did not match the catalog file size")]
     InvalidRange,
     #[error(transparent)]

@@ -68,7 +68,9 @@ impl Writeback {
             .tempfile_in(&self.root)?;
         if let Some(previous) = previous {
             let old = File::open(self.root.join(previous))?;
-            io::copy(&mut old.take(size), &mut file)?;
+            if rustix::fs::ioctl_ficlone(file.as_file(), &old).is_err() {
+                io::copy(&mut old.take(size), &mut file)?;
+            }
         } else {
             file.write_all(prefix)?;
         }
@@ -118,6 +120,14 @@ fn job(db: &Connection, inode: u64) -> rusqlite::Result<Option<Job>> {
         },
     )
     .optional()
+}
+
+fn same_content_version(before: &CatalogItem, after: &CatalogItem) -> bool {
+    before.item_id == after.item_id
+        && before.size == after.size
+        && before.etag == after.etag
+        && before.ctag == after.ctag
+        && before.mtime == after.mtime
 }
 
 fn enqueue_existing(tx: &Transaction<'_>, item: &CatalogItem) -> rusqlite::Result<()> {
@@ -322,7 +332,7 @@ impl Engine {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
             let current_job = job(&tx, inode)?;
-            if before != current
+            if !same_content_version(&before, &current)
                 || previous.as_ref().map(|job| job.generation)
                     != current_job.as_ref().map(|job| job.generation)
             {
@@ -347,7 +357,8 @@ impl Engine {
                 params![inode, name],
             )?;
             tx.execute(
-                "UPDATE items SET size = ?2, mtime = ?3, sync_state = CASE WHEN sync_state = 3 THEN 3 ELSE 1 END WHERE inode = ?1",
+                "UPDATE items SET size = ?2, mtime = ?3, last_accessed_at = ?3,
+                 sync_state = CASE WHEN sync_state = 3 THEN 3 ELSE 1 END WHERE inode = ?1",
                 params![inode, size, self.write_time()],
             )?;
             tx.execute(
@@ -489,24 +500,56 @@ impl Engine {
         self.writeback.changed.notify_one();
     }
 
+    /// Expose queued catalog entries, including deletions hidden from the mount.
+    pub fn pending_uploads(&self) -> Result<Vec<CatalogItem>, EngineError> {
+        let db = self.db();
+        let mut query = db.prepare_cached(&format!(
+            "SELECT {} FROM items WHERE inode IN (SELECT inode FROM writeback_queue) ORDER BY inode",
+            super::ITEM_COLUMNS,
+        ))?;
+        Ok(query
+            .query_map([], super::catalog_item)?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Drain currently runnable work. The catalog lock is released during all cloud calls.
     pub async fn drain_uploads(&self) -> Result<usize, EngineError> {
         // Delta must not apply a snapshot taken before an upload acknowledgment.
         let _sync = self.syncing.lock().await;
         let mut completed = 0;
-        while let Some(work) = self.next_upload()? {
-            let result = self.upload(&work).await;
-            match result {
+        let mut skipped = HashSet::new();
+        let mut first_error = None;
+        while let Some(work) = self.next_upload(&skipped)? {
+            match self.upload(&work).await {
                 Ok(()) => completed += 1,
-                Err(EngineError::Cloud(CloudError::Conflict | CloudError::NotFound))
-                    if matches!(work.action, Action::Upload(_) | Action::CreateFile(_)) =>
+                Err(EngineError::Cloud(CloudError::Conflict))
+                    if matches!(
+                        work.action,
+                        Action::Upload | Action::CreateFile | Action::CreateFolder | Action::Move
+                    ) =>
                 {
                     self.preserve_conflict(&work).await?;
+                }
+                Err(EngineError::Cloud(CloudError::NotFound))
+                    if matches!(work.action, Action::Upload) =>
+                {
+                    self.preserve_conflict(&work).await?;
+                }
+                Err(
+                    error @ EngineError::Cloud(
+                        CloudError::Conflict
+                        | CloudError::NotFound
+                        | CloudError::Unsupported
+                        | CloudError::InvalidResponse,
+                    ),
+                ) => {
+                    skipped.insert(work.item.inode);
+                    first_error.get_or_insert(error);
                 }
                 Err(error) => return Err(error),
             }
         }
-        Ok(completed)
+        first_error.map_or(Ok(completed), Err)
     }
 
     /// Run retries while the caller retains the Engine. This task holds no strong
@@ -535,7 +578,7 @@ impl Engine {
         }
     }
 
-    fn next_upload(&self) -> Result<Option<Work>, EngineError> {
+    fn next_upload(&self, skipped: &HashSet<u64>) -> Result<Option<Work>, EngineError> {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let open_files = self.writeback.open_files.lock().unwrap();
@@ -543,7 +586,8 @@ impl Engine {
             .prepare("SELECT inode FROM writeback_queue ORDER BY deleted DESC, sequence")?
             .query_map([], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        for inode in inodes {
+        let mut blocked_moves = HashMap::new();
+        for inode in inodes.into_iter().filter(|inode| !skipped.contains(inode)) {
             let item = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
             let queued = job(&tx, inode)?.ok_or(EngineError::NotFound)?;
             let action = if queued.deleted {
@@ -574,40 +618,58 @@ impl Engine {
                 let path_changed = queued.remote_parent != item.parent_id
                     || queued.remote_name.as_deref() != Some(&item.name);
                 if queued.remote_id.is_none() || (queued.stage.is_none() && path_changed) {
-                    let occupied: bool = tx.query_row(
-                        "SELECT EXISTS (SELECT 1 FROM writeback_queue
-                          WHERE inode <> ?1 AND remote_parent = ?2 AND remote_name = ?3)",
-                        params![inode, item.parent_id, item.name],
-                        |row| row.get(0),
-                    )?;
-                    if occupied {
+                    let occupied = tx
+                        .query_row(
+                            "SELECT inode FROM writeback_queue
+                         WHERE inode <> ?1 AND remote_parent = ?2 AND remote_name = ?3
+                         ORDER BY sequence LIMIT 1",
+                            params![inode, item.parent_id, item.name],
+                            |row| row.get::<_, u64>(0),
+                        )
+                        .optional()?;
+                    if let Some(other) = occupied {
+                        if queued.remote_id.is_some() {
+                            blocked_moves.insert(inode, other);
+                        }
                         continue;
                     }
                 }
                 match (&queued.remote_id, item.kind, &queued.stage) {
                     (None, ItemKind::Folder, _) => Action::CreateFolder,
-                    (None, ItemKind::File, _) => Action::CreateFile(self.staged_bytes(&queued)?),
-                    (Some(_), ItemKind::File, Some(_)) => {
-                        Action::Upload(self.staged_bytes(&queued)?)
-                    }
+                    (None, ItemKind::File, _) => Action::CreateFile,
+                    (Some(_), ItemKind::File, Some(_)) => Action::Upload,
                     (Some(_), _, _) if path_changed => Action::Move,
                     _ => Action::Acknowledge,
                 }
+            };
+            let stage = if matches!(action, Action::CreateFile | Action::Upload) {
+                queued
+                    .stage
+                    .as_deref()
+                    .map(|name| File::open(self.writeback.root.join(name)))
+                    .transpose()?
+            } else {
+                None
             };
             tx.commit()?;
             return Ok(Some(Work {
                 item,
                 queued,
                 action,
+                stage,
+            }));
+        }
+        if let Some(inode) = rename_cycle(&blocked_moves) {
+            let item = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
+            let queued = job(&tx, inode)?.ok_or(EngineError::NotFound)?;
+            return Ok(Some(Work {
+                item,
+                queued,
+                action: Action::TemporaryMove,
+                stage: None,
             }));
         }
         Ok(None)
-    }
-
-    fn staged_bytes(&self, queued: &Job) -> Result<Vec<u8>, EngineError> {
-        queued.stage.as_ref().map_or(Ok(Vec::new()), |name| {
-            Ok(fs::read(self.writeback.root.join(name))?)
-        })
     }
 
     async fn upload(&self, work: &Work) -> Result<(), EngineError> {
@@ -630,23 +692,25 @@ impl Engine {
                 return Ok(());
             }
             Action::CreateFolder => self.cloud.create_folder(parent, name).await?,
-            Action::CreateFile(bytes) => {
+            Action::CreateFile => {
+                let bytes = work.read_bytes().await?;
                 self.cloud
                     .upload(
                         UploadTarget::New {
                             parent_id: parent,
                             name,
                         },
-                        bytes,
+                        &bytes,
                         None,
                     )
                     .await?
             }
-            Action::Upload(bytes) => {
+            Action::Upload => {
+                let bytes = work.read_bytes().await?;
                 let etag = work.item.etag.as_deref().ok_or(CloudError::Conflict)?;
                 let item_id = cloud_id.ok_or(EngineError::InvalidMutation)?;
                 self.cloud
-                    .upload(UploadTarget::Existing { item_id }, bytes, Some(etag))
+                    .upload(UploadTarget::Existing { item_id }, &bytes, Some(etag))
                     .await?
             }
             Action::Move => {
@@ -654,9 +718,39 @@ impl Engine {
                     .move_item(cloud_id.ok_or(EngineError::InvalidMutation)?, parent, name)
                     .await?
             }
+            Action::TemporaryMove => self.move_to_temporary_name(work).await?,
             Action::Acknowledge => return self.acknowledge(work, None),
         };
         self.acknowledge(work, Some(remote))
+    }
+
+    async fn move_to_temporary_name(&self, work: &Work) -> Result<RemoteItem, EngineError> {
+        let id = work
+            .queued
+            .remote_id
+            .as_deref()
+            .ok_or(EngineError::InvalidMutation)?;
+        let parent = work
+            .queued
+            .remote_parent
+            .as_deref()
+            .ok_or(EngineError::InvalidMutation)?;
+        for attempt in 0..16 {
+            let name = format!("onedrive-rs-move-{}-{attempt}", work.item.inode);
+            if self.lookup(parent, &name)?.is_some() {
+                continue;
+            }
+            match self.cloud.move_item(id, parent, &name).await {
+                Ok(mut moved) => {
+                    moved.parent_id = Some(parent.into());
+                    moved.name = Some(name);
+                    return Ok(moved);
+                }
+                Err(CloudError::Conflict) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(CloudError::Conflict.into())
     }
 
     fn finish_delete(&self, work: &Work) -> Result<(), EngineError> {
@@ -682,7 +776,7 @@ impl Engine {
         let inode = work.item.inode;
         let current = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
         let queued = job(&tx, inode)?.ok_or(EngineError::NotFound)?;
-        let sent_content = matches!(work.action, Action::CreateFile(_) | Action::Upload(_));
+        let sent_content = matches!(work.action, Action::CreateFile | Action::Upload);
         let retire = sent_content && queued.stage == work.queued.stage;
         if retire {
             tx.execute(
@@ -691,16 +785,16 @@ impl Engine {
             )?;
         }
         let completed = if let Some(remote) = remote {
-            let submitted_path = !matches!(work.action, Action::Upload(_));
-            let parent = if submitted_path {
-                work.item.parent_id.as_deref()
-            } else {
-                work.queued.remote_parent.as_deref()
-            };
-            let name = if submitted_path {
-                Some(work.item.name.as_str())
-            } else {
-                work.queued.remote_name.as_deref()
+            let (parent, name) = match work.action {
+                Action::Upload => (
+                    work.queued.remote_parent.as_deref(),
+                    work.queued.remote_name.as_deref(),
+                ),
+                Action::TemporaryMove => (remote.parent_id.as_deref(), remote.name.as_deref()),
+                _ => (
+                    work.item.parent_id.as_deref(),
+                    Some(work.item.name.as_str()),
+                ),
             };
             tx.execute(
                 "UPDATE writeback_queue SET remote_id = ?2, remote_parent = ?3, remote_name = ?4 WHERE inode = ?1",
@@ -737,7 +831,15 @@ impl Engine {
             if queued.stage.is_none() || retire {
                 tx.execute(
                     "UPDATE items SET size = ?2, mtime = ?3 WHERE inode = ?1",
-                    params![inode, remote.size, remote.mtime],
+                    params![
+                        inode,
+                        if sent_content {
+                            work.item.size
+                        } else {
+                            remote.size
+                        },
+                        remote.mtime
+                    ],
                 )?;
             }
             (retire || queued.stage.is_none())
@@ -746,6 +848,21 @@ impl Engine {
         } else {
             queued.generation == work.queued.generation
         };
+        if retire
+            && !queued.deleted
+            && let Some(stage) = queued.stage.as_deref()
+        {
+            let source = self.writeback.root.join(stage);
+            tx.execute_batch("SAVEPOINT cache_uploaded_content")?;
+            if self
+                .cache
+                .retain_upload(&tx, inode, current.size, &source)
+                .is_err()
+            {
+                tx.execute_batch("ROLLBACK TO cache_uploaded_content")?;
+            }
+            tx.execute_batch("RELEASE cache_uploaded_content")?;
+        }
         if completed && !queued.deleted {
             tx.execute("DELETE FROM writeback_queue WHERE inode = ?1", [inode])?;
             tx.execute(
@@ -772,9 +889,10 @@ impl Engine {
 enum Action {
     Delete,
     CreateFolder,
-    CreateFile(Vec<u8>),
-    Upload(Vec<u8>),
+    CreateFile,
+    Upload,
     Move,
+    TemporaryMove,
     Acknowledge,
 }
 
@@ -782,6 +900,45 @@ struct Work {
     item: CatalogItem,
     queued: Job,
     action: Action,
+    stage: Option<File>,
+}
+
+impl Work {
+    async fn read_bytes(&self) -> Result<Vec<u8>, EngineError> {
+        let Some(file) = self.stage.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut file = file.try_clone()?;
+        let size = self.item.size;
+        Ok(tokio::task::spawn_blocking(move || {
+            let size = usize::try_from(size).map_err(io::Error::other)?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(size).map_err(io::Error::other)?;
+            file.read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        })
+        .await
+        .map_err(io::Error::other)??)
+    }
+}
+
+fn rename_cycle(blocked: &HashMap<u64, u64>) -> Option<u64> {
+    let mut processed = HashSet::new();
+    for &start in blocked.keys() {
+        let mut visited = HashSet::new();
+        let mut current = start;
+        while let Some(&next) = blocked.get(&current) {
+            if processed.contains(&current) {
+                break;
+            }
+            if !visited.insert(current) {
+                return Some(current);
+            }
+            current = next;
+        }
+        processed.extend(visited);
+    }
+    None
 }
 
 fn check_removable(db: &Connection, item: &CatalogItem, kind: ItemKind) -> Result<(), EngineError> {
@@ -852,23 +1009,33 @@ impl Engine {
             .parent_id
             .as_deref()
             .ok_or(EngineError::InvalidMutation)?;
-        let name = conflict_name(&tx, parent, &item.name, self.write_time(), &remote)?;
+        let name = conflict_name(&tx, parent, &item, self.write_time(), &remote)?;
         let original_id = queued.remote_id.as_deref();
+        // A stale conditional upload forks the item; a destination-name
+        // collision can keep the current item and use a different destination.
+        if matches!(work.action, Action::Upload) {
+            tx.execute(
+                "UPDATE items SET item_id = 'local:' || lower(hex(randomblob(16))),
+                 etag = NULL, ctag = NULL, quickxor_hash = NULL, remote_missing = 0 WHERE inode = ?1",
+                [item.inode],
+            )?;
+            tx.execute(
+                "UPDATE writeback_queue SET remote_id = NULL, remote_parent = NULL, remote_name = NULL WHERE inode = ?1",
+                [item.inode],
+            )?;
+        }
         tx.execute(
-            "UPDATE items SET item_id = 'local:' || lower(hex(randomblob(16))), name = ?2,
-             etag = NULL, ctag = NULL, quickxor_hash = NULL, sync_state = 3, remote_missing = 0
-             WHERE inode = ?1",
+            "UPDATE items SET name = ?2, sync_state = 3 WHERE inode = ?1",
             params![item.inode, name],
         )?;
         tx.execute(
-            "UPDATE writeback_queue SET remote_id = NULL, remote_parent = NULL, remote_name = NULL,
-             generation = generation + 1, conflict = 1 WHERE inode = ?1",
+            "UPDATE writeback_queue SET generation = generation + 1, conflict = 1 WHERE inode = ?1",
             [item.inode],
         )?;
         // Restore the original at its current cloud path. Existing open handles
         // keep the inode associated with the local bytes.
         for original in remote.into_values().filter(|entry| {
-            Some(entry.item_id.as_str()) == original_id
+            (matches!(work.action, Action::Upload) && Some(entry.item_id.as_str()) == original_id)
                 || (entry.parent_id.as_deref() == Some(parent)
                     && entry.name.as_deref() == Some(&item.name))
         }) {
@@ -890,12 +1057,14 @@ impl Engine {
 fn conflict_name(
     db: &Connection,
     parent: &str,
-    name: &str,
+    item: &CatalogItem,
     seconds: i64,
     remote: &HashMap<String, RemoteItem>,
 ) -> Result<String, EngineError> {
+    let name = item.name.as_str();
     let (stem, extension) = Path::new(name)
         .extension()
+        .filter(|_| item.kind == ItemKind::File)
         .and_then(|extension| extension.to_str())
         .map_or((name, ""), |extension| {
             name.split_at(name.len() - extension.len() - 1)
@@ -907,7 +1076,10 @@ fn conflict_name(
         } else {
             format!("conflict {date} {number}")
         };
-        let candidate = format!("{stem} ({label}){extension}");
+        let suffix = format!(" ({label})");
+        let extension = truncate_name(extension, 255 - suffix.len());
+        let stem = truncate_name(stem, 255 - suffix.len() - extension.len());
+        let candidate = format!("{stem}{suffix}{extension}");
         if lookup(db, parent, &candidate)?.is_none()
             && !remote.values().any(|entry| {
                 entry.parent_id.as_deref() == Some(parent)
@@ -918,4 +1090,8 @@ fn conflict_name(
         }
     }
     unreachable!()
+}
+
+fn truncate_name(name: &str, max_bytes: usize) -> &str {
+    &name[..name.floor_char_boundary(max_bytes.min(name.len()))]
 }

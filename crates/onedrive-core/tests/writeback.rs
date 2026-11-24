@@ -42,6 +42,7 @@ async fn staged_bytes_survive_restart_and_upload_keeps_the_inode() {
     assert_ne!(uploaded.item_id, file.item_id);
     assert_eq!(uploaded.sync_state, SyncState::Clean);
     assert!(uploaded.etag.is_some() && uploaded.ctag.is_some());
+    drive.set_online(false);
     assert_eq!(engine.read(file.inode, 0, 20).await.unwrap(), b"\0\0draft");
 }
 
@@ -206,4 +207,71 @@ async fn an_edit_during_first_upload_reuses_the_acknowledged_cloud_id() {
     assert_eq!(items[0].inode, file.inode);
     assert_eq!(items[0].item_id, intermediate.item_id);
     assert_eq!(items[0].sync_state, SyncState::Clean);
+}
+
+#[tokio::test]
+async fn offline_rename_cycle_uploads_both_names_and_keeps_both_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let drive = drive();
+    let engine = Engine::open(dir.path().join("db"), drive.clone(), Arc::new(SystemClock)).unwrap();
+    engine.sync().await.unwrap();
+    let a = engine.create(1, "a", ItemKind::File).unwrap();
+    let b = engine.create(1, "b", ItemKind::File).unwrap();
+    engine.write(a.inode, 0, b"alpha", false).await.unwrap();
+    engine.write(b.inode, 0, b"beta", false).await.unwrap();
+    engine.drain_uploads().await.unwrap();
+
+    engine.rename(1, "a", 1, "temp", false).unwrap();
+    engine.rename(1, "b", 1, "a", false).unwrap();
+    engine.rename(1, "temp", 1, "b", false).unwrap();
+    engine.drain_uploads().await.unwrap();
+
+    let observer = Engine::open(dir.path().join("observer"), drive, Arc::new(SystemClock)).unwrap();
+    observer.sync().await.unwrap();
+    assert_eq!(observer.list_children("root").unwrap().len(), 2);
+    for (path, expected) in [("/a", b"beta".as_slice()), ("/b", b"alpha".as_slice())] {
+        let item = observer.resolve_path(path).unwrap().unwrap();
+        assert_eq!(observer.read(item.inode, 0, 20).await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn remote_create_at_a_dirty_path_leaves_the_staged_version_reachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let drive = drive();
+    let engine = Engine::open(dir.path().join("db"), drive.clone(), Arc::new(SystemClock)).unwrap();
+    engine.sync().await.unwrap();
+    let local = engine.create(1, "draft.txt", ItemKind::File).unwrap();
+    engine.write(local.inode, 0, b"local", false).await.unwrap();
+    drive.upsert(RemoteItem {
+        item_id: "remote".into(),
+        parent_id: Some("root".into()),
+        name: Some("draft.txt".into()),
+        kind: ItemKind::File,
+        size: 6,
+        mtime: 100,
+        etag: Some("external-version".into()),
+        ctag: Some("external-content".into()),
+        quickxor_hash: None,
+    });
+    drive.set_content("remote", b"remote".to_vec());
+    engine.sync().await.unwrap();
+
+    let entries = engine.list_children("root").unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.name == "draft.txt")
+            .count(),
+        1
+    );
+    assert_eq!(
+        engine.resolve_path("/draft.txt").unwrap().unwrap().inode,
+        local.inode
+    );
+    engine.drain_uploads().await.unwrap();
+    let original = engine.resolve_path("/draft.txt").unwrap().unwrap();
+    assert_eq!(engine.read(original.inode, 0, 20).await.unwrap(), b"remote");
+    assert_eq!(engine.read(local.inode, 0, 20).await.unwrap(), b"local");
+    assert_eq!(engine.list_children("root").unwrap().len(), 2);
 }

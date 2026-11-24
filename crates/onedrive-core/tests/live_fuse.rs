@@ -256,6 +256,7 @@ fn exercise_writeback(dir: &Path) {
     use onedrive_core::{EngineError, SyncState};
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -285,11 +286,14 @@ fn exercise_writeback(dir: &Path) {
         .unwrap();
 
     let draft = mount.join("document");
+    fs::write(&draft, b"previous-longer-content").unwrap();
     fs::write(&draft, b"first").unwrap();
     let editor = OpenOptions::new().write(true).open(&draft).unwrap();
     editor.write_all_at(b"X", 1).unwrap();
     editor.set_len(7).unwrap();
     editor.sync_all().unwrap();
+    fs::set_permissions(&draft, fs::Permissions::from_mode(0o640)).unwrap();
+    assert_eq!(fs::metadata(&draft).unwrap().mode() & 0o777, 0o640);
     let mut append = OpenOptions::new().append(true).open(&draft).unwrap();
     append.write_all(b"!").unwrap();
     assert_eq!(fs::read(&draft).unwrap(), b"fXrst\0\0!");
@@ -301,6 +305,7 @@ fn exercise_writeback(dir: &Path) {
     let old_handle = File::open(mount.join("work/final")).unwrap();
     fs::rename(&draft, mount.join("work/final")).unwrap();
     assert!(!draft.exists());
+    assert_eq!(old_handle.metadata().unwrap().nlink(), 0);
     let mut previous = Vec::new();
     (&old_handle).read_to_end(&mut previous).unwrap();
     assert_eq!(previous, b"previous");
@@ -326,6 +331,10 @@ fn exercise_writeback(dir: &Path) {
         .mount(&mount)
         .unwrap();
     assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fXrst\0\0!");
+    assert_eq!(
+        fs::metadata(mount.join("work/final")).unwrap().mode() & 0o777,
+        0o640
+    );
     assert_xattrs(&mount.join("work/final"), b"Dirty", b"none", b"");
     drive.set_online(true);
     let deadline = Instant::now() + Duration::from_secs(7);

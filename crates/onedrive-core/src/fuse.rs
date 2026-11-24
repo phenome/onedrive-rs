@@ -482,7 +482,13 @@ fn attributes(item: &CatalogItem) -> FileAttr {
         crtime: UNIX_EPOCH,
         kind: file_type(item.kind),
         perm: item.mode.unwrap_or(if directory { 0o755 } else { 0o644 }),
-        nlink: if directory { 2 } else { 1 },
+        nlink: if item.unlinked {
+            0
+        } else if directory {
+            2
+        } else {
+            1
+        },
         uid: rustix::process::geteuid().as_raw(),
         gid: rustix::process::getegid().as_raw(),
         rdev: 0,

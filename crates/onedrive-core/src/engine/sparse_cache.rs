@@ -58,6 +58,36 @@ impl SparseCache {
         Ok(())
     }
 
+    pub(super) fn retain_upload(
+        &self,
+        db: &Connection,
+        inode: u64,
+        size: u64,
+        source: &Path,
+    ) -> Result<(), EngineError> {
+        if size == 0 {
+            return Ok(());
+        }
+        db.execute("DELETE FROM sparse_files WHERE inode = ?1", [inode])?;
+        db.execute("INSERT INTO sparse_files (inode) VALUES (?1)", [inode])?;
+        let generation = db.last_insert_rowid();
+        let path = self.path(generation);
+        let result = (|| {
+            fs::copy(source, &path)?;
+            File::open(&path)?.sync_all()?;
+            File::open(&self.root)?.sync_all()?;
+            let mut insert = db.prepare_cached("INSERT INTO sparse_ranges VALUES (?1, ?2)")?;
+            for offset in (0..size).step_by(STREAM_BYTES as usize) {
+                insert.execute(params![generation, offset])?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(path);
+        }
+        result
+    }
+
     fn lock(&self, generation: i64, stream_offset: u64) -> Arc<AsyncMutex<()>> {
         let mut locks = self.locks.lock().unwrap();
         let key = (generation, stream_offset);

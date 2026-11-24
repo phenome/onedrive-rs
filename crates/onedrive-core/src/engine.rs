@@ -70,6 +70,7 @@ pub struct CatalogItem {
     pub mode: Option<u16>,
     pub local_atime: Option<i64>,
     pub local_mtime: Option<i64>,
+    pub unlinked: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,7 +122,8 @@ const ITEM_COLUMNS: &str =
      (SELECT pin_state FROM pin_directives WHERE item_id = items.item_id),
      (SELECT mode FROM local_attributes WHERE inode = items.inode),
      (SELECT atime FROM local_attributes WHERE inode = items.inode),
-     (SELECT mtime FROM local_attributes WHERE inode = items.inode)";
+     (SELECT mtime FROM local_attributes WHERE inode = items.inode),
+     EXISTS (SELECT 1 FROM writeback_queue WHERE inode = items.inode AND deleted)";
 
 impl Engine {
     pub fn open(
@@ -316,7 +318,14 @@ impl Engine {
         Ok(self
             .db()
             .prepare_cached(&format!(
-                "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted) ORDER BY name, inode"
+                "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1
+                 AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM items AS local JOIN writeback_queue AS q ON local.inode = q.inode
+                     WHERE local.parent_id = items.parent_id AND local.name = items.name
+                       AND local.inode <> items.inode AND NOT q.deleted
+                 )
+                 ORDER BY name, inode"
             ))?
             .query_map([parent_id], catalog_item)?
             .collect::<Result<_, _>>()?)
@@ -360,7 +369,10 @@ impl Engine {
                 path.extend(names.into_iter().rev());
                 return Ok(Some(path));
             };
-            if !seen.insert(item.item_id) {
+            if !seen.insert(item.item_id)
+                || lookup(&snapshot, &parent_id, &item.name)?
+                    .is_none_or(|entry| entry.inode != item.inode)
+            {
                 return Ok(None);
             }
             names.push(item.name);
@@ -382,7 +394,8 @@ fn root(db: &Connection) -> rusqlite::Result<Option<CatalogItem>> {
 fn lookup(db: &Connection, parent_id: &str, name: &str) -> rusqlite::Result<Option<CatalogItem>> {
     db.prepare_cached(&format!(
         "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND name = ?2
-         AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted) ORDER BY inode"
+         AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted)
+         ORDER BY (inode IN (SELECT inode FROM writeback_queue)) DESC, inode"
     ))?
     .query_row(params![parent_id, name], catalog_item)
     .optional()
@@ -425,6 +438,7 @@ fn catalog_item(row: &Row<'_>) -> rusqlite::Result<CatalogItem> {
         mode: row.get(13)?,
         local_atime: row.get(14)?,
         local_mtime: row.get(15)?,
+        unlinked: row.get(16)?,
         pin_state: row
             .get::<_, Option<PinState>>(12)?
             .unwrap_or(PinState::None),

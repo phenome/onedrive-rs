@@ -541,7 +541,7 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn directory_reads_and_delta_commit_while_a_block_flush_is_suspended() {
         let timeout = Duration::from_secs(5);
         let temp = tempfile::tempdir_in("/tmp").unwrap();

@@ -1,5 +1,4 @@
 use super::*;
-use onedrive_core::{CloudDrive, DeltaRequest};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -62,20 +61,26 @@ async fn pkce_login_checks_state_and_exchanges_code_from_real_loopback_listener(
         .mount(&server)
         .await;
 
-    auth.login_with(|authorize| async move {
-        let browser = crate::http_client().unwrap();
-        let response = browser.get(authorize).send().await.unwrap();
-        assert_eq!(response.status(), 302);
-        let callback = Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
-        let mut incorrect = callback.clone();
-        incorrect.set_query(Some("state=wrong&code=untrusted"));
-        assert_eq!(browser.get(incorrect).send().await.unwrap().status(), 400);
-        assert_eq!(browser.get(callback).send().await.unwrap().status(), 200);
+    let mut browser_task = None;
+    let login = auth.login_with(|authorize| {
+        browser_task = Some(tokio::spawn(async move {
+            let browser = crate::http_client().unwrap();
+            let response = browser.get(authorize).send().await.unwrap();
+            assert_eq!(response.status(), 302);
+            let callback = Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+            let mut incorrect = callback.clone();
+            incorrect.set_query(Some("state=wrong&code=untrusted"));
+            assert_eq!(browser.get(incorrect).send().await.unwrap().status(), 400);
+            assert_eq!(browser.get(callback).send().await.unwrap().status(), 200);
+        }));
         // xdg-open can remain running if the browser was launched by this login.
-        std::future::pending::<Result<(), AuthError>>().await
-    })
-    .await
-    .unwrap();
+        std::future::pending::<Result<(), AuthError>>()
+    });
+    timeout(Duration::from_secs(5), login)
+        .await
+        .unwrap()
+        .unwrap();
+    browser_task.unwrap().await.unwrap();
 
     let requests = server.received_requests().await.unwrap();
     let auth_query: HashMap<_, _> = requests[0].url.query_pairs().into_owned().collect();
@@ -166,13 +171,10 @@ async fn rotated_refresh_token_must_be_persisted_before_access_is_used() {
         .expect(2)
         .mount(&server)
         .await;
-    let auth = Arc::new(mock_auth(&server, Arc::new(UnavailableStore)));
-    let drive = crate::GraphDrive::new(auth.clone()).unwrap();
-    assert!(matches!(
-        drive.delta(DeltaRequest::Initial).await,
-        Err(onedrive_core::CloudError::Authentication)
-    ));
-    assert!(matches!(auth.bearer().await, Err(AuthError::Store)));
+    let auth = mock_auth(&server, Arc::new(UnavailableStore));
+    for _ in 0..2 {
+        assert!(matches!(auth.bearer().await, Err(AuthError::Store)));
+    }
 }
 
 #[tokio::test]

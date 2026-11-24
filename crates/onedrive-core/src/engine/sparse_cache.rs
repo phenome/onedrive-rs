@@ -455,7 +455,7 @@ impl Engine {
             let stream_offset = offset / STREAM_BYTES * STREAM_BYTES;
             // The two requests that can cover byte zero share a lock.
             let lock = self.cache.lock(generation, stream_offset);
-            let _guard = lock.lock().await;
+            let guard = lock.lock().await;
             let stream = Block::Stream(stream_offset);
             let cached = {
                 let db = self.db();
@@ -531,6 +531,7 @@ impl Engine {
             let bytes = match versioned {
                 Err(crate::CloudError::Unsupported) => {
                     if kind == ReadKind::Pin {
+                        drop(guard);
                         self.hydrate_unversioned_snapshot(item, generation).await?;
                         return Ok(ReadOutcome::Retired);
                     }

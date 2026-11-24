@@ -22,6 +22,8 @@ pub struct CacheStatus {
     pub hydration_paused_low_disk: bool,
 }
 
+const MAX_PIN_RESTARTS: usize = 2;
+
 const XATTR_NAMES: [&str; 3] = [
     "user.onedrive.state",
     "user.onedrive.pin",
@@ -188,59 +190,70 @@ impl Engine {
     }
 
     async fn hydrate_pinned_file(&self, item_id: &str) -> Result<(), EngineError> {
-        let existing = {
-            let db = self.db();
-            match item_by_id(&db, item_id)? {
-                Some(item) => {
-                    generation_for(&db, item.inode)?.map(|generation| (item.inode, generation))
+        let mut restarts = 0;
+        'hydrate: loop {
+            let existing = {
+                let db = self.db();
+                match item_by_id(&db, item_id)? {
+                    Some(item) => {
+                        generation_for(&db, item.inode)?.map(|generation| (item.inode, generation))
+                    }
+                    None => None,
                 }
-                None => None,
-            }
-        };
-        if let Some((inode, generation)) = existing {
-            self.validate_cached_generation(inode, generation)?;
-        }
-        let (item, generation) = {
-            let mut db = self.db();
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let Some(item) = item_by_id(&tx, item_id)? else {
-                return Ok(());
             };
-            if item.kind != ItemKind::File
-                || item.sync_state != SyncState::Clean
-                || effective_pin(&tx, item_id)? != PinState::Pinned
-                || is_hydrated(&tx, &item)?
-            {
-                return Ok(());
+            if let Some((inode, generation)) = existing {
+                self.validate_cached_generation(inode, generation)?;
             }
-            let generation = allocate_generation(&tx, item.inode)?;
-            if item.size == 0 {
-                self.touch_generation(&tx, generation)?;
-            }
-            tx.commit()?;
-            (item, generation)
-        };
+            let (item, generation) = {
+                let mut db = self.db();
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let Some(item) = item_by_id(&tx, item_id)? else {
+                    return Ok(());
+                };
+                if item.kind != ItemKind::File
+                    || item.sync_state != SyncState::Clean
+                    || effective_pin(&tx, item_id)? != PinState::Pinned
+                    || is_hydrated(&tx, &item)?
+                {
+                    return Ok(());
+                }
+                if restarts > MAX_PIN_RESTARTS {
+                    return Err(EngineError::PinHydrationSuperseded {
+                        item_id: item_id.to_owned(),
+                    });
+                }
+                let generation = allocate_generation(&tx, item.inode)?;
+                if item.size == 0 {
+                    self.touch_generation(&tx, generation)?;
+                }
+                tx.commit()?;
+                (item, generation)
+            };
 
-        let mut output = vec![0; item.size.min(STREAM_BYTES) as usize];
-        let mut offset = 0;
-        while offset < item.size {
-            let length = (item.size - offset).min(STREAM_BYTES) as usize;
-            if self
-                .read_generation(
-                    &item,
-                    generation,
-                    offset,
-                    &mut output[..length],
-                    ReadKind::Pin,
-                )
-                .await?
-                == ReadOutcome::Retired
-            {
-                break;
+            let mut output = vec![0; item.size.min(STREAM_BYTES) as usize];
+            let mut offset = 0;
+            while offset < item.size {
+                let length = (item.size - offset).min(STREAM_BYTES) as usize;
+                if self
+                    .read_generation(
+                        &item,
+                        generation,
+                        offset,
+                        &mut output[..length],
+                        ReadKind::Pin,
+                    )
+                    .await?
+                    == ReadOutcome::Retired
+                {
+                    // Both snapshot publication and invalidation retire the old
+                    // generation. Reload the current item to tell them apart.
+                    restarts += 1;
+                    continue 'hydrate;
+                }
+                offset += length as u64;
             }
-            offset += length as u64;
+            return Ok(());
         }
-        Ok(())
     }
 
     /// Cached content bytes, excluding sparse holes and counting overlapping ranges once.

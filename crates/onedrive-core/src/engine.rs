@@ -53,6 +53,8 @@ pub enum EngineError {
     UnresolvedConflict { item_id: String },
     #[error("cache hydration paused to preserve the free-disk floor")]
     LowDisk,
+    #[error("could not finish hydrating Pin for {item_id}: the cache generation kept changing")]
+    PinHydrationSuperseded { item_id: String },
     #[error("cannot read a directory as a file")]
     IsDirectory,
     #[error("item is not a directory")]

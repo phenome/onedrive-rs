@@ -87,3 +87,16 @@ and the count of queued uploads. A second sync request returns an error while
 a delta pass is active. Pin and sync requests can run for up to five minutes.
 The daemon reserves connection capacity for short requests while these
 operations run.
+
+## Offline edits and Conflict Copies
+
+You can append to or overwrite part of a Cloud-only file while offline. The
+daemon stages the bytes you write and records which version supplies the
+untouched ranges. Those local edits survive restart. Reading an uncached,
+untouched range requires access to that version.
+
+If OneDrive can no longer supply the original version, `onedrive-rs uploads`
+shows the conflict. Your staged ranges remain readable, and the peer's version
+stays on OneDrive. Supplying the missing ranges from a known-good copy lets the
+daemon upload a complete Conflict Copy. Pin files before going offline when
+you need their full original contents available for editing.

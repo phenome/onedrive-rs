@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,12 +20,19 @@ use crate::engine::{CatalogInvalidation, CatalogObserver};
 use crate::{CatalogItem, CloudError, Engine, EngineError, ItemKind};
 
 type DirectoryEntry = (INodeNo, FileType, String);
+type DirectorySnapshot = Arc<Mutex<Option<Vec<DirectoryEntry>>>>;
+
+struct MountPaths {
+    mountpoint: PathBuf,
+    thumbnail_root: PathBuf,
+}
 
 pub struct FuseAdapter {
     engine: Arc<Engine>,
     runtime: Handle,
     shutdown: Option<watch::Receiver<()>>,
-    directories: Mutex<HashMap<u64, Arc<[DirectoryEntry]>>>,
+    directories: Mutex<HashMap<u64, DirectorySnapshot>>,
+    paths: Option<MountPaths>,
     next_directory: AtomicU64,
     observer: Arc<OnceLock<CatalogObserver>>,
 }
@@ -38,6 +45,7 @@ impl FuseAdapter {
             runtime,
             shutdown: None,
             directories: Mutex::default(),
+            paths: None,
             next_directory: AtomicU64::new(1),
             observer: Arc::default(),
         }
@@ -63,7 +71,12 @@ impl FuseAdapter {
         })
     }
 
-    pub fn mount(self, mountpoint: impl AsRef<Path>) -> io::Result<BackgroundSession> {
+    pub fn mount(mut self, mountpoint: impl AsRef<Path>) -> io::Result<BackgroundSession> {
+        let mountpoint = mountpoint.as_ref().canonicalize()?;
+        self.paths = Some(MountPaths {
+            mountpoint: mountpoint.clone(),
+            thumbnail_root: crate::engine::default_thumbnail_root()?,
+        });
         let mut config = Config::default();
         config.mount_options = vec![
             MountOption::FSName("onedrive-rs".into()),
@@ -131,10 +144,22 @@ impl FuseAdapter {
             }
             None => ino.0,
         };
-        let entries = self
-            .engine
-            .list_directory_entries(&directory.item_id)
-            .map_err(errno)?;
+        let entries = match &self.paths {
+            Some(paths) => self
+                .run(self.engine.readdir(
+                    &directory.item_id,
+                    &paths.mountpoint,
+                    &paths.thumbnail_root,
+                ))
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|entry| (entry.inode, entry.kind, entry.name))
+                        .collect()
+                }),
+            None => self.engine.list_directory_entries(&directory.item_id),
+        }
+        .map_err(errno)?;
         Ok([
             (ino, FileType::Directory, ".".into()),
             (INodeNo(parent), FileType::Directory, "..".into()),
@@ -179,20 +204,21 @@ impl Filesystem for FuseAdapter {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let entries = match self.directory_entries(ino) {
-            Ok(entries) => entries.collect(),
-            Err(error) => return reply.error(error),
-        };
-        // Directory offsets stay stable across paginated reads and concurrent delta updates.
+        if let Err(error) = self.directory(ino) {
+            return reply.error(error);
+        }
         let handle = self.next_directory.fetch_add(1, Ordering::Relaxed);
-        self.directories.lock().unwrap().insert(handle, entries);
+        self.directories
+            .lock()
+            .unwrap()
+            .insert(handle, Arc::default());
         reply.opened(FileHandle(handle), FopenFlags::empty());
     }
 
     fn readdir(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
@@ -201,6 +227,15 @@ impl Filesystem for FuseAdapter {
         let Some(entries) = entries else {
             return reply.error(Errno::EBADF);
         };
+        // Seed on the first read and preserve directory offsets across pages.
+        let mut snapshot = entries.lock().unwrap();
+        if snapshot.is_none() {
+            *snapshot = match self.directory_entries(ino) {
+                Ok(entries) => Some(entries.collect()),
+                Err(error) => return reply.error(error),
+            };
+        }
+        let entries = snapshot.as_ref().unwrap();
         let offset = usize::try_from(offset).unwrap_or(usize::MAX);
         for (index, (inode, kind, name)) in entries.iter().enumerate().skip(offset) {
             if reply.add(*inode, (index + 1) as u64, *kind, name) {

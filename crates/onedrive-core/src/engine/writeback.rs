@@ -14,7 +14,8 @@ use super::{
     CatalogItem, Engine, EngineError, ItemKind, SyncState, item_by_id, item_by_inode, lookup,
 };
 use crate::{
-    CloudError, DeltaChange, DeltaCursor, DeltaRequest, RemoteItem, UploadSource, UploadTarget,
+    CloudError, DeltaChange, DeltaCursor, DeltaRequest, RemoteItem, UploadOutcome, UploadSource,
+    UploadTarget,
 };
 
 pub(super) struct Writeback {
@@ -90,13 +91,6 @@ impl Writeback {
         file.as_file().sync_all()?;
         File::open(&self.root)?.sync_all()?;
         Ok(file)
-    }
-
-    fn retire(&self, name: Option<&str>) {
-        if let Some(name) = name {
-            // A failed cleanup can be retried on the next open.
-            let _ = fs::remove_file(self.root.join(name));
-        }
     }
 }
 
@@ -596,25 +590,36 @@ impl Engine {
             Ok((current, queued.stage))
         })?;
         if let Some(stage) = previous {
-            self.retire_unused_stage(&stage)?;
+            self.retire_unused_stage(&stage);
         }
         self.writeback.changed.notify_one();
         Ok(current)
     }
 
-    fn retire_unused_stage(&self, stage: &str) -> Result<(), EngineError> {
-        let db = self.db();
-        let referenced: bool = db.query_row(
-            "SELECT EXISTS (SELECT 1 FROM writeback_queue WHERE stage = ?1)
-                 OR EXISTS (SELECT 1 FROM writeback_attempts WHERE stage = ?1)",
-            [stage],
-            |row| row.get(0),
-        )?;
-        if !referenced {
-            db.execute("DELETE FROM writeback_bases WHERE stage = ?1", [stage])?;
-            self.writeback.retire(Some(stage));
+    fn retire_unused_stage(&self, stage: &str) {
+        // Catalog updates have already committed. Reopening retries cleanup
+        // without making a caller repeat a successful write.
+        let retire = || -> Result<(), EngineError> {
+            let db = self.db();
+            let referenced: bool = db.query_row(
+                "SELECT EXISTS (SELECT 1 FROM writeback_queue WHERE stage = ?1)
+                     OR EXISTS (SELECT 1 FROM writeback_attempts WHERE stage = ?1)",
+                [stage],
+                |row| row.get(0),
+            )?;
+            if !referenced {
+                db.execute("DELETE FROM writeback_bases WHERE stage = ?1", [stage])?;
+                match fs::remove_file(self.writeback.root.join(stage)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        };
+        if let Err(error) = retire() {
+            log::warn!("Could not retire unused write-back stage: {error}");
         }
-        Ok(())
     }
 
     pub(super) fn open_stage(
@@ -708,8 +713,8 @@ impl Engine {
                 affected.record_item(tx, &replaced.item_id)?;
                 if job(tx, replaced.inode)?.is_some_and(|job| job.remote_id.is_some()) {
                     tx.execute(
-                        "INSERT INTO writeback_replacements VALUES (?1, ?2, ?3)",
-                        params![replaced.inode, item.inode, replaced.etag],
+                        "INSERT INTO writeback_replacements (target_inode, source_inode) VALUES (?1, ?2)",
+                        params![replaced.inode, item.inode],
                     )?;
                 }
             }
@@ -896,20 +901,40 @@ impl Engine {
     fn next_upload(&self, skipped: &HashSet<u64>) -> Result<Option<Work>, EngineError> {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let work = self.select_upload(&tx, skipped)?;
+        if work.is_some() {
+            tx.commit()?;
+        }
+        Ok(work)
+    }
+
+    fn select_upload(
+        &self,
+        tx: &Transaction<'_>,
+        skipped: &HashSet<u64>,
+    ) -> Result<Option<Work>, EngineError> {
         let open_files = self.writeback.open_files.lock().unwrap();
-        let inodes = tx
-            .prepare(
-                "SELECT queue.inode FROM writeback_queue AS queue
-                 LEFT JOIN writeback_moves AS moving ON moving.inode = queue.inode
-                 ORDER BY moving.inode IS NOT NULL DESC, queue.deleted DESC, queue.sequence",
-            )?
-            .query_map([], |row| row.get::<_, u64>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut moving = tx.prepare_cached(
+            "SELECT queue.inode FROM writeback_moves AS moving
+             CROSS JOIN writeback_queue AS queue ON queue.inode = moving.inode
+             ORDER BY queue.deleted DESC, queue.sequence",
+        )?;
+        let mut queued = tx.prepare_cached(
+            "SELECT queue.inode FROM writeback_queue AS queue
+             WHERE NOT EXISTS (SELECT 1 FROM writeback_moves WHERE inode = queue.inode)
+             ORDER BY queue.deleted DESC, queue.sequence",
+        )?;
+        let moving = moving.query_map([], |row| row.get::<_, u64>(0))?;
+        let queued = queued.query_map([], |row| row.get::<_, u64>(0))?;
         let mut blocked_moves = HashMap::new();
-        for inode in inodes.into_iter().filter(|inode| !skipped.contains(inode)) {
-            let item = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
-            let queued = job(&tx, inode)?.ok_or(EngineError::NotFound)?;
-            let saved_move = move_attempt(&tx, inode)?;
+        for inode in moving.chain(queued) {
+            let inode = inode?;
+            if skipped.contains(&inode) {
+                continue;
+            }
+            let item = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
+            let queued = job(tx, inode)?.ok_or(EngineError::NotFound)?;
+            let saved_move = move_attempt(tx, inode)?;
             if saved_move.is_none()
                 && !queued.deleted
                 && tx.query_row(
@@ -920,8 +945,8 @@ impl Engine {
             {
                 continue;
             }
-            let saved = attempt(&tx, inode)?;
-            let publication_ready = publication_ready(&tx, inode, queued.stage.as_deref())?;
+            let saved = attempt(tx, inode)?;
+            let publication_ready = publication_ready(tx, inode, queued.stage.as_deref())?;
             let action = if saved_move.is_some() {
                 Action::Move
             } else if let Some(saved) = &saved {
@@ -954,8 +979,8 @@ impl Engine {
                     .parent_id
                     .as_deref()
                     .ok_or(EngineError::InvalidMutation)?;
-                let parent = item_by_id(&tx, parent)?.ok_or(EngineError::NotFound)?;
-                if job(&tx, parent.inode)?.is_some_and(|job| job.remote_id.is_none()) {
+                let parent = item_by_id(tx, parent)?.ok_or(EngineError::NotFound)?;
+                if job(tx, parent.inode)?.is_some_and(|job| job.remote_id.is_none()) {
                     continue;
                 }
                 let path_changed = queued.remote_parent != item.parent_id
@@ -1003,7 +1028,7 @@ impl Engine {
             };
             let replay = saved.is_some() || saved_move.is_some();
             let move_attempt = if matches!(action, Action::Move) && saved_move.is_none() {
-                Some(save_move(&tx, &item, item.parent_id.as_deref(), false)?)
+                Some(save_move(tx, &item, item.parent_id.as_deref(), false)?)
             } else {
                 saved_move
             };
@@ -1023,11 +1048,10 @@ impl Engine {
                          ?6, ?7, ?8)",
                     params![inode, queued.generation, queued.remote_id, parent, item.intended_name, item.etag, queued.stage, item.size],
                 )?;
-                attempt(&tx, inode)?
+                attempt(tx, inode)?
             } else {
                 saved
             };
-            tx.commit()?;
             return Ok(Some(Work {
                 item,
                 queued,
@@ -1038,10 +1062,9 @@ impl Engine {
             }));
         }
         if let Some(inode) = rename_cycle(&blocked_moves) {
-            let item = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
-            let queued = job(&tx, inode)?.ok_or(EngineError::NotFound)?;
-            let move_attempt = save_move(&tx, &item, queued.remote_parent.as_deref(), true)?;
-            tx.commit()?;
+            let item = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
+            let queued = job(tx, inode)?.ok_or(EngineError::NotFound)?;
+            let move_attempt = save_move(tx, &item, queued.remote_parent.as_deref(), true)?;
             return Ok(Some(Work {
                 item,
                 queued,
@@ -1060,16 +1083,25 @@ impl Engine {
             Action::Delete => {
                 if let Some(id) = cloud_id {
                     let replacement = self.db().query_row(
-                        "SELECT source_inode, etag FROM writeback_replacements WHERE target_inode = ?1",
+                        "SELECT source_inode FROM writeback_replacements WHERE target_inode = ?1",
                         [work.item.inode],
-                        |row| Ok((row.get::<_, Option<u64>>(0)?, row.get::<_, Option<String>>(1)?)),
+                        |row| row.get::<_, Option<u64>>(0),
                     ).optional()?;
                     let unpublished = has_publication(&self.db(), work.item.inode)?;
-                    let etag = match &replacement {
-                        Some((_, etag)) if !unpublished => etag.as_deref(),
-                        _ => work.item.etag.as_deref(),
-                    };
-                    let result = self.dispatch_delete(id, work.item.kind, etag).await;
+                    // Older catalogs do not establish that their stored tags
+                    // still match the revision the original delete authorized.
+                    let etag = self
+                        .db()
+                        .query_row(
+                            "SELECT etag FROM writeback_deletes WHERE inode = ?1",
+                            [work.item.inode],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    let result = self
+                        .dispatch_delete(id, work.item.kind, etag.as_deref())
+                        .await;
                     match result {
                         Ok(()) | Err(CloudError::NotFound) => {}
                         Err(CloudError::Conflict) if unpublished => {
@@ -1084,7 +1116,7 @@ impl Engine {
                                 let ordinary = replacement.is_none();
                                 self.restore_delete_conflict(
                                     work,
-                                    replacement.and_then(|(inode, _)| inode),
+                                    replacement.flatten(),
                                     remote,
                                     ordinary,
                                 )?;
@@ -1108,7 +1140,10 @@ impl Engine {
             Action::Move => return self.dispatch_move(work).await,
             Action::Acknowledge => return self.acknowledge(work, None, false),
         };
-        self.acknowledge(work, Some(remote), false)
+        match remote {
+            UploadOutcome::Acknowledged(item) => self.acknowledge(work, Some(item), false),
+            UploadOutcome::Observed(item) => self.acknowledge(work, Some(item), true),
+        }
     }
 
     async fn dispatch_delete(
@@ -1301,11 +1336,11 @@ impl Engine {
             }
             Ok(())
         })?;
-        self.retire_unused_stage(previous)?;
+        self.retire_unused_stage(previous);
         Ok(())
     }
 
-    async fn dispatch_attempt(&self, work: &Work) -> Result<RemoteItem, EngineError> {
+    async fn dispatch_attempt(&self, work: &Work) -> Result<UploadOutcome, EngineError> {
         let attempt = work.attempt.as_ref().ok_or(EngineError::InvalidMutation)?;
         let target = if let Some(id) = &attempt.remote_id {
             UploadTarget::Existing { item_id: id }
@@ -1320,15 +1355,16 @@ impl Engine {
                 && let Some(remote) = self.cloud.upload_destination(target).await?
             {
                 return if remote.kind == ItemKind::Folder && remote.etag.is_some() {
-                    Ok(remote)
+                    Ok(UploadOutcome::Observed(remote))
                 } else {
                     Err(CloudError::Conflict.into())
                 };
             }
-            return Ok(self
+            let remote = self
                 .cloud
                 .create_folder(&attempt.parent_id, &attempt.name)
-                .await?);
+                .await?;
+            return Ok(UploadOutcome::Acknowledged(remote));
         }
         let size = usize::try_from(attempt.size).map_err(|_| EngineError::InvalidMutation)?;
         let stage = attempt
@@ -1360,9 +1396,9 @@ impl Engine {
         if work.replay
             && let Some(remote) = self.cloud.confirm_upload(target, source, etag).await?
         {
-            return Ok(remote);
+            return Ok(UploadOutcome::Observed(remote));
         }
-        Ok(self.cloud.upload_from(target, source, etag).await?)
+        Ok(self.cloud.upload_with_outcome(target, source, etag).await?)
     }
 
     fn restore_delete_conflict(
@@ -1404,6 +1440,7 @@ impl Engine {
                     tx.execute("UPDATE items SET sync_state = 3 WHERE inode = ?1", [target])?;
                 }
                 tx.execute("DELETE FROM writeback_replacements WHERE target_inode = ?1", [target])?;
+                tx.execute("DELETE FROM writeback_deletes WHERE inode = ?1", [target])?;
             } else {
                 tx.execute("DELETE FROM writeback_queue WHERE inode = ?1", [target])?;
                 tx.execute(
@@ -1433,7 +1470,7 @@ impl Engine {
             Ok(stage)
         })?;
         if let Some(stage) = stage {
-            self.retire_unused_stage(&stage)?;
+            self.retire_unused_stage(&stage);
         }
         self.reclaim_sparse_cache()?;
         Ok(())
@@ -1443,7 +1480,7 @@ impl Engine {
         &self,
         work: &Work,
         remote: Option<RemoteItem>,
-        observed_move: bool,
+        observed: bool,
     ) -> Result<(), EngineError> {
         let cache_lock = matches!(
             work.action,
@@ -1467,7 +1504,7 @@ impl Engine {
                 && current.parent_id == queued.remote_parent
                 && Some(current.intended_name.as_str()) == queued.remote_name.as_deref();
             let ready = publication_ready(tx, inode, queued.stage.as_deref())?;
-            if observed_move
+            if observed
                 && let (Some(attempt), Some(remote)) = (&work.move_attempt, &remote)
                 && !attempt.same_version(remote)
                 && (queued.stage.is_some() || has_publication(tx, inode)?)
@@ -1505,17 +1542,17 @@ impl Engine {
                         params![name, remote.item_id],
                     )?;
                 }
-                let replacement_base = work.attempt.as_ref().and_then(|attempt| attempt.etag.as_deref())
-                    .or_else(|| {
-                        work.move_attempt.as_ref()
-                            .filter(|attempt| !observed_move || attempt.same_version(remote))
-                            .and_then(|attempt| attempt.etag.as_deref())
-                    });
-                if let Some(base) = replacement_base {
-                    tx.execute(
-                        "UPDATE writeback_replacements SET etag = ?3 WHERE target_inode = ?1 AND etag = ?2",
-                        params![inode, base, remote.etag],
-                    )?;
+                // An observation can describe a peer revision. Only a
+                // successful mutation response can advance a queued delete.
+                if !observed {
+                    let base = work.attempt.as_ref().map(|attempt| attempt.etag.as_deref())
+                        .or_else(|| work.move_attempt.as_ref().map(|attempt| attempt.etag.as_deref()));
+                    if let Some(base) = base {
+                        tx.execute(
+                            "UPDATE writeback_deletes SET etag = ?3 WHERE inode = ?1 AND etag IS ?2",
+                            params![inode, base, remote.etag],
+                        )?;
+                    }
                 }
                 tx.execute("INSERT OR IGNORE INTO full_sync_seen SELECT ?1 WHERE EXISTS (
                     SELECT 1 FROM delta_checkpoint WHERE full_scan AND link IS NOT NULL
@@ -1607,7 +1644,7 @@ impl Engine {
         })?;
         drop(cache_lock);
         if let Some(stage) = stage {
-            self.retire_unused_stage(&stage)?;
+            self.retire_unused_stage(&stage);
         }
         self.reclaim_sparse_cache()?;
         Ok(())
@@ -1809,6 +1846,10 @@ fn queue_delete(tx: &Transaction<'_>, item: &CatalogItem) -> rusqlite::Result<()
     )?;
     tx.execute("INSERT INTO changed_inodes VALUES (?1, 0)", [item.inode])?;
     tx.execute(
+        "INSERT INTO writeback_deletes (inode, etag) VALUES (?1, ?2)",
+        params![item.inode, item.etag],
+    )?;
+    tx.execute(
         "UPDATE writeback_queue SET deleted = 1, generation = generation + 1 WHERE inode = ?1",
         [item.inode],
     )?;
@@ -1917,7 +1958,7 @@ impl Engine {
             .as_ref()
             .and_then(|attempt| attempt.stage.as_deref())
         {
-            self.retire_unused_stage(stage)?;
+            self.retire_unused_stage(stage);
         }
         Ok(())
     }

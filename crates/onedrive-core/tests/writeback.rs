@@ -297,6 +297,7 @@ async fn remote_create_at_a_dirty_path_leaves_the_staged_version_reachable() {
 }
 
 struct InterruptedDrive {
+    move_gate: Option<(tokio::sync::Notify, tokio::sync::Notify)>,
     pause_move: std::sync::atomic::AtomicBool,
     peer_before_move: std::sync::atomic::AtomicBool,
     inner: Arc<FakeCloudDrive>,
@@ -391,6 +392,10 @@ impl CloudDrive for InterruptedDrive {
         name: &str,
         etag: &str,
     ) -> Result<RemoteItem, CloudError> {
+        if let Some((started, resume)) = &self.move_gate {
+            started.notify_one();
+            resume.notified().await;
+        }
         if self
             .peer_before_move
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -413,6 +418,7 @@ impl CloudDrive for InterruptedDrive {
 
 fn interrupted_drive(inner: Arc<FakeCloudDrive>, pause: bool) -> Arc<InterruptedDrive> {
     Arc::new(InterruptedDrive {
+        move_gate: None,
         pause_move: false.into(),
         peer_before_move: false.into(),
         inner,
@@ -1229,4 +1235,177 @@ async fn cold_edit_during_move(ctag: Option<&str>, peer_edit: bool) {
         assert_eq!(moved.sync_state, SyncState::Clean);
         assert_eq!(inner.read_range("cold", 0, 5).await.unwrap(), b"base!");
     }
+}
+
+#[tokio::test]
+async fn delete_queued_during_move_only_advances_for_our_acknowledged_mutation() {
+    for peer_edit in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = drive();
+        inner.upsert(cloud_file(4));
+        inner.set_content("cold", b"base".to_vec());
+        let mut cloud = interrupted_drive(inner.clone(), false);
+        Arc::get_mut(&mut cloud).unwrap().move_gate = Some(Default::default());
+        let (started, resume) = cloud.move_gate.as_ref().unwrap();
+        let engine = Arc::new(
+            Engine::open(dir.path().join("db"), cloud.clone(), Arc::new(SystemClock)).unwrap(),
+        );
+        engine.sync().await.unwrap();
+        let inode = engine.resolve_path("/cold").unwrap().unwrap().inode;
+        engine.rename(1, "cold", 1, "moved", false).unwrap();
+        let draining = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.drain_uploads().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        engine.unlink(1, "moved", ItemKind::File).unwrap();
+        if peer_edit {
+            inner
+                .upload(UploadTarget::Existing { item_id: "cold" }, b"peer", None)
+                .await
+                .unwrap();
+        }
+        resume.notify_one();
+        let result = draining.await.unwrap();
+        if peer_edit {
+            assert!(matches!(
+                result,
+                Err(EngineError::Cloud(CloudError::Conflict))
+            ));
+            assert!(inner.recycled_items().is_empty());
+            let restored = engine.resolve_path("/cold").unwrap().unwrap();
+            assert_eq!(
+                (restored.inode, restored.sync_state),
+                (inode, SyncState::Conflict)
+            );
+            assert_eq!(engine.read(inode, 0, 4).await.unwrap(), b"peer");
+        } else {
+            assert_eq!(result.unwrap(), 2);
+            assert_eq!(inner.recycled_items(), ["cold"]);
+        }
+        assert!(engine.pending_uploads().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn committed_append_succeeds_when_old_stage_retirement_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog");
+    let drive = drive();
+    drive.upsert(cloud_file(4));
+    drive.set_content("cold", b"base".to_vec());
+    let engine = Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    engine.sync().await.unwrap();
+    let inode = engine.resolve_path("/cold").unwrap().unwrap().inode;
+    engine.write(inode, 0, b"B", false).await.unwrap();
+    let fault = rusqlite::Connection::open(&db).unwrap();
+    fault
+        .execute_batch(
+            "CREATE TRIGGER fail_retirement BEFORE DELETE ON writeback_bases
+         BEGIN SELECT RAISE(ABORT, 'test cleanup failure'); END;",
+        )
+        .unwrap();
+
+    engine.write(inode, 0, b"!", true).await.unwrap();
+    assert_eq!(engine.read(inode, 0, 8).await.unwrap(), b"Base!");
+    fault.execute_batch("DROP TRIGGER fail_retirement").unwrap();
+    drop(engine);
+    let engine = Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+    assert_eq!(drive.read_range("cold", 0, 8).await.unwrap(), b"Base!");
+}
+
+#[tokio::test]
+async fn blocked_delete_yields_to_later_runnable_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let drive = drive();
+    let engine = Engine::open(dir.path().join("db"), drive, Arc::new(SystemClock)).unwrap();
+    engine.sync().await.unwrap();
+    let held = engine.create_and_open(1, "held", None).unwrap();
+    engine.unlink(1, "held", ItemKind::File).unwrap();
+    engine.create(1, "ready", ItemKind::File).unwrap();
+
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+    assert_eq!(
+        engine.resolve_path("/ready").unwrap().unwrap().sync_state,
+        SyncState::Clean
+    );
+    assert_eq!(engine.pending_uploads().unwrap()[0].inode, held.inode);
+    engine.release_file(held.inode);
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn fake_cloud_rejects_truncated_sources_before_publication() {
+    let drive = drive();
+    let file = tempfile::tempfile().unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, b"ab", 0).unwrap();
+    let target = UploadTarget::New {
+        parent_id: "root",
+        name: "upload",
+    };
+    assert!(matches!(
+        drive
+            .upload_from(
+                target,
+                UploadSource::File {
+                    file: &file,
+                    size: 4
+                },
+                None
+            )
+            .await,
+        Err(CloudError::Unavailable)
+    ));
+    assert!(drive.upload_destination(target).await.unwrap().is_none());
+    let uploaded = drive
+        .upload_from(
+            target,
+            UploadSource::File {
+                file: &file,
+                size: 2,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        drive.read_range(&uploaded.item_id, 0, 4).await.unwrap(),
+        b"ab"
+    );
+}
+
+#[tokio::test]
+async fn legacy_delete_with_no_frozen_version_restores_the_remote_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog");
+    let drive = drive();
+    drive.upsert(cloud_file(4));
+    drive.set_content("cold", b"base".to_vec());
+    let open = || Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    let engine = open();
+    engine.sync().await.unwrap();
+    let inode = engine.resolve_path("/cold").unwrap().unwrap().inode;
+    engine.unlink(1, "cold", ItemKind::File).unwrap();
+    drop(engine);
+
+    let old_catalog = rusqlite::Connection::open(&db).unwrap();
+    old_catalog
+        .execute_batch("DROP TABLE writeback_deletes;")
+        .unwrap();
+    drop(old_catalog);
+    let reopened = open();
+    assert!(matches!(
+        reopened.drain_uploads().await,
+        Err(EngineError::Cloud(CloudError::Conflict))
+    ));
+    let restored = reopened.resolve_path("/cold").unwrap().unwrap();
+    assert_eq!(
+        (restored.inode, restored.sync_state),
+        (inode, SyncState::Conflict)
+    );
+    assert!(drive.recycled_items().is_empty());
+    assert!(reopened.pending_uploads().unwrap().is_empty());
 }

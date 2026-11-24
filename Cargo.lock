@@ -1593,6 +1593,7 @@ dependencies = [
  "onedrive-core",
  "onedrive-graph",
  "png",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

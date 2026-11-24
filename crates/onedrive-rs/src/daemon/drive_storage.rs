@@ -51,7 +51,7 @@ pub(super) async fn open(
     }
     if !database.try_exists()? && Engine::catalog_storage_present(&database)? {
         return Err(io::Error::other(format!(
-            "OneDrive catalog missing beside its staging files or WAL at {database:?}"
+            "OneDrive catalog missing beside its SQLite companions or staged files at {database:?}"
         ))
         .into());
     }
@@ -116,8 +116,7 @@ fn legacy_catalogs(data: &Path, legacy_state: Option<&Path>) -> io::Result<Vec<P
     let mut sources = Vec::new();
     for directory in std::iter::once(data).chain(legacy_state) {
         let database = directory.join(CATALOG);
-        // Also surface an orphaned stage or WAL instead of opening a new
-        // catalog beside it and having writeback clean up unrecognized bytes.
+        // Surface orphaned staging and SQLite companions to preserve them for recovery.
         if Engine::catalog_storage_present(&database)? && !sources.contains(&database) {
             sources.push(database);
         }
@@ -144,6 +143,7 @@ async fn adopt_legacy(
 
     let mut identified = Vec::new();
     let mut seen = Vec::new();
+    let canonical_data = data.canonicalize()?;
     for source in sources {
         let parent = source.parent().expect("legacy catalog has a parent");
         let canonical = parent.canonicalize()?;
@@ -151,22 +151,31 @@ async fn adopt_legacy(
             continue;
         }
         seen.push(canonical.clone());
+        let lock = if canonical == canonical_data {
+            Ok(None)
+        } else {
+            lock_storage(parent).map(Some).map_err(io::Error::other)
+        };
+        let rollback_journal = Engine::catalog_rollback_journal_present(&source)?;
         let result = (|| {
-            let lock = if canonical == data.canonicalize()? {
-                None
-            } else {
-                Some(lock_storage(parent).map_err(io::Error::other)?)
-            };
+            let lock = lock?;
             if !fs::symlink_metadata(&source)?.is_file() {
                 return Err(io::Error::other("legacy catalog must be a regular file"));
             }
-            let root = Engine::stored_root_id(&source).map_err(io::Error::other)?;
+            let root = Engine::stored_root_id(&source)?;
             Ok((root, lock))
         })();
         match result {
             Ok((Some(root), lock)) => identified.push((source, root, lock)),
             Ok((None, _)) => report_preserved(&source),
             Err(error) => {
+                // A fresh destination would prevent a later recovery from being adopted.
+                if rollback_journal {
+                    return Err(io::Error::other(format!(
+                        "Cannot recover legacy OneDrive catalog at {source:?} ({error})"
+                    ))
+                    .into());
+                }
                 eprintln!("Cannot inspect legacy OneDrive data at {source:?} ({error}).");
                 report_preserved(&source);
             }
@@ -194,6 +203,11 @@ async fn adopt_legacy(
     }
     if matching.len() == 1 {
         let (source, _legacy_lock) = matching.pop().unwrap();
+        // Persist the destination path before removing anything from the legacy path.
+        let directory = destination.parent().expect("drive catalog has a parent");
+        for parent in directory.canonicalize()?.ancestors().skip(1) {
+            File::open(parent)?.sync_all()?;
+        }
         Engine::relocate_catalog(&source, destination)
             .map_err(|error| io::Error::other(format!("Cannot adopt {source:?} ({error})")))?;
     } else {

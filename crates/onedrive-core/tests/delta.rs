@@ -273,14 +273,17 @@ async fn retry_after_survives_cancellation_and_restart_before_retrying_the_same_
     drive.fail_after(1, CloudError::Throttled { retry_after: wait });
     tokio::time::advance(Duration::from_micros(500)).await;
 
-    let worker = tokio::spawn({
+    let mut worker = tokio::spawn({
         let engine = engine.clone();
         async move { engine.sync().await }
     });
-    assert_eq!(
-        backoffs.recv().await,
-        Some(wait + Duration::from_micros(500))
-    );
+    let backoff = tokio::select! {
+        notification = tokio::time::timeout(Duration::from_secs(1), backoffs.recv()) => {
+            notification.expect("worker did not start a backoff")
+        }
+        result = &mut worker => panic!("worker exited before the first backoff: {result:?}"),
+    };
+    assert_eq!(backoff, Some(wait + Duration::from_micros(500)));
     let requests = drive.requests();
     assert_eq!(requests.len(), 2);
     assert!(matches!(requests[1], DeltaRequest::Link(_)));

@@ -21,6 +21,21 @@ fn entry_present(path: &Path) -> io::Result<bool> {
     }
 }
 
+fn sqlite_companions_present(database: &Path) -> io::Result<bool> {
+    Ok(entry_present(&sqlite_companion(database, "-wal"))?
+        || entry_present(&sqlite_companion(database, "-shm"))?
+        || Engine::catalog_rollback_journal_present(database)?)
+}
+
+fn validate_rollback_journal(database: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(sqlite_companion(database, "-journal")) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(io::Error::other("rollback journal must be a regular file")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn parent(path: &Path) -> &Path {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -141,20 +156,37 @@ impl Engine {
     /// Does the storage directory contain a catalog or a companion requiring recovery?
     pub fn catalog_storage_present(database: &Path) -> io::Result<bool> {
         Ok(entry_present(database)?
-            || entry_present(&sqlite_companion(database, "-wal"))?
-            || entry_present(&sqlite_companion(database, "-shm"))?
+            || sqlite_companions_present(database)?
             || entry_present(&Writeback::staging_directory(database))?)
     }
 
-    /// Inspect an offline catalog without opening its cache or staging directory.
-    pub fn stored_root_id(database: &Path) -> rusqlite::Result<Option<String>> {
-        let db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        db.query_row(
-            "SELECT item_id FROM items WHERE inode = 1 AND parent_id IS NULL AND kind = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
+    /// Does a rollback journal entry exist, even if its catalog is missing?
+    pub fn catalog_rollback_journal_present(database: &Path) -> io::Result<bool> {
+        entry_present(&sqlite_companion(database, "-journal"))
+    }
+
+    /// Inspect an offline catalog, recovering a hot rollback journal if needed.
+    /// The caller holds the storage directory lock. Neither open creates a catalog.
+    pub fn stored_root_id(database: &Path) -> io::Result<Option<String>> {
+        validate_rollback_journal(database)?;
+        let read_root = |flags| {
+            let db = Connection::open_with_flags(database, flags)?;
+            db.query_row(
+                "SELECT item_id FROM items WHERE inode = 1 AND parent_id IS NULL AND kind = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+        };
+        let root = match read_root(OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK =>
+            {
+                read_root(OpenFlags::SQLITE_OPEN_READ_WRITE)
+            }
+            result => result,
+        };
+        root.map_err(io::Error::other)
     }
 
     /// Relocate an offline catalog on the same filesystem. The caller owns
@@ -165,7 +197,7 @@ impl Engine {
         if !entry_present(source)? {
             if Self::catalog_storage_present(source)? {
                 return Err(io::Error::other(
-                    "legacy catalog missing beside its WAL or staged files",
+                    "legacy catalog missing beside its SQLite companions or staged files",
                 ));
             }
             if entry_present(destination)? {
@@ -177,14 +209,12 @@ impl Engine {
         if !fs::symlink_metadata(source)?.is_file() {
             return Err(io::Error::other("legacy catalog must be a regular file"));
         }
-        if entry_present(destination)?
-            || entry_present(&sqlite_companion(destination, "-wal"))?
-            || entry_present(&sqlite_companion(destination, "-shm"))?
-        {
+        if entry_present(destination)? || sqlite_companions_present(destination)? {
             return Err(io::Error::other(
                 "catalog files exist in both storage directories",
             ));
         }
+        validate_rollback_journal(source)?;
         Self::checkpoint_for_relocation(source).map_err(io::Error::other)?;
         let from = File::open(parent(source))?;
         let to = File::open(parent(destination))?;
@@ -201,6 +231,11 @@ impl Engine {
             &destination_stage,
             move_stage,
         )?;
+        if sqlite_companions_present(source)? {
+            return Err(io::Error::other(
+                "SQLite companions remain beside the legacy catalog",
+            ));
+        }
         let move_entry = |old: &Path, new: &Path| -> io::Result<()> {
             renameat_with(CWD, old, CWD, new, RenameFlags::NOREPLACE)?;
             to.sync_all()?;
@@ -359,5 +394,47 @@ mod tests {
         assert!(source.is_file());
         assert_eq!(fs::read(stage.join("edit")).unwrap(), b"offline");
         assert!(!Writeback::staging_directory(&destination).exists());
+    }
+
+    #[test]
+    fn destination_catalog_or_companions_prevent_relocation_without_overwrite() {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("old.sqlite");
+            let destination = dir.path().join("new.sqlite");
+            Connection::open(&source)
+                .unwrap()
+                .execute_batch("CREATE TABLE existing (value)")
+                .unwrap();
+            let before = fs::read(&source).unwrap();
+            let stage = Writeback::staging_directory(&source);
+            fs::create_dir(&stage).unwrap();
+            fs::write(stage.join("edit"), b"offline").unwrap();
+            let companion = sqlite_companion(&destination, suffix);
+            fs::write(&companion, b"keep").unwrap();
+
+            assert!(Engine::catalog_storage_present(&destination).unwrap());
+            assert!(Engine::relocate_catalog(&source, &destination).is_err());
+            assert_eq!(fs::read(&source).unwrap(), before);
+            assert_eq!(fs::read(stage.join("edit")).unwrap(), b"offline");
+            assert_eq!(fs::read(companion).unwrap(), b"keep");
+            assert_eq!(destination.exists(), suffix.is_empty());
+            assert!(!Writeback::staging_directory(&destination).exists());
+        }
+    }
+
+    #[test]
+    fn missing_source_with_a_rollback_journal_is_not_a_completed_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("old.sqlite");
+        let destination = dir.path().join("new.sqlite");
+        let journal = sqlite_companion(&source, "-journal");
+        fs::write(&journal, b"keep").unwrap();
+        fs::write(&destination, b"existing").unwrap();
+
+        assert!(Engine::catalog_storage_present(&source).unwrap());
+        assert!(Engine::relocate_catalog(&source, &destination).is_err());
+        assert_eq!(fs::read(journal).unwrap(), b"keep");
+        assert_eq!(fs::read(destination).unwrap(), b"existing");
     }
 }

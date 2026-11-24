@@ -216,11 +216,11 @@ async fn ranged_cdn_reads_refresh_expired_urls_and_validate_responses() {
             .expect(1)
             .mount(&cdn)
             .await;
+        assert_eq!(graph.read_range("file", 2, 5).await.unwrap(), b"cde");
         assert_eq!(
             graph.read_range("file", 0, 1).await,
             Err(CloudError::InvalidResponse)
         );
-        assert_eq!(graph.read_range("file", 2, 5).await.unwrap(), b"cde");
         assert_eq!(graph.read_range("file", 9, 2).await.unwrap(), b"");
         assert_eq!(graph.read_range("file", 0, 2).await.unwrap(), b"ab");
         for (offset, length) in [(1, 2), (0, 3), (0, 4)] {

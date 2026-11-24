@@ -10,8 +10,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::{CatalogItem, Engine, EngineError, ItemKind};
 
-const HEADER_BYTES: u64 = 64 * 1024;
-const STREAM_BYTES: u64 = 2 * 1024 * 1024;
+pub(super) const HEADER_BYTES: u64 = 64 * 1024;
+pub(super) const STREAM_BYTES: u64 = 2 * 1024 * 1024;
 const HEADER_BLOCK: i64 = -1;
 const XATTR_NAMES: [&str; 3] = [
     "user.onedrive.state",
@@ -119,12 +119,7 @@ impl Engine {
                 if offset >= item.size || length == 0 {
                     return Ok(Vec::new());
                 }
-                tx.execute(
-                    "INSERT INTO sparse_files (inode) VALUES (?1) ON CONFLICT(inode) DO NOTHING",
-                    [inode],
-                )?;
-                let generation =
-                    generation_for(&tx, inode)?.expect("cache generation was allocated");
+                let generation = allocate_generation(&tx, inode)?;
                 tx.commit()?;
                 (item, generation)
             };
@@ -141,7 +136,7 @@ impl Engine {
         }
     }
 
-    async fn read_generation(
+    pub(super) async fn read_generation(
         &self,
         item: &CatalogItem,
         generation: i64,
@@ -218,7 +213,7 @@ fn range_for_read(stream_offset: u64, header_sniff: bool) -> (i64, u64, u64) {
     }
 }
 
-fn generation_for(db: &Connection, inode: u64) -> rusqlite::Result<Option<i64>> {
+pub(super) fn generation_for(db: &Connection, inode: u64) -> rusqlite::Result<Option<i64>> {
     db.query_row(
         "SELECT generation FROM sparse_files WHERE inode = ?1",
         [inode],
@@ -235,12 +230,9 @@ fn block_cached(db: &Connection, generation: i64, block: i64) -> rusqlite::Resul
     )
 }
 
-fn is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
+pub(super) fn is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
     if item.kind != ItemKind::File {
         return Ok(false);
-    }
-    if item.size == 0 {
-        return Ok(true);
     }
     let Some(generation) = generation_for(db, item.inode)? else {
         return Ok(false);
@@ -254,4 +246,12 @@ fn is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
         |row| row.get(0),
     )?;
     Ok(streams == item.size.div_ceil(STREAM_BYTES))
+}
+
+pub(super) fn allocate_generation(db: &Connection, inode: u64) -> rusqlite::Result<i64> {
+    db.execute(
+        "INSERT INTO sparse_files (inode) VALUES (?1) ON CONFLICT(inode) DO NOTHING",
+        [inode],
+    )?;
+    Ok(generation_for(db, inode)?.expect("cache generation was allocated"))
 }

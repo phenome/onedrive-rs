@@ -9,10 +9,11 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use thiserror::Error;
 
 use crate::{
-    Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem,
+    Clock, CloudDrive, CloudError, Config, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest,
+    ItemKind, RemoteItem,
 };
 
+mod retention;
 mod sparse_cache;
 
 use sparse_cache::SparseCache;
@@ -95,6 +96,7 @@ pub struct Engine {
     cloud: Arc<dyn CloudDrive>,
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
+    config: Config,
 }
 
 const ITEM_COLUMNS: &str =
@@ -119,6 +121,16 @@ impl Engine {
         cloud: Arc<dyn CloudDrive>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, EngineError> {
+        Self::open_with_config(database, cache_dir, cloud, clock, Config::default())
+    }
+
+    pub fn open_with_config(
+        database: impl AsRef<Path>,
+        cache_dir: impl AsRef<Path>,
+        cloud: Arc<dyn CloudDrive>,
+        clock: Arc<dyn Clock>,
+        config: Config,
+    ) -> Result<Self, EngineError> {
         let mut db = Connection::open(database)?;
         db.pragma_update(None, "foreign_keys", true)?;
         let journal: String = db.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
@@ -135,6 +147,7 @@ impl Engine {
             db: Mutex::new(db),
             cloud,
             clock,
+            config,
             syncing: tokio::sync::Mutex::new(()),
         })
     }
@@ -239,18 +252,7 @@ impl Engine {
     /// Store the explicit directive. Effective sticky pin policy belongs in Engine.
     pub fn set_pin_state(&self, item_id: &str, pin: PinState) -> Result<bool, EngineError> {
         let db = self.db();
-        let changed = match pin {
-            PinState::None => {
-                db.execute("DELETE FROM pin_directives WHERE item_id = ?1", [item_id])?
-            }
-            _ => db.execute(
-                "INSERT INTO pin_directives (item_id, pin_state)
-                 SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM items WHERE item_id = ?1)
-                 ON CONFLICT(item_id) DO UPDATE SET pin_state = excluded.pin_state",
-                params![item_id, pin as i64],
-            )?,
-        };
-        Ok(changed != 0)
+        Ok(write_pin(&db, item_id, pin)?)
     }
 
     pub fn pin_state(&self, item_id: &str) -> Result<PinState, EngineError> {
@@ -517,4 +519,17 @@ fn prune_remote_deletions(transaction: &Transaction<'_>) -> rusqlite::Result<()>
         [],
     )?;
     Ok(())
+}
+
+fn write_pin(db: &Connection, item_id: &str, pin: PinState) -> rusqlite::Result<bool> {
+    let changed = match pin {
+        PinState::None => db.execute("DELETE FROM pin_directives WHERE item_id = ?1", [item_id])?,
+        _ => db.execute(
+            "INSERT INTO pin_directives (item_id, pin_state)
+             SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM items WHERE item_id = ?1)
+             ON CONFLICT(item_id) DO UPDATE SET pin_state = excluded.pin_state",
+            params![item_id, pin as i64],
+        )?,
+    };
+    Ok(changed != 0)
 }

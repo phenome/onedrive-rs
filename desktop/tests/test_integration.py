@@ -153,11 +153,13 @@ class ExtensionTests(unittest.TestCase):
         self.assertEqual(self.info.emblems, [])
         self.assertEqual(self.provider.get_file_items([self.info]), [])
 
-    def serve(self, listener, response):
+    def serve(self, listener, response, next_status=None):
         with listener.accept()[0] as conn, conn.makefile("rb") as stream:
             conn.settimeout(3)
             line = stream.readline()
             self.assertTrue(line.endswith(b"\n"))
+            if next_status is not None:
+                self.set_status(*next_status)
             conn.sendall(response)
             return json.loads(line)
 
@@ -173,16 +175,9 @@ class ExtensionTests(unittest.TestCase):
                 ("purge", ("Cloud-only", "none")),
             ):
                 with self.subTest(operation=operation):
-                    def respond():
-                        with listener.accept()[0] as conn, conn.makefile("rb") as stream:
-                            conn.settimeout(3)
-                            line = stream.readline()
-                            self.assertTrue(line.endswith(b"\n"))
-                            self.set_status(*next_status)
-                            conn.sendall(b'{"ok":true,"result":null}\n')
-                            return json.loads(line)
-
-                    received = server.submit(respond)
+                    received = server.submit(
+                        self.serve, listener, b'{"ok":true,"result":null}\n', next_status
+                    )
                     previous = self.info.invalidations
                     [item] = self.provider.get_file_items([self.info])
                     item.emit("activate")
@@ -194,6 +189,32 @@ class ExtensionTests(unittest.TestCase):
                     self.update()
                     expected = "starred-symbolic" if operation == "pin" else "folder-remote-symbolic"
                     self.assertEqual(self.info.emblems, [expected])
+
+    def test_purge_rechecks_dirty_state_before_sending(self):
+        self.set_status("Hydrated", "none")
+        self.update()
+        [_, purge] = self.provider.get_file_items([self.info])
+        self.set_status("Dirty", "none")
+        with patch.object(extension, "request") as send, patch.object(extension.Gtk, "AlertDialog") as alert:
+            purge.emit("activate")
+            self.drain_until(lambda: alert.called)
+            self.assertIn("await upload", alert.call_args.kwargs["detail"])
+            send.assert_not_called()
+            self.assertFalse(self.provider.active_paths)
+
+    def test_action_on_non_utf8_name_reports_error_on_every_attempt(self):
+        self.path = self.mount / os.fsdecode(b"\xff")
+        self.path.touch()
+        self.info = FileInfo(Gio.File.new_for_uri(self.path.as_uri()))
+        self.set_status("Cloud-only", "none")
+        with patch.object(extension.Gtk, "AlertDialog") as alert:
+            for attempt in (1, 2):
+                self.update()
+                [pin] = self.provider.get_file_items([self.info])
+                pin.emit("activate")
+                self.drain_until(lambda: alert.call_count == attempt)
+                self.assertIn("UTF-8", alert.call_args.kwargs["detail"])
+                self.assertFalse(self.provider.active_paths)
 
     def test_purge_failure_shows_daemon_error_and_invalidates(self):
         self.set_status("Hydrated", "none")

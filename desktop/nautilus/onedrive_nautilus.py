@@ -113,7 +113,11 @@ def request(socket_path, operation, path, complete):
     # A folder Pin can wait for recursive hydration.
     client = Gio.SocketClient(enable_proxy=False, timeout=300)
     address = Gio.UnixSocketAddress.new(os.fspath(socket_path))
-    payload = json.dumps({"op": operation, "path": path}, ensure_ascii=False).encode() + b"\n"
+    try:
+        payload = json.dumps({"op": operation, "path": path}, ensure_ascii=False).encode() + b"\n"
+    except UnicodeEncodeError:
+        complete("The OneDrive path must be valid UTF-8")
+        return
     response_bytes = bytearray()
 
     def connected(client, result):

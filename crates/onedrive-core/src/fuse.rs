@@ -109,7 +109,7 @@ impl FuseAdapter {
         };
         let entries = self
             .engine
-            .list_children(&directory.item_id)
+            .list_directory_entries(&directory.item_id)
             .map_err(errno)?;
         Ok([
             (ino, FileType::Directory, ".".into()),
@@ -119,7 +119,7 @@ impl FuseAdapter {
         .chain(
             entries
                 .into_iter()
-                .map(|entry| (INodeNo(entry.inode), file_type(entry.kind), entry.name)),
+                .map(|(inode, kind, name)| (INodeNo(inode), file_type(kind), name)),
         ))
     }
 }

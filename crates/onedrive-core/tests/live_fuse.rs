@@ -7,10 +7,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
 use onedrive_core::{
-    Engine, FakeCloudDrive, FuseAdapter, ItemKind, PinState, RemoteItem, SystemClock,
+    CloudError, Engine, EngineError, FakeCloudDrive, FuseAdapter, ItemKind, PinState, RemoteItem,
+    SyncState, SystemClock,
 };
 
 const WORKER_DIR: &str = "ONEDRIVE_LIVE_FUSE_WORKER_DIR";
+const DELTA_PAGE_SIZE: usize = 100;
 const HEADER: usize = 64 * 1024;
 const STREAM: usize = 2 * 1024 * 1024;
 
@@ -83,7 +85,7 @@ fn exercise_mount(dir: &Path) {
         .unwrap();
     let mount = dir.join("mount");
     let cache = dir.join("cache");
-    let drive = Arc::new(FakeCloudDrive::new(100));
+    let drive = Arc::new(FakeCloudDrive::new(DELTA_PAGE_SIZE));
     let root = RemoteItem {
         item_id: "root".into(),
         parent_id: None,
@@ -242,7 +244,7 @@ fn exercise_mount(dir: &Path) {
         parent_id: Some("root".into()),
         name: Some("renamed".into()),
         mtime: root.mtime + 1,
-        ..root
+        ..root.clone()
     });
     runtime.block_on(engine.sync()).unwrap();
     assert!(!mount.join("folder").exists());
@@ -251,6 +253,61 @@ fn exercise_mount(dir: &Path) {
         file.mtime + 1
     );
     assert_eq!(fs::read_dir(mount.join("renamed")).unwrap().count(), 1500);
+    assert!(engine.set_sync_state("file", SyncState::Dirty).unwrap());
+    let alias = mount.join("content (pending).bin");
+    let conflict = mount.join("content (conflict).bin");
+    assert!(!alias.exists());
+    assert!(!conflict.exists());
+
+    let replacement = RemoteItem {
+        item_id: "replacement".into(),
+        ctag: Some("replacement".into()),
+        ..file.clone()
+    };
+    drive.upsert(replacement);
+    drive.set_content("replacement", vec![23; bytes.len()]);
+    // Fill the first page so the replacement is visible before the final reconciliation.
+    for index in 1..DELTA_PAGE_SIZE {
+        drive.upsert(RemoteItem {
+            item_id: format!("nameless-{index}"),
+            parent_id: Some("root".into()),
+            name: None,
+            kind: ItemKind::File,
+            ..root.clone()
+        });
+    }
+    drive.delete("file");
+    drive.fail_after(1, CloudError::Unavailable);
+    assert!(matches!(
+        runtime.block_on(engine.sync()),
+        Err(EngineError::Cloud(CloudError::Unavailable))
+    ));
+    let old_inode = metadata.ino();
+    let replacement_inode = fs::metadata(&path).unwrap().ino();
+    assert_ne!(replacement_inode, old_inode);
+    assert_eq!(fs::metadata(&alias).unwrap().ino(), old_inode);
+    assert!(
+        fs::read_dir(&mount)
+            .unwrap()
+            .any(|entry| entry.unwrap().file_name() == alias.file_name().unwrap())
+    );
+    let mut prefix = [0; 32];
+    File::open(&path).unwrap().read_exact(&mut prefix).unwrap();
+    assert_eq!(prefix, [23; 32]);
+    let mut aliased = File::open(&alias).unwrap();
+    aliased.read_exact(&mut prefix).unwrap();
+    assert_eq!(prefix, new_bytes[..32]);
+    assert!(!conflict.exists());
+
+    runtime.block_on(engine.sync()).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), replacement_inode);
+    assert!(!alias.exists());
+    assert_eq!(fs::metadata(&conflict).unwrap().ino(), old_inode);
+    aliased.read_exact_at(&mut prefix, 0).unwrap();
+    assert_eq!(prefix, new_bytes[..32]);
+    handle.read_exact_at(&mut prefix, 0).unwrap();
+    assert_eq!(prefix, new_bytes[..32]);
+    drop(aliased);
     drop(handle);
 
     assert!(

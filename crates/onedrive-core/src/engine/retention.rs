@@ -1,9 +1,66 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::sparse_cache::{HEADER_BYTES, STREAM_BYTES, allocate_generation, is_hydrated};
-use super::{Engine, EngineError, ItemKind, PinState, SyncState, item_by_id};
+use super::{Engine, EngineError, ItemKind, PinState, SyncState, item_by_id, write_pin};
+
+const SUBTREE: &str = "WITH RECURSIVE subtree(item_id) AS (
+    SELECT item_id FROM items WHERE item_id = ?1
+    UNION
+    SELECT i.item_id FROM items i JOIN subtree ON i.parent_id = subtree.item_id
+)";
 
 impl Engine {
+    /// Remove a Pin while retaining cached bytes according to the eviction policy.
+    pub fn unpin(&self, item_id: &str) -> Result<(), EngineError> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let item = item_by_id(&tx, item_id)?.ok_or(EngineError::NotFound)?;
+        write_pin(
+            &tx,
+            item_id,
+            unpin_directive(&tx, item.parent_id.as_deref())?,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Retire all cached bytes and explicit pins in a clean subtree.
+    pub fn purge(&self, item_id: &str) -> Result<(), EngineError> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let item = item_by_id(&tx, item_id)?.ok_or(EngineError::NotFound)?;
+        let protected = tx
+            .prepare_cached(&format!(
+                "{SUBTREE} SELECT i.item_id, i.sync_state FROM items i JOIN subtree USING (item_id)
+             WHERE i.sync_state <> 0 ORDER BY i.sync_state, i.inode LIMIT 1",
+            ))?
+            .query_row([item_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        if let Some((item_id, state)) = protected {
+            return Err(match state {
+                SyncState::Conflict => EngineError::UnresolvedConflict { item_id },
+                _ => EngineError::PendingUpload { item_id },
+            });
+        }
+
+        let pin = unpin_directive(&tx, item.parent_id.as_deref())?;
+        tx.execute(
+            &format!(
+                "{SUBTREE} DELETE FROM sparse_files WHERE inode IN (
+                SELECT inode FROM items JOIN subtree USING (item_id)
+            )"
+            ),
+            [item_id],
+        )?;
+        tx.execute(
+            &format!("{SUBTREE} DELETE FROM pin_directives WHERE item_id IN (SELECT item_id FROM subtree)"),
+            [item_id],
+        )?;
+        write_pin(&tx, item_id, pin)?;
+        tx.commit()?;
+        self.cache.reclaim(&db)
+    }
+
     /// Persist a Pin (Sticky Pin for folders) and hydrate its eligible files.
     pub async fn pin(&self, item_id: &str) -> Result<(), EngineError> {
         if !self.set_pin_state(item_id, PinState::Pinned)? {
@@ -14,7 +71,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn hydrate_pins(&self, root: Option<&str>) -> Result<(), EngineError> {
+    pub(super) async fn hydrate_pins(&self, root: Option<&str>) -> Result<(), EngineError> {
         let candidates = self
             .db()
             .prepare_cached(
@@ -174,4 +231,13 @@ fn cached_files(db: &Connection) -> Result<Vec<CachedFile>, EngineError> {
         })
     })
     .collect()
+}
+
+fn unpin_directive(db: &Connection, parent_id: Option<&str>) -> rusqlite::Result<PinState> {
+    if let Some(parent_id) = parent_id
+        && effective_pin(db, parent_id)? == PinState::Pinned
+    {
+        return Ok(PinState::UnpinOverride);
+    }
+    Ok(PinState::None)
 }

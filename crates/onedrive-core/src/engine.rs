@@ -28,6 +28,10 @@ pub enum EngineError {
     SyncSuperseded,
     #[error("item does not exist")]
     NotFound,
+    #[error("cannot purge {item_id}: pending upload")]
+    PendingUpload { item_id: String },
+    #[error("cannot purge {item_id}: unresolved conflict")]
+    UnresolvedConflict { item_id: String },
     #[error("cannot read a directory as a file")]
     IsDirectory,
     #[error("sparse cache I/O error")]
@@ -178,7 +182,8 @@ impl Engine {
                 Err(error) => return Err(error.into()),
             };
             if self.commit_page(page, revision)? {
-                return Ok(());
+                self.evict()?;
+                return self.hydrate_pins(None).await;
             }
         }
     }

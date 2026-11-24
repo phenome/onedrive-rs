@@ -114,3 +114,79 @@ async fn pin_hydrates_full_file_and_survives_restart_and_eviction() {
     );
     assert_eq!(fixture.drive.range_requests(), requests);
 }
+
+#[tokio::test]
+async fn purge_inherited_file_persists_override_and_preserves_siblings() {
+    let fixture = Fixture::new();
+    fixture.add("folder", Some("root"), ItemKind::Folder, 0);
+    fixture.add("nested", Some("folder"), ItemKind::Folder, 0);
+    fixture.add("file", Some("nested"), ItemKind::File, 10);
+    fixture.add("sibling", Some("folder"), ItemKind::File, 20);
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.pin("folder").await.unwrap();
+    assert_eq!(state(&engine, "file"), "Hydrated");
+    assert_eq!(xattr(&engine, "file", "user.onedrive.pin"), "pinned");
+    engine.purge("file").unwrap();
+    assert_eq!(state(&engine, "file"), "Cloud-only");
+    assert_eq!(engine.pin_state("file").unwrap(), PinState::UnpinOverride);
+    drop(engine);
+
+    let engine = fixture.open();
+    fixture.add("new", Some("nested"), ItemKind::File, 30);
+    engine.sync().await.unwrap();
+    assert_eq!(state(&engine, "new"), "Hydrated");
+    assert_eq!(state(&engine, "sibling"), "Hydrated");
+    assert_eq!(state(&engine, "file"), "Cloud-only");
+    assert_eq!(
+        xattr(&engine, "file", "user.onedrive.pin"),
+        "unpin_override"
+    );
+    assert_eq!(
+        fixture
+            .drive
+            .range_requests()
+            .iter()
+            .filter(|r| r.0 == "file")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn purge_folder_is_atomic_on_pending_upload_then_clears_descendant_pins() {
+    use onedrive_core::{EngineError, SyncState};
+
+    let fixture = Fixture::new();
+    fixture.add("folder", Some("root"), ItemKind::Folder, 0);
+    fixture.add("dirty", Some("folder"), ItemKind::File, 10);
+    fixture.add("clean", Some("folder"), ItemKind::File, 20);
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.pin("folder").await.unwrap();
+    engine.pin("clean").await.unwrap();
+    engine
+        .set_sync_state("dirty", SyncState::Uploading)
+        .unwrap();
+    for target in ["dirty", "folder"] {
+        assert!(
+            matches!(engine.purge(target), Err(EngineError::PendingUpload { item_id }) if item_id == "dirty")
+        );
+    }
+    assert_eq!(state(&engine, "dirty"), "Dirty");
+    assert_eq!(state(&engine, "clean"), "Hydrated");
+    assert_eq!(engine.pin_state("folder").unwrap(), PinState::Pinned);
+
+    engine.set_sync_state("dirty", SyncState::Clean).unwrap();
+    engine.purge("folder").unwrap();
+    for id in ["folder", "dirty", "clean"] {
+        assert_eq!(engine.pin_state(id).unwrap(), PinState::None);
+        assert_eq!(state(&engine, id), "Cloud-only");
+    }
+    let requests = fixture.drive.range_requests().len();
+    assert_eq!(
+        engine.read(inode(&engine, "dirty"), 0, 10).await.unwrap(),
+        vec![13; 10]
+    );
+    assert_eq!(fixture.drive.range_requests().len(), requests + 1);
+}

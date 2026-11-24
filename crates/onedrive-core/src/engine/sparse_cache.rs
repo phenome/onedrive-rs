@@ -47,13 +47,15 @@ impl SparseCache {
         let retired = select.query_map([], |row| row.get(0))?;
         for generation in retired {
             let generation = generation?;
-            let removed = fs::remove_file(self.path(generation));
-            if removed.is_ok() || removed.is_err_and(|err| err.kind() == io::ErrorKind::NotFound) {
-                db.execute(
-                    "DELETE FROM sparse_retired WHERE generation = ?1",
-                    [generation],
-                )?;
+            if let Err(error) = fs::remove_file(self.path(generation))
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(error.into());
             }
+            db.execute(
+                "DELETE FROM sparse_retired WHERE generation = ?1",
+                [generation],
+            )?;
         }
         Ok(())
     }
@@ -87,7 +89,7 @@ impl Engine {
                 super::SyncState::Clean if is_hydrated(&db, &item)? => "Hydrated",
                 super::SyncState::Clean => "Cloud-only",
             },
-            "user.onedrive.pin" => match item.pin_state {
+            "user.onedrive.pin" => match super::retention::effective_pin(&db, &item.item_id)? {
                 super::PinState::None => "none",
                 super::PinState::Pinned => "pinned",
                 super::PinState::UnpinOverride => "unpin_override",

@@ -24,3 +24,4 @@ Live Nautilus 51.1 tracing ([`docs/research/nautilus-live-probe.md`](../research
 
 - Opening a large unvisited photo folder (e.g., 955 PNGs) takes a few seconds once for concurrent thumbnail seeding, then opens instantaneously on every subsequent visit.
 - Never synthesize fake bytes on `read()` to fool MIME sniffing; POSIX callers always see authentic file bytes.
+- Partial ranges count toward the unpinned cache budget. Under pressure, eviction can remove a clean, unpinned file's cached ranges, so a repeated header read may fetch the range again.

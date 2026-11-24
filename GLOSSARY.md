@@ -5,11 +5,11 @@ A cloud-first OneDrive client for Linux desktops (targeting Nautilus and POSIX t
 ## Language
 
 **Cloud-only**:
-A file whose metadata exists locally but whose content bytes are not stored in the local cache; opening it fetches bytes on demand.
+A file whose metadata is available locally and whose content is fetched on demand. A cached header or other partial range can satisfy a read while the file remains Cloud-only.
 _Avoid_: Placeholder, stub, remote-only
 
 **Hydrated**:
-A file whose content bytes are currently stored in the local cache and available without re-downloading.
+A file whose complete contents are available from the local cache.
 _Avoid_: Downloaded, materialized, locally synced
 
 **Pin**:
@@ -29,7 +29,7 @@ An explicit user action that removes an item's locally cached bytes, unpins it (
 _Avoid_: Free up space, delete local, evict
 
 **Eviction**:
-Automatic removal of locally cached content bytes from clean, unpinned hydrated files when cache size or idle-age limits are exceeded.
+Automatic removal of cached bytes from clean, unpinned files under cache budget pressure, including partially cached files. Fully hydrated files are also eligible when their idle-age limit is exceeded.
 _Avoid_: Purge, cleanup, garbage collection
 
 **Dirty**:

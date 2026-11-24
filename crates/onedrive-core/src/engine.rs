@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -12,6 +13,10 @@ use crate::{
     RemoteItem,
 };
 
+mod sparse_cache;
+
+use sparse_cache::SparseCache;
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("metadata catalog error")]
@@ -20,6 +25,14 @@ pub enum EngineError {
     WalUnavailable,
     #[error("another engine advanced the delta checkpoint")]
     SyncSuperseded,
+    #[error("item does not exist")]
+    NotFound,
+    #[error("cannot read a directory as a file")]
+    IsDirectory,
+    #[error("sparse cache I/O error")]
+    CacheIo(#[from] io::Error),
+    #[error("cloud range did not match the catalog file size")]
+    InvalidRange,
     #[error(transparent)]
     Cloud(#[from] CloudError),
 }
@@ -78,6 +91,7 @@ impl FromSql for SyncState {
 
 pub struct Engine {
     db: Mutex<Connection>,
+    cache: SparseCache,
     cloud: Arc<dyn CloudDrive>,
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
@@ -93,7 +107,20 @@ impl Engine {
         cloud: Arc<dyn CloudDrive>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, EngineError> {
+        let database = database.as_ref();
+        let mut cache = database.as_os_str().to_owned();
+        cache.push(".cache");
+        Self::open_with_cache(database, PathBuf::from(cache), cloud, clock)
+    }
+
+    pub fn open_with_cache(
+        database: impl AsRef<Path>,
+        cache_dir: impl AsRef<Path>,
+        cloud: Arc<dyn CloudDrive>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, EngineError> {
         let mut db = Connection::open(database)?;
+        db.pragma_update(None, "foreign_keys", true)?;
         let journal: String = db.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         if !journal.eq_ignore_ascii_case("wal") {
             return Err(EngineError::WalUnavailable);
@@ -102,7 +129,9 @@ impl Engine {
         let transaction = db.transaction()?;
         transaction.execute_batch(include_str!("schema.sql"))?;
         transaction.commit()?;
+        let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
         Ok(Self {
+            cache,
             db: Mutex::new(db),
             cloud,
             clock,
@@ -190,6 +219,7 @@ impl Engine {
             transaction.execute("UPDATE delta_checkpoint SET full_scan = 0", [])?;
         }
         transaction.commit()?;
+        self.cache.reclaim(&db)?;
         Ok(complete)
     }
 
@@ -251,13 +281,7 @@ impl Engine {
     }
 
     pub fn getattr(&self, inode: u64) -> Result<Option<CatalogItem>, EngineError> {
-        Ok(self
-            .db()
-            .prepare_cached(&format!(
-                "SELECT {ITEM_COLUMNS} FROM items WHERE inode = ?1"
-            ))?
-            .query_row([inode], catalog_item)
-            .optional()?)
+        Ok(item_by_inode(&self.db(), inode)?)
     }
 
     pub fn item(&self, item_id: &str) -> Result<Option<CatalogItem>, EngineError> {
@@ -344,6 +368,14 @@ fn item_by_id(db: &Connection, item_id: &str) -> rusqlite::Result<Option<Catalog
         "SELECT {ITEM_COLUMNS} FROM items WHERE item_id = ?1"
     ))?
     .query_row([item_id], catalog_item)
+    .optional()
+}
+
+fn item_by_inode(db: &Connection, inode: u64) -> rusqlite::Result<Option<CatalogItem>> {
+    db.prepare_cached(&format!(
+        "SELECT {ITEM_COLUMNS} FROM items WHERE inode = ?1"
+    ))?
+    .query_row([inode], catalog_item)
     .optional()
 }
 

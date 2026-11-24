@@ -7,6 +7,16 @@ use thiserror::Error;
 /// The Graph adapter translates HTTP responses into this port's domain types.
 #[async_trait]
 pub trait CloudDrive: Send + Sync {
+    /// Read up to length bytes, stopping at remote EOF.
+    async fn read_range(
+        &self,
+        _item_id: &str,
+        _offset: u64,
+        _length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        Err(CloudError::Unavailable)
+    }
+
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError>;
 }
 

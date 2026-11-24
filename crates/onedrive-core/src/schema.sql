@@ -42,3 +42,32 @@ CREATE TABLE IF NOT EXISTS delta_deletions (
 CREATE TABLE IF NOT EXISTS full_sync_seen (
     item_id TEXT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS sparse_files (
+    generation INTEGER PRIMARY KEY AUTOINCREMENT,
+    inode INTEGER NOT NULL UNIQUE REFERENCES items(inode) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS sparse_ranges (
+    generation INTEGER NOT NULL REFERENCES sparse_files(generation) ON DELETE CASCADE,
+    block INTEGER NOT NULL,
+    PRIMARY KEY (generation, block)
+);
+
+CREATE TABLE IF NOT EXISTS sparse_retired (
+    generation INTEGER PRIMARY KEY
+);
+
+CREATE TRIGGER IF NOT EXISTS sparse_invalidate_on_content_change
+AFTER UPDATE OF ctag, mtime, size, kind ON items
+WHEN OLD.ctag IS NOT NEW.ctag OR OLD.mtime IS NOT NEW.mtime
+     OR OLD.size IS NOT NEW.size OR OLD.kind IS NOT NEW.kind
+BEGIN
+    DELETE FROM sparse_files WHERE inode = NEW.inode;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sparse_reclaim_on_retirement
+AFTER DELETE ON sparse_files
+BEGIN
+    INSERT INTO sparse_retired VALUES (OLD.generation);
+END;

@@ -23,6 +23,8 @@ struct State {
     next_token: u64,
     failures: VecDeque<(usize, CloudError)>,
     requests: Vec<DeltaRequest>,
+    contents: HashMap<String, Vec<u8>>,
+    range_requests: Vec<(String, u64, usize)>,
 }
 
 #[derive(Clone)]
@@ -55,14 +57,11 @@ impl FakeCloudDrive {
         let mut state = self.state.lock().unwrap();
         let mut removed = vec![item_id.to_owned()];
         while let Some(parent) = removed.pop() {
-            state.items.retain(|id, item| {
-                if item.parent_id.as_deref() == Some(&parent) {
-                    removed.push(id.clone());
-                    false
-                } else {
-                    *id != parent
-                }
-            });
+            state.contents.remove(&parent);
+            state.items.remove(&parent);
+            removed.extend(state.items.iter().filter_map(|(id, item)| {
+                (item.parent_id.as_deref() == Some(&parent)).then(|| id.clone())
+            }));
         }
         state.changes.push(DeltaChange::Delete(item_id.into()));
     }
@@ -79,6 +78,18 @@ impl FakeCloudDrive {
             .push_back((requests_before_failure, error));
     }
 
+    pub fn set_content(&self, item_id: &str, bytes: Vec<u8>) {
+        self.state
+            .lock()
+            .unwrap()
+            .contents
+            .insert(item_id.into(), bytes);
+    }
+
+    pub fn range_requests(&self) -> Vec<(String, u64, usize)> {
+        self.state.lock().unwrap().range_requests.clone()
+    }
+
     pub fn requests(&self) -> Vec<DeltaRequest> {
         self.state.lock().unwrap().requests.clone()
     }
@@ -86,6 +97,22 @@ impl FakeCloudDrive {
 
 #[async_trait]
 impl CloudDrive for FakeCloudDrive {
+    async fn read_range(
+        &self,
+        item_id: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        let mut state = self.state.lock().unwrap();
+        state.range_requests.push((item_id.into(), offset, length));
+        let bytes = state.contents.get(item_id).ok_or(CloudError::Unavailable)?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let end = start.saturating_add(length).min(bytes.len());
+        Ok(bytes[start..end].to_vec())
+    }
+
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
         let mut state = self.state.lock().unwrap();
         state.requests.push(request.clone());

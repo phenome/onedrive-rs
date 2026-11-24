@@ -13,6 +13,11 @@ use super::{CatalogItem, Engine, EngineError, ItemKind};
 const HEADER_BYTES: u64 = 64 * 1024;
 const STREAM_BYTES: u64 = 2 * 1024 * 1024;
 const HEADER_BLOCK: i64 = -1;
+const XATTR_NAMES: [&str; 3] = [
+    "user.onedrive.state",
+    "user.onedrive.pin",
+    "user.onedrive.etag",
+];
 
 #[derive(Default)]
 struct RangeLocks(HashMap<(i64, u64), Weak<AsyncMutex<()>>>);
@@ -67,6 +72,36 @@ impl SparseCache {
 }
 
 impl Engine {
+    pub fn list_xattrs(&self, inode: u64) -> Result<&'static [&'static str], EngineError> {
+        self.getattr(inode)?.ok_or(EngineError::NotFound)?;
+        Ok(&XATTR_NAMES)
+    }
+
+    pub fn xattr(&self, inode: u64, name: &str) -> Result<Option<Vec<u8>>, EngineError> {
+        let db = self.db();
+        let item = super::item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?;
+        let value = match name {
+            "user.onedrive.state" => match item.sync_state {
+                super::SyncState::Conflict => "Conflict",
+                super::SyncState::Dirty | super::SyncState::Uploading => "Dirty",
+                super::SyncState::Clean if is_hydrated(&db, &item)? => "Hydrated",
+                super::SyncState::Clean => "Cloud-only",
+            },
+            "user.onedrive.pin" => match item.pin_state {
+                super::PinState::None => "none",
+                super::PinState::Pinned => "pinned",
+                super::PinState::UnpinOverride => "unpin_override",
+            },
+            "user.onedrive.etag" => item.etag.as_deref().unwrap_or_default(),
+            _ => return Ok(None),
+        };
+        Ok(Some(value.as_bytes().to_vec()))
+    }
+
+    pub fn cache_capacity(&self) -> Result<rustix::fs::StatVfs, EngineError> {
+        rustix::fs::statvfs(&self.cache.root).map_err(|err| io::Error::from(err).into())
+    }
+
     pub async fn read(
         &self,
         inode: u64,
@@ -96,8 +131,9 @@ impl Engine {
 
             let end = offset.saturating_add(length as u64).min(item.size);
             let mut result = vec![0; (end - offset) as usize];
+            let header_sniff = offset == 0 && length as u64 <= HEADER_BYTES;
             if self
-                .read_generation(&item, generation, offset, end, &mut result)
+                .read_generation(&item, generation, offset, header_sniff, &mut result)
                 .await?
             {
                 return Ok(result);
@@ -110,9 +146,10 @@ impl Engine {
         item: &CatalogItem,
         generation: i64,
         start: u64,
-        end: u64,
+        header_sniff: bool,
         output: &mut [u8],
     ) -> Result<bool, EngineError> {
+        let end = start + output.len() as u64;
         let mut offset = start;
         while offset < end {
             let stream_offset = offset / STREAM_BYTES * STREAM_BYTES;
@@ -140,7 +177,7 @@ impl Engine {
                 }
             }
 
-            let (block, fetch_offset, length) = range_for_read(stream_offset, end);
+            let (block, fetch_offset, length) = range_for_read(stream_offset, header_sniff);
             let bytes = self
                 .cloud
                 .read_range(&item.item_id, fetch_offset, length as usize)
@@ -173,8 +210,8 @@ impl Engine {
     }
 }
 
-fn range_for_read(stream_offset: u64, end: u64) -> (i64, u64, u64) {
-    if end <= HEADER_BYTES {
+fn range_for_read(stream_offset: u64, header_sniff: bool) -> (i64, u64, u64) {
+    if header_sniff {
         (HEADER_BLOCK, 0, HEADER_BYTES)
     } else {
         (stream_offset as i64, stream_offset, STREAM_BYTES)
@@ -196,4 +233,25 @@ fn block_cached(db: &Connection, generation: i64, block: i64) -> rusqlite::Resul
         params![generation, block],
         |row| row.get(0),
     )
+}
+
+fn is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
+    if item.kind != ItemKind::File {
+        return Ok(false);
+    }
+    if item.size == 0 {
+        return Ok(true);
+    }
+    let Some(generation) = generation_for(db, item.inode)? else {
+        return Ok(false);
+    };
+    if item.size <= HEADER_BYTES && block_cached(db, generation, HEADER_BLOCK)? {
+        return Ok(true);
+    }
+    let streams: u64 = db.query_row(
+        "SELECT COUNT(*) FROM sparse_ranges WHERE generation = ?1 AND block >= 0",
+        [generation],
+        |row| row.get(0),
+    )?;
+    Ok(streams == item.size.div_ceil(STREAM_BYTES))
 }

@@ -8,12 +8,15 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1"
+fuser = "0.19"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 toml = "1"
 
 [dev-dependencies]
+xattr = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

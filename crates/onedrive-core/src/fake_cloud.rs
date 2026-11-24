@@ -103,6 +103,7 @@ impl CloudDrive for FakeCloudDrive {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, CloudError> {
+        tokio::task::yield_now().await;
         let mut state = self.state.lock().unwrap();
         state.range_requests.push((item_id.into(), offset, length));
         let bytes = state.contents.get(item_id).ok_or(CloudError::Unavailable)?;

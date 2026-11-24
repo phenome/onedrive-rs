@@ -62,3 +62,62 @@ async fn header_sniff_fetches_only_64_kib_and_survives_engine_restart() {
     );
     assert_eq!(drive.range_requests(), [("file".into(), 0, HEADER)]);
 }
+
+#[tokio::test]
+async fn streaming_reads_coalesce_and_hydrate_across_arbitrary_offsets() {
+    let (_temp, drive, engine, inode, bytes) = setup(2 * STREAM + 37).await;
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Cloud-only"
+    );
+    let (first, second) = tokio::join!(
+        engine.read(inode, STREAM as u64 + 17, 950),
+        engine.read(inode, STREAM as u64 + 300, STREAM),
+    );
+    assert_eq!(first.unwrap(), bytes[STREAM + 17..STREAM + 967]);
+    assert_eq!(second.unwrap(), bytes[STREAM + 300..]);
+    assert_eq!(
+        engine.read(inode, HEADER as u64 - 5, 200).await.unwrap(),
+        bytes[HEADER - 5..HEADER + 195]
+    );
+    assert_eq!(
+        drive.range_requests(),
+        [
+            ("file".into(), STREAM as u64, STREAM),
+            ("file".into(), 2 * STREAM as u64, STREAM),
+            ("file".into(), 0, STREAM),
+        ]
+    );
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Hydrated"
+    );
+    assert_eq!(engine.read(inode, 0, bytes.len()).await.unwrap(), bytes);
+    assert_eq!(drive.range_requests().len(), 3);
+}
+
+#[tokio::test]
+async fn ctag_and_mtime_changes_each_retire_cached_bytes() {
+    let (_temp, drive, engine, inode, bytes) = setup(8192).await;
+    assert_eq!(engine.read(inode, 0, bytes.len()).await.unwrap(), bytes);
+    let mut item = fixture_file(bytes.len());
+    for (version, byte) in [("ctag", 13), ("mtime", 42)] {
+        if version == "ctag" {
+            item.ctag = Some("content-2".into());
+        } else {
+            item.mtime += 1;
+        }
+        drive.upsert(item.clone());
+        drive.set_content("file", vec![byte; bytes.len()]);
+        engine.sync().await.unwrap();
+        assert_eq!(
+            engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+            b"Cloud-only"
+        );
+        assert_eq!(
+            engine.read(inode, 0, bytes.len()).await.unwrap(),
+            vec![byte; bytes.len()]
+        );
+    }
+    assert_eq!(drive.range_requests(), vec![("file".into(), 0, HEADER); 3]);
+}

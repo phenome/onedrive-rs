@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use onedrive_core::{
     CloudDrive, CloudError, Config, DeltaCursor, DeltaPage, DeltaRequest, FakeCloudDrive, ItemKind,
-    RemoteItem, RemoteThumbnail,
+    RemoteItem, RemoteThumbnail, UploadSource, UploadTarget,
 };
 use onedrive_rs::{daemon, ipc::socket_path};
 use rustix::process::{Pid, Signal, kill_process};
@@ -28,12 +28,19 @@ struct IsolatedCloud {
 #[async_trait]
 impl CloudDrive for IsolatedCloud {
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
-        if self.stall_delta || self.dir.join("stall-manual").exists() {
-            let DeltaRequest::Link(link) = request else {
-                panic!("expected persisted continuation");
-            };
+        if let DeltaRequest::Link(link) = &request {
             fs::write(self.dir.join("resumed-cursor"), link).unwrap();
+        }
+        if self.stall_delta || self.dir.join("stall-manual").exists() {
+            assert!(
+                matches!(request, DeltaRequest::Link(_)),
+                "expected persisted continuation"
+            );
+            fs::write(self.dir.join("delta-stalled"), "").unwrap();
             return std::future::pending().await;
+        }
+        if self.dir.join("offline").exists() {
+            return Err(CloudError::Unavailable);
         }
         let page = self.fake.delta(request).await?;
         if let DeltaCursor::Complete(link) = &page.cursor {
@@ -68,6 +75,40 @@ impl CloudDrive for IsolatedCloud {
 
     async fn download_thumbnail(&self, rendition: &RemoteThumbnail) -> Result<Vec<u8>, CloudError> {
         self.fake.download_thumbnail(rendition).await
+    }
+    async fn upload_destination(
+        &self,
+        target: UploadTarget<'_>,
+    ) -> Result<Option<RemoteItem>, CloudError> {
+        self.check_upload_connection()?;
+        self.fake.upload_destination(target).await
+    }
+
+    async fn upload_from(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        self.check_upload_connection()?;
+        let uploaded = self.fake.upload_from(target, source, if_match).await?;
+        let bytes = self
+            .fake
+            .read_range(&uploaded.item_id, 0, uploaded.size as usize)
+            .await?;
+        fs::write(self.dir.join("uploaded-bytes"), bytes).unwrap();
+        Ok(uploaded)
+    }
+}
+
+impl IsolatedCloud {
+    fn check_upload_connection(&self) -> Result<(), CloudError> {
+        if self.dir.join("offline").exists() {
+            fs::write(self.dir.join("upload-offline"), "").unwrap();
+            Err(CloudError::Unavailable)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -168,7 +209,7 @@ fn mounted_daemon_lifecycle() {
     assert_eq!(sandbox.cli("status")["result"]["paused"], true);
     assert_eq!(sandbox.cli("sync")["ok"], true);
     assert_eq!(sandbox.cli("resume")["ok"], true);
-    assert_eq!(sandbox.cli("uploads")["ok"], false);
+    assert_eq!(sandbox.cli("uploads")["result"], serde_json::json!([]));
     let content_path = mount.join("content.txt");
     let content = content_path.to_str().unwrap();
     assert_eq!(xattr(&content_path, "state"), "Hydrated");
@@ -235,7 +276,7 @@ fn mounted_daemon_lifecycle() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    wait_for(|| sandbox.dir().join("resumed-cursor").exists());
+    wait_for(|| sandbox.dir().join("delta-stalled").exists());
 
     let duplicates: Vec<_> = (0..32)
         .map(|_| {
@@ -332,6 +373,98 @@ fn mounted_daemon_lifecycle() {
     assert_eq!(xattr(&mount.join("content.txt"), "pin"), "pinned");
     assert_eq!(xattr(&mount.join("content.txt"), "state"), "Cloud-only");
     sandbox.stop(Signal::TERM);
+}
+
+#[test]
+fn mounted_daemon_writeback_restarts_offline_and_purges_after_upload() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start(false);
+    let mount = sandbox.mount.clone();
+    let socket = socket_path(&sandbox.dir().join("run"));
+    let document = mount.join("content.txt");
+    let mounted_path = document.to_str().unwrap();
+    let offline = sandbox.dir().join("offline");
+    wait_for(|| mounted(&mount) && socket.exists());
+    wait_for(|| sandbox.cli("status")["result"]["sync_state"] == "idle");
+    let checkpoint = fs::read_to_string(sandbox.dir().join("issued-cursor")).unwrap();
+
+    fs::write(&offline, "").unwrap();
+    assert!(
+        bounded("sh")
+            .args([
+                "-c",
+                "printf %s 'edited offline' > \"$1\"",
+                "writeback",
+                mounted_path
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for(|| sandbox.dir().join("upload-offline").exists());
+    assert_eq!(xattr(&document, "state"), "Dirty");
+    assert_eq!(sandbox.cli("status")["result"]["pending_upload_count"], 1);
+    assert_eq!(
+        sandbox.cli("uploads")["result"],
+        serde_json::json!([
+            {"path": "/content.txt", "sync_state": "dirty"}
+        ])
+    );
+    let purge = sandbox.cli_args(&["purge", mounted_path]);
+    assert_eq!(purge["ok"], false);
+    assert!(purge["error"].as_str().unwrap().contains("pending upload"));
+    assert!(
+        fs::read_dir(
+            sandbox
+                .dir()
+                .join("data/onedrive-rs/catalog.sqlite3.staging")
+        )
+        .unwrap()
+        .next()
+        .is_some()
+    );
+    assert!(
+        fs::metadata(sandbox.dir().join("data/onedrive-rs/catalog.sqlite3-wal"))
+            .unwrap()
+            .len()
+            > 0
+    );
+    sandbox.stop(Signal::TERM);
+    assert!(!socket.exists() && !mounted(&mount));
+
+    fs::remove_file(sandbox.dir().join("resumed-cursor")).ok();
+    sandbox.start(false);
+    wait_for(|| mounted(&mount) && sandbox.dir().join("resumed-cursor").exists());
+    assert_eq!(
+        fs::read_to_string(sandbox.dir().join("resumed-cursor")).unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        bounded("cat").arg(&document).output().unwrap().stdout,
+        b"edited offline"
+    );
+    assert_eq!(xattr(&document, "state"), "Dirty");
+    assert_eq!(sandbox.cli_args(&["purge", mounted_path])["ok"], false);
+
+    assert_eq!(sandbox.cli("pause")["ok"], true);
+    fs::remove_file(&offline).unwrap();
+    assert_eq!(sandbox.cli("status")["result"]["pending_upload_count"], 1);
+    assert_eq!(sandbox.cli("resume")["ok"], true);
+    wait_for(|| sandbox.cli("status")["result"]["pending_upload_count"] == 0);
+    assert_eq!(
+        fs::read(sandbox.dir().join("uploaded-bytes")).unwrap(),
+        b"edited offline"
+    );
+    assert_eq!(sandbox.cli("uploads")["result"], serde_json::json!([]));
+    assert_eq!(xattr(&document, "state"), "Hydrated");
+    assert_eq!(sandbox.cli_args(&["purge", mounted_path])["ok"], true);
+    assert_eq!(xattr(&document, "state"), "Cloud-only");
+    assert_eq!(
+        bounded("cat").arg(&document).output().unwrap().stdout,
+        b"edited offline"
+    );
+    sandbox.stop(Signal::TERM);
+    assert!(!socket.exists() && !mounted(&mount));
 }
 
 struct Sandbox {

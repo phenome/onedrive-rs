@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use onedrive_core::{CloudDrive, Config, Engine, FuseAdapter, SystemClock};
+use onedrive_core::{
+    CloudDrive, Config, Engine, FuseAdapter, SyncState as ItemSyncState, SystemClock,
+};
 use rustix::fs::{FlockOperation, flock};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
@@ -14,7 +16,7 @@ use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
-use crate::ipc::{IpcServer, MountPath, Request, Status, serve_connection, socket_path};
+use crate::ipc::{IpcServer, MountPath, Request, Status, Upload, serve_connection, socket_path};
 
 const MAX_CONNECTIONS: usize = 32;
 const MAX_LONG_JOBS: usize = 24;
@@ -60,7 +62,6 @@ pub async fn run(
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
     let runtime = runtime_dir()?;
     let mount = mount_path(&runtime, &config, cli_mount)?;
-    let state = xdg_home("XDG_STATE_HOME", ".local/state")?.join("onedrive-rs");
     let data = xdg_home("XDG_DATA_HOME", ".local/share")?.join("onedrive-rs");
     let cache = xdg_home("XDG_CACHE_HOME", ".cache")?.join("onedrive-rs");
     let period = Duration::from_secs(config.delta_poll_interval_secs);
@@ -72,8 +73,11 @@ pub async fn run(
         .map_err(|error| format!("Cannot bind OneDrive IPC socket ({error})"))?;
     let listener = server.async_listener().map_err(|error| error.to_string())?;
     let _data_lock = prepare_storage(&data, &cache)?;
-    let _legacy_lock = migrate_legacy_catalog(&state, &data)
-        .map_err(|error| format!("Cannot migrate OneDrive catalog ({error})"))?;
+    let _legacy_lock = match xdg_home("XDG_STATE_HOME", ".local/state") {
+        Ok(state) => migrate_legacy_catalog(&state.join("onedrive-rs"), &data)
+            .map_err(|error| format!("Cannot migrate OneDrive catalog ({error})"))?,
+        Err(_) => None,
+    };
     let min_free_disk_bytes = config.min_free_disk_bytes;
     let engine = Arc::new(
         Engine::open_with_config(
@@ -99,6 +103,7 @@ pub async fn run(
         _ = interrupt.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),
         _ = delta.poll(period) => Ok(()),
+        _ = delta.upload_worker() => Ok(()),
         result = async {
             loop {
                 tokio::select! {
@@ -169,23 +174,42 @@ fn migrate_legacy_catalog(
     let source = state.join("catalog.sqlite3");
     let destination = data.join("catalog.sqlite3");
     if !source.try_exists()? {
+        if state.join("catalog.sqlite3-wal").try_exists()? {
+            return Err("the legacy WAL exists without its catalog".into());
+        }
         return Ok(Some(legacy_lock));
     }
-    if destination.try_exists()? {
-        return Err("catalogs exist in both XDG_STATE_HOME and XDG_DATA_HOME".into());
+    if !fs::symlink_metadata(&source)?.is_file() {
+        return Err("the legacy catalog is not a regular file".into());
     }
-    let db = rusqlite::Connection::open_with_flags(
-        &source,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )?;
-    // Exiting WAL mode folds committed frames into the main database.
-    let mode: String = db.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
-    if mode != "delete" {
-        return Err("could not checkpoint the legacy catalog".into());
+    if destination.try_exists()?
+        || data.join("catalog.sqlite3-wal").try_exists()?
+        || data.join("catalog.sqlite3-shm").try_exists()?
+    {
+        return Err("catalog files exist in both XDG_STATE_HOME and XDG_DATA_HOME".into());
     }
-    drop(db);
+    Engine::checkpoint_for_relocation(&source)?;
     let target = File::open(data)?;
-    fs::rename(source, destination)?;
+    let source_stage = state.join("catalog.sqlite3.staging");
+    if source_stage.try_exists()? {
+        let destination_stage = data.join("catalog.sqlite3.staging");
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &source_stage,
+            rustix::fs::CWD,
+            &destination_stage,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?;
+        target.sync_all()?;
+        legacy_lock.sync_all()?;
+    }
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &source,
+        rustix::fs::CWD,
+        &destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
     target.sync_all()?;
     legacy_lock.sync_all()?;
     Ok(Some(legacy_lock))
@@ -257,7 +281,14 @@ impl DeltaSync {
         if background && self.poll_state.borrow().paused {
             return Ok(());
         }
-        let synced = self.engine.sync().await;
+        let synced = async {
+            self.engine.sync().await?;
+            if !background {
+                self.engine.drain_uploads().await?;
+            }
+            Ok::<_, onedrive_core::EngineError>(())
+        }
+        .await;
         *result = if synced.is_ok() {
             SyncState::Idle
         } else {
@@ -283,6 +314,49 @@ impl DeltaSync {
                 _ = state.wait_for(|state| state.paused || state.resume_count != resume_count) => {}
             }
         }
+    }
+
+    async fn upload_worker(&self) {
+        let mut state = self.poll_state.subscribe();
+        loop {
+            let resume_count = state
+                .wait_for(|state| !state.paused)
+                .await
+                .unwrap()
+                .resume_count;
+            tokio::select! {
+                biased;
+                _ = state.wait_for(|state| state.paused || state.resume_count != resume_count) => {}
+                _ = Engine::run_upload_worker(Arc::downgrade(&self.engine)) => return,
+            }
+        }
+    }
+
+    fn uploads(&self) -> Result<Value, String> {
+        let entries = self
+            .engine
+            .pending_upload_paths()
+            .map_err(|error| error.to_string())?;
+        let uploads = entries
+            .into_iter()
+            .map(|(path, state)| {
+                let sync_state = match state {
+                    ItemSyncState::Dirty => "dirty",
+                    ItemSyncState::Uploading => "uploading",
+                    ItemSyncState::Conflict => "conflict",
+                    ItemSyncState::Clean => "clean",
+                };
+                Ok(Upload {
+                    path: MountPath::try_from(
+                        path.into_os_string()
+                            .into_string()
+                            .map_err(|_| "OneDrive upload path is not UTF-8")?,
+                    )?,
+                    sync_state: sync_state.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, &str>>()?;
+        serde_json::to_value(uploads).map_err(|error| error.to_string())
     }
 
     fn resolve_item(&self, path: &MountPath) -> Result<String, String> {
@@ -362,7 +436,7 @@ impl DeltaSync {
                     .map_err(|error| error.to_string())?;
                 Ok(Value::Null)
             }
-            Request::Uploads {} => Err("The upload queue is unavailable in this build".into()),
+            Request::Uploads {} => self.uploads(),
         }
     }
 }

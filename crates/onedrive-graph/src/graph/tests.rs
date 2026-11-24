@@ -417,6 +417,14 @@ async fn simple_upload_folder_move_and_recycle_bin_use_personal_drive() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/drive/items/replacement"))
+        .and(header("authorization", "Bearer synthetic-access"))
+        .and(header("if-match", r#""base""#))
+        .respond_with(ResponseTemplate::new(412))
+        .expect(1)
+        .mount(&server)
+        .await;
     assert_eq!(
         graph.create_folder("root", "photos").await.unwrap().kind,
         ItemKind::Folder
@@ -456,6 +464,10 @@ async fn simple_upload_folder_move_and_recycle_bin_use_personal_drive() {
         Some("folder")
     );
     graph.delete_item("item").await.unwrap();
+    assert_eq!(
+        graph.delete_if_match("replacement", r#""base""#).await,
+        Err(CloudError::Conflict)
+    );
 }
 
 #[tokio::test]
@@ -527,17 +539,23 @@ async fn upload_session_resumes_from_server_offset_and_maps_conflict() {
         .mount(&cdn)
         .await;
 
-    let mut bytes = vec![1; 5 * 1024 * 1024];
-    bytes.extend(vec![2; 5 * 1024 * 1024]);
-    bytes.extend([3; 3]);
+    use std::io::Write;
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&vec![1; 5 * 1024 * 1024]).unwrap();
+    file.write_all(&vec![2; 5 * 1024 * 1024]).unwrap();
+    file.write_all(&[3; 3]).unwrap();
+    let source = UploadSource::File {
+        file: &file,
+        size: 10 * 1024 * 1024 + 3,
+    };
     let target = UploadTarget::Existing { item_id: "file" };
     assert_eq!(
-        graph.upload(target, &bytes, Some("old")).await,
+        graph.upload_from(target, source, Some("old")).await,
         Err(CloudError::Conflict)
     );
     assert_eq!(
         graph
-            .upload(target, &bytes, Some("fresh"))
+            .upload_from(target, source, Some("fresh"))
             .await
             .unwrap()
             .etag

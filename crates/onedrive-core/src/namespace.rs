@@ -102,6 +102,7 @@ fn reconcile_name(
                     (remote_missing OR item_id IN (SELECT item_id FROM delta_deletions)) AS unavailable,
                     sync_state <> 0 AS local
              FROM items WHERE parent_id = ?1 AND name = ?2
+               AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted)
          )
          ORDER BY unavailable, local,
                   CASE WHEN NOT (unavailable OR local) THEN claim_revision END DESC,
@@ -132,6 +133,12 @@ fn reconcile_name(
             let conflict = choose_conflict_name(db, parent_id, name, kind, "conflict")?;
             db.prepare_cached("UPDATE items SET name = ?2, alias = NULL WHERE item_id = ?1")?
                 .execute(params![item_id, conflict])?;
+            if db.prepare_cached(
+                "UPDATE writeback_queue SET conflict = 1 WHERE inode = (SELECT inode FROM items WHERE item_id = ?1)",
+            )?.execute([&item_id])? > 0 {
+                db.prepare_cached("UPDATE items SET sync_state = 3 WHERE item_id = ?1")?
+                    .execute([item_id])?;
+            }
         } else {
             let alias_claimed = match alias {
                 Some(alias) => db

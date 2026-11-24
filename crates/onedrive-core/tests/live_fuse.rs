@@ -59,13 +59,18 @@ fn mount_type(path: &Path) -> Option<String> {
 }
 
 #[test]
-fn live_read_only_mount() {
-    supervise_mount("live_read_only_mount", exercise_mount);
+fn live_cached_reads_on_writable_mount() {
+    supervise_mount("live_cached_reads_on_writable_mount", exercise_mount);
 }
 
 #[test]
 fn live_thumbnail_validation() {
     supervise_mount("live_thumbnail_validation", exercise_thumbnail_validation);
+}
+
+#[test]
+fn live_offline_save_restart_and_recycle() {
+    supervise_mount("live_offline_save_restart_and_recycle", exercise_writeback);
 }
 
 fn supervise_mount(test: &str, exercise: fn(&Path)) {
@@ -667,4 +672,165 @@ assert not factory.can_thumbnail(failed, "image/x-jp2-codestream", 1700000000)
     );
     assert!(mount_type(&mount).is_none());
     mounted.join().unwrap();
+}
+
+fn exercise_writeback(dir: &Path) {
+    use onedrive_core::{EngineError, SyncState};
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mount = dir.join("mount");
+    let drive = Arc::new(FakeCloudDrive::new(100));
+    drive.upsert(RemoteItem {
+        item_id: "root".into(),
+        parent_id: None,
+        name: Some("root".into()),
+        kind: ItemKind::Folder,
+        size: 0,
+        mtime: 100,
+        etag: None,
+        ctag: None,
+        quickxor_hash: None,
+    });
+    let open =
+        || Arc::new(Engine::open(dir.join("db"), drive.clone(), Arc::new(SystemClock)).unwrap());
+    let engine = open();
+    runtime.block_on(engine.sync()).unwrap();
+    drive.set_online(false);
+    let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
+        .mount(&mount)
+        .unwrap();
+
+    let draft = mount.join("document");
+    fs::write(&draft, b"previous-longer-content").unwrap();
+    fs::write(&draft, b"first").unwrap();
+    let editor = OpenOptions::new().write(true).open(&draft).unwrap();
+    editor.write_all_at(b"X", 1).unwrap();
+    editor.set_len(7).unwrap();
+    editor.sync_all().unwrap();
+    fs::set_permissions(&draft, fs::Permissions::from_mode(0o640)).unwrap();
+    assert_eq!(fs::metadata(&draft).unwrap().mode() & 0o777, 0o640);
+    let mut append = OpenOptions::new().append(true).open(&draft).unwrap();
+    append.write_all(b"!").unwrap();
+    assert_eq!(fs::read(&draft).unwrap(), b"fXrst\0\0!");
+    drop(append);
+    drop(editor);
+
+    assert!(
+        command("python3")
+            .args([
+                "-c",
+                "import mmap, sys
+with open(sys.argv[1], 'r+b') as file:
+ with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_WRITE) as view:
+  view[1:2] = b'Y'
+  view.flush()"
+            ])
+            .arg(&draft)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::read(&draft).unwrap(), b"fYrst\0\0!");
+
+    fs::create_dir(mount.join("work")).unwrap();
+    fs::write(mount.join("work/final"), b"previous").unwrap();
+    let old_handle = File::open(mount.join("work/final")).unwrap();
+    fs::rename(&draft, mount.join("work/final")).unwrap();
+    File::open(mount.join("work")).unwrap().sync_all().unwrap();
+    assert!(!draft.exists());
+    assert_eq!(old_handle.metadata().unwrap().nlink(), 0);
+    let mut previous = Vec::new();
+    (&old_handle).read_to_end(&mut previous).unwrap();
+    assert_eq!(previous, b"previous");
+    drop(old_handle);
+
+    let file = engine.resolve_path("/work/final").unwrap().unwrap();
+    assert_xattrs(&mount.join("work/final"), b"Dirty", b"none", b"");
+    assert!(matches!(
+        engine.check_purge(&file.item_id),
+        Err(EngineError::PendingUpload { .. })
+    ));
+    assert_eq!(
+        engine.resolve_path("/work").unwrap().unwrap().sync_state,
+        SyncState::Dirty
+    );
+    assert!(fs::create_dir(mount.join(".Trash-1000")).is_err());
+
+    unmount(&mount, session);
+    drop(engine);
+
+    let engine = open();
+    let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
+        .mount(&mount)
+        .unwrap();
+    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fYrst\0\0!");
+    assert_eq!(
+        fs::metadata(mount.join("work/final")).unwrap().mode() & 0o777,
+        0o640
+    );
+    assert_xattrs(&mount.join("work/final"), b"Dirty", b"none", b"");
+    let worker = runtime.spawn(Engine::run_upload_worker(Arc::downgrade(&engine)));
+    drive.set_online(true);
+    let deadline = Instant::now() + Duration::from_secs(7);
+    let uploaded = loop {
+        let item = engine.resolve_path("/work/final").unwrap().unwrap();
+        if item.sync_state == SyncState::Clean {
+            break item;
+        }
+        assert!(Instant::now() < deadline, "offline bytes did not upload");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(uploaded.inode, file.inode);
+    assert_ne!(uploaded.item_id, file.item_id);
+    assert!(uploaded.etag.is_some() && uploaded.ctag.is_some());
+    engine.check_purge(&uploaded.item_id).unwrap();
+    runtime.block_on(engine.sync()).unwrap();
+    assert_eq!(
+        engine.resolve_path("/work/final").unwrap().unwrap().inode,
+        file.inode
+    );
+    assert_eq!(engine.list_children("root").unwrap().len(), 1);
+    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fYrst\0\0!");
+    assert_ne!(
+        xattr::get(mount.join("work/final"), "user.onedrive.state")
+            .unwrap()
+            .unwrap(),
+        b"Dirty"
+    );
+
+    let folder = engine.resolve_path("/work").unwrap().unwrap();
+    fs::remove_file(mount.join("work/final")).unwrap();
+    fs::remove_dir(mount.join("work")).unwrap();
+    assert!(engine.resolve_path("/work").unwrap().is_none());
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while !drive.recycled_items().contains(&folder.item_id) {
+        assert!(
+            Instant::now() < deadline,
+            "deletes did not reach the recycle bin"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(drive.recycled_items(), [uploaded.item_id, folder.item_id]);
+    worker.abort();
+    unmount(&mount, session);
+}
+
+fn unmount(path: &Path, session: fuser::BackgroundSession) {
+    assert!(
+        command("fusermount3")
+            .arg("-u")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(mount_type(path).is_none());
+    session.join().unwrap();
 }

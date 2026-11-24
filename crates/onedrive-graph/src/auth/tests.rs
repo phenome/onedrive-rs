@@ -221,6 +221,42 @@ async fn refresh_outage_and_rejected_grant_have_distinct_graph_errors() {
 }
 
 #[tokio::test]
+async fn token_body_transport_and_json_errors_preserve_the_refresh_token() {
+    use onedrive_core::CloudError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for (length, expected) in [
+        (100, CloudError::Unavailable),
+        (1, CloudError::InvalidResponse),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let endpoint = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut method = [0; 4];
+            stream.read_exact(&mut method).await.unwrap();
+            assert_eq!(&method, b"POST");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{{"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+        });
+        let store = Arc::new(FakeTokenStore::default());
+        store.replace_refresh_token("original").await.unwrap();
+        let auth = Auth::with_authority("test-client", url, store.clone()).unwrap();
+        let graph = crate::GraphDrive::new(Arc::new(auth)).unwrap();
+        assert_eq!(graph.discover_drive().await, Err(expected));
+        assert_eq!(
+            store.load_refresh_token().await.unwrap().as_deref(),
+            Some("original")
+        );
+        endpoint.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn production_xdg_open_runs_in_isolated_process() {
     use std::os::unix::fs::PermissionsExt;
 

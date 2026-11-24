@@ -461,7 +461,8 @@ impl Auth {
         if !status.is_success() {
             return Err(AuthError::GrantRejected);
         }
-        response.json().await.map_err(|_| AuthError::InvalidToken)
+        let body = response.bytes().await.map_err(|_| AuthError::Transport)?;
+        serde_json::from_slice(&body).map_err(|_| AuthError::InvalidToken)
     }
 
     async fn persist(

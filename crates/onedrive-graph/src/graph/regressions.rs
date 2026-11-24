@@ -101,7 +101,7 @@ async fn disappeared_upload_session_checks_destination_bytes() {
             .and(header("authorization", "Bearer synthetic-access"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "stored", "parentReference": {"id": "parent"}, "name": "a b",
-                "size": bytes.len(), "eTag": "after", "file": {},
+                "size": bytes.len(), "eTag": "after", "cTag": "uploaded-content", "file": {},
                 "@microsoft.graph.downloadUrl": format!("{}/committed", cdn.uri())
             })))
             .expect(probes)
@@ -252,44 +252,62 @@ async fn mount_read(cdn: &MockServer, route: &str, byte: &str) {
 async fn ambiguous_simple_upload_requires_current_destination_and_complete_bytes() {
     for (first, second, content, expected) in [
         (
-            Some(("file", "after", "same-content")),
-            Some(("file", "after", "same-content")),
+            Some(("file", "after", Some("same-content"))),
+            Some(("file", "after", Some("same-content"))),
             "sent",
             Ok("after"),
         ),
         (
-            Some(("file", "after", "uploaded-content")),
-            Some(("file", "after", "peer-content")),
+            Some(("file", "after", Some("uploaded-content"))),
+            Some(("file", "after", Some("peer-content"))),
+            "sent",
+            Err(CloudError::Unavailable),
+        ),
+        (
+            Some(("file", "after", None)),
+            None,
+            "",
+            Err(CloudError::Unavailable),
+        ),
+        (
+            Some(("file", "after", Some(""))),
+            None,
+            "",
+            Err(CloudError::Unavailable),
+        ),
+        (
+            Some(("file", "after", Some("uploaded-content"))),
+            Some(("file", "after", None)),
             "sent",
             Err(CloudError::Unavailable),
         ),
         (None, None, "", Err(CloudError::Unavailable)),
         (
-            Some(("other", "after", "same-content")),
+            Some(("other", "after", Some("same-content"))),
             None,
             "",
             Err(CloudError::Unavailable),
         ),
         (
-            Some(("file", "before", "same-content")),
+            Some(("file", "before", Some("same-content"))),
             None,
             "",
             Err(CloudError::Unavailable),
         ),
         (
-            Some(("file", "after", "same-content")),
-            Some(("file", "later", "same-content")),
+            Some(("file", "after", Some("same-content"))),
+            Some(("file", "later", Some("same-content"))),
             "sent",
             Err(CloudError::Unavailable),
         ),
         (
-            Some(("file", "after", "same-content")),
+            Some(("file", "after", Some("same-content"))),
             None,
             "sent!",
             Err(CloudError::Unavailable),
         ),
         (
-            Some(("file", "after", "same-content")),
+            Some(("file", "after", Some("same-content"))),
             None,
             "sen",
             Err(CloudError::Unavailable),
@@ -313,10 +331,14 @@ async fn ambiguous_simple_upload_requires_current_destination_and_complete_bytes
         };
         for version in variants {
             let reply = if let Some((id, etag, ctag)) = version {
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "id": id, "size": 4, "eTag": etag, "cTag": ctag, "file": {},
+                let mut metadata = json!({
+                    "id": id, "size": 4, "eTag": etag, "file": {},
                     "@microsoft.graph.downloadUrl": format!("{}/committed", cdn.uri())
-                }))
+                });
+                if let Some(tag) = ctag {
+                    metadata["cTag"] = json!(tag);
+                }
+                ResponseTemplate::new(200).set_body_json(metadata)
             } else {
                 ResponseTemplate::new(404)
             };

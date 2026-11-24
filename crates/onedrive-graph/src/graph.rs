@@ -435,6 +435,9 @@ impl GraphDrive {
         if if_match != Some("*") && tag == if_match {
             return Ok(None);
         }
+        if item.file.is_some() && item.ctag.as_deref().is_none_or(str::is_empty) {
+            return Err(CloudError::Unavailable);
+        }
         let matches = if item.file.is_some()
             && item.folder.is_none()
             && item.size == Some(source.len() as u64)
@@ -527,7 +530,11 @@ impl CloudDrive for GraphDrive {
         match response.status() {
             StatusCode::GONE => return Err(CloudError::ResyncRequired),
             StatusCode::NOT_FOUND => {
-                let body = response.json::<Value>().await.unwrap_or_default();
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|_| CloudError::Unavailable)?;
+                let body = serde_json::from_slice::<Value>(&bytes).unwrap_or_default();
                 return Err(if body["error"]["code"] == "resyncRequired" {
                     CloudError::ResyncRequired
                 } else {
@@ -984,10 +991,11 @@ fn status_error(status: StatusCode) -> CloudError {
 }
 
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, CloudError> {
-    successful(response)?
-        .json()
+    let bytes = successful(response)?
+        .bytes()
         .await
-        .map_err(|_| CloudError::InvalidResponse)
+        .map_err(|_| CloudError::Unavailable)?;
+    serde_json::from_slice(&bytes).map_err(|_| CloudError::InvalidResponse)
 }
 
 async fn decode_item(response: Response) -> Result<RemoteItem, CloudError> {

@@ -88,11 +88,14 @@ pub trait CloudDrive: Send + Sync {
         let Some(item) = self.upload_destination(target).await? else {
             return Ok(None);
         };
-        if item.etag.is_none() {
+        if item.etag.as_deref().is_none_or(str::is_empty) {
             return Err(CloudError::Unavailable);
         }
         if item.etag.as_deref() == if_match {
             return Ok(None);
+        }
+        if item.kind == ItemKind::File && item.ctag.as_deref().is_none_or(str::is_empty) {
+            return Err(CloudError::Unavailable);
         }
         let mut matches = item.kind == ItemKind::File && item.size == source.len() as u64;
         if matches {

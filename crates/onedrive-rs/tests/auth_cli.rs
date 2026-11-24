@@ -1,16 +1,18 @@
 use std::fs::{self, Permissions};
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use onedrive_graph::{SecretServiceStore, TokenStore};
 use serde_json::{Value, json};
 
 #[test]
+#[ignore = "requires FUSE3 and an isolated D-Bus session with GNOME Keyring"]
 fn cli_auth_in_an_isolated_secret_service_session() {
     let root = tempfile::Builder::new()
         .permissions(Permissions::from_mode(0o700))
-        .tempdir()
+        .tempdir_in("/tmp")
         .unwrap();
     let root = root.path();
     let config = root.join("config/onedrive-rs");
@@ -101,15 +103,37 @@ fn auth_session_fixture() {
         .block_on(selected.begin_transaction())
         .unwrap()
         .unwrap();
-    let mut logout = Command::new(env!("CARGO_BIN_EXE_onedrive-rs"))
-        .args(["--json", "auth", "logout"])
-        .stdout(std::process::Stdio::piped())
+    let mut monitor = Command::new("stdbuf")
+        .args([
+            "-oL",
+            "dbus-monitor",
+            "--session",
+            "type='method_call',interface='org.freedesktop.DBus',member='RequestName'",
+        ])
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    let mut logout = Command::new(env!("CARGO_BIN_EXE_onedrive-rs"))
+        .args(["--json", "auth", "logout"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Only logout is starting a credential transaction on this private bus.
+    // Its second RequestName proves it had to retry while we held the lock.
+    let requests = BufReader::new(monitor.stdout.take().unwrap())
+        .lines()
+        .map(Result::unwrap)
+        .filter(|line| {
+            line.trim_start()
+                .starts_with("string \"org.onedrive_rs.Auth.Client_")
+        })
+        .take(2)
+        .count();
+    assert_eq!(requests, 2);
+    monitor.kill().unwrap();
+    monitor.wait().unwrap();
+    assert!(logout.try_wait().unwrap().is_none());
     runtime.block_on(async {
-        use std::time::Duration;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(logout.try_wait().unwrap().is_none());
         transaction
             .replace_refresh_token("synthetic-rotated-refresh")
             .await
@@ -152,7 +176,7 @@ test -z "$entries"
 timeout 2 "$1" --json status
 kill -TERM "$daemon_pid"
 wait "$daemon_pid"
-! timeout 1 mountpoint -q "$mount"
+awk -v mount="$mount" '$5 == mount { still_mounted = 1 } END { exit still_mounted }' /proc/self/mountinfo
 "#,
             "fixture",
             env!("CARGO_BIN_EXE_onedrive-rs"),

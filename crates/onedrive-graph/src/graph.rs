@@ -840,9 +840,13 @@ impl CloudDrive for GraphDrive {
         {
             return Err(CloudError::Conflict);
         }
-        // The folder eTag does not cover descendant changes. Use the cTag
-        // from the same snapshot as the child count to close the race.
-        let ctag = directory.ctag.as_deref().ok_or(CloudError::Conflict)?;
+        // Protect a newly added child through DELETE. A concurrent rename
+        // can still recycle this same empty folder under its new name.
+        let ctag = directory
+            .ctag
+            .as_deref()
+            .filter(|tag| !tag.trim().is_empty() && tag.trim() != "*")
+            .ok_or(CloudError::Conflict)?;
         self.delete_if_match(item_id, ctag).await
     }
 }

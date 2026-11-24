@@ -750,8 +750,10 @@ async fn checked_rmdir_uses_the_empty_snapshot_ctag_and_rejects_nonempty_folders
     let graph = mock_graph(&server);
     for (id, folder, ctag) in [
         ("empty", json!({"childCount": 0}), Some("empty-content")),
+        ("child-added", json!({"childCount": 0}), Some("old-content")),
         ("nonempty", json!({"childCount": 1}), Some("has-content")),
         ("untagged", json!({"childCount": 0}), None),
+        ("wildcard", json!({"childCount": 0}), Some("*")),
     ] {
         Mock::given(method("GET"))
             .and(path(format!("/v1.0/me/drive/items/{id}")))
@@ -769,17 +771,28 @@ async fn checked_rmdir_uses_the_empty_snapshot_ctag_and_rejects_nonempty_folders
     Mock::given(method("DELETE"))
         .and(path("/v1.0/me/drive/items/empty"))
         .and(header("if-match", "empty-content"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/drive/items/child-added"))
+        .and(header("if-match", "old-content"))
         .respond_with(ResponseTemplate::new(412))
         .expect(1)
         .mount(&server)
         .await;
-    for id in ["empty", "nonempty", "untagged"] {
+    assert_eq!(
+        graph.delete_empty_folder_if_match("empty", "base").await,
+        Ok(())
+    );
+    for id in ["child-added", "nonempty", "untagged", "wildcard"] {
         assert_eq!(
             graph.delete_empty_folder_if_match(id, "base").await,
             Err(CloudError::Conflict)
         );
     }
-    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    assert_eq!(server.received_requests().await.unwrap().len(), 7);
 }
 
 #[tokio::test]

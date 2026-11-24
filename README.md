@@ -8,6 +8,12 @@ A cloud-first Microsoft OneDrive (Personal) client in Rust for Linux desktops, t
 - **Async write-back** with a persistent upload queue and conflict-copy preservation on `If-Match` / `eTag` mismatch.
 - **Shared local IPC** serving the CLI, a thin `nautilus-python` extension (emblems + Pin/Purge menu), and (Phase 2) a native Rust `gpui` management app.
 
+Removing an empty folder from Linux sends it to the OneDrive Recycle Bin. When
+another device adds a file before OneDrive processes the deletion, the folder
+and its new file stay in OneDrive. If another device renames or moves the empty
+folder after the client checks it, that same folder can reach the Recycle Bin
+under its new name. Replacing an existing folder uses the same protection.
+
 ## Setup
 
 - [Register a Microsoft Entra desktop app](docs/entra-setup.md)

@@ -1370,9 +1370,11 @@ dependencies = [
 name = "onedrive-rs"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "onedrive-core",
  "onedrive-graph",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

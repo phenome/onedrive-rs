@@ -41,8 +41,9 @@ file info on success or surface the error message.
 
 The CLI takes absolute filesystem paths or paths relative to the working
 directory. For example, `onedrive-rs pin "$XDG_RUNTIME_DIR/onedrive/docs/draft.txt"`
-sends a Pin request for `/docs/draft.txt`. Supply `--mount-path /absolute/mount`
-for a custom mount. Path validation checks components and mount containment
+sends a Pin request for `/docs/draft.txt`. Set `mount_path` in the XDG configuration for a custom mount.
+The `--mount-path /absolute/mount` option overrides that setting for the daemon
+and path commands. Path validation checks components and mount containment
 without accessing the item on disk. Paths containing `..` are rejected.
 
 With `--json`, command results and errors are printed to stdout in the same
@@ -62,5 +63,21 @@ Logout waits for any credential rotation already in progress, then deletes
 the stored credential. The daemon rechecks the credential before using cached
 access. Requests that have already obtained an access token can still finish.
 
-The `daemon` subcommand reports that the runtime is unavailable until the
-daemon, FUSE, and production dispatch are integrated.
+After signing in, run `onedrive-rs daemon` in the foreground. The default mount
+is `$XDG_RUNTIME_DIR/onedrive`. The daemon creates the mount directory if needed
+and requires it to be empty. The catalog and delta checkpoint are stored in
+`$XDG_STATE_HOME/onedrive-rs/catalog.sqlite3` (default
+`~/.local/state/onedrive-rs/catalog.sqlite3`). File content is cached under
+`$XDG_CACHE_HOME/onedrive-rs` (default `~/.cache/onedrive-rs`).
+
+Delta sync runs on startup and then every `delta_poll_interval_secs`, measured
+from the completion of the previous background pass. The default is 60 seconds.
+`pause` prevents new background passes and lets any active pass finish.
+`sync` can run while paused. `resume` wakes the background poller. SIGINT and
+SIGTERM end requests in flight, unmount the filesystem, and remove the socket.
+Committed delta pages and cache files survive the restart.
+
+This build implements `status`, `sync`, `pause`, and `resume`. Status reports
+committed sparse cache bytes, the cache filesystem's free disk floor, and the
+count of catalog entries marked Dirty or Uploading. The retention commands
+and `uploads` return explicit errors until their Engine operations are wired.

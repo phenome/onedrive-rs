@@ -15,6 +15,9 @@ use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener as AsyncListener, UnixStream as AsyncStream};
+use tokio::time::timeout;
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -256,6 +259,11 @@ impl IpcServer {
         Ok(server)
     }
 
+    pub(crate) fn async_listener(&self) -> io::Result<AsyncListener> {
+        self.set_nonblocking(true)?;
+        AsyncListener::from_std(self.listener.try_clone()?)
+    }
+
     pub fn set_nonblocking(&self, enabled: bool) -> io::Result<()> {
         self.listener.set_nonblocking(enabled)
     }
@@ -286,6 +294,37 @@ impl Drop for IpcServer {
             let _ = unlinkat(&self.directory, &self.name, AtFlags::empty());
         }
     }
+}
+
+pub(crate) async fn serve_connection(
+    mut stream: AsyncStream,
+    dispatch: impl AsyncFnOnce(Request) -> Result<Value, String>,
+) -> io::Result<()> {
+    let mut frame = Vec::new();
+    let read = timeout(
+        SOCKET_TIMEOUT,
+        tokio::io::BufReader::new(&mut stream)
+            .take(MAX_REQUEST_BYTES)
+            .read_until(b'\n', &mut frame),
+    )
+    .await;
+    let request = match read {
+        Ok(Ok(_)) => decode_request(&frame),
+        Ok(Err(error)) => Err(error),
+        Err(error) => return Err(error.into()),
+    };
+    let response = match request {
+        Ok(request) => match dispatch(request).await {
+            Ok(result) => Response::Success(result),
+            Err(error) => Response::Error(error),
+        },
+        Err(error) => Response::Error(format!("invalid request: {error}")),
+    };
+    timeout(
+        SOCKET_TIMEOUT,
+        stream.write_all(&encode_frame(&response.into_json())?),
+    )
+    .await?
 }
 
 fn validate_private_directory(file: &File) -> io::Result<()> {
@@ -332,7 +371,11 @@ fn read_request(stream: &UnixStream) -> io::Result<Request> {
     BufReader::new(stream)
         .take(MAX_REQUEST_BYTES)
         .read_until(b'\n', &mut frame)?;
-    Ok(serde_json::from_slice(require_newline(&frame)?)?)
+    decode_request(&frame)
+}
+
+fn decode_request(frame: &[u8]) -> io::Result<Request> {
+    Ok(serde_json::from_slice(require_newline(frame)?)?)
 }
 
 fn require_newline(frame: &[u8]) -> io::Result<&[u8]> {
@@ -345,7 +388,11 @@ fn require_newline(frame: &[u8]) -> io::Result<&[u8]> {
 }
 
 fn write_frame(stream: &mut UnixStream, message: &impl Serialize) -> io::Result<()> {
+    stream.write_all(&encode_frame(message)?)
+}
+
+fn encode_frame(message: &impl Serialize) -> io::Result<Vec<u8>> {
     let mut frame = serde_json::to_vec(message)?;
     frame.push(b'\n');
-    stream.write_all(&frame)
+    Ok(frame)
 }

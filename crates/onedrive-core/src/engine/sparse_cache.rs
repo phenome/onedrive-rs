@@ -59,6 +59,13 @@ impl Block {
 #[derive(Default)]
 struct RangeLocks(HashMap<(i64, u64), Weak<AsyncMutex<()>>>);
 
+pub struct SparseCacheStatus {
+    pub pinned_bytes: u64,
+    pub unpinned_bytes: u64,
+    pub below_free_disk_floor: bool,
+    pub pending_uploads: u64,
+}
+
 pub(super) struct SparseCache {
     root: PathBuf,
     locks: Mutex<RangeLocks>,
@@ -240,6 +247,43 @@ impl Engine {
             _ => return Ok(None),
         };
         Ok(Some(value.as_bytes().to_vec()))
+    }
+
+    pub fn sparse_cache_status(
+        &self,
+        min_free_bytes: u64,
+    ) -> Result<SparseCacheStatus, EngineError> {
+        let space = self.cache_capacity()?;
+        let db = self.db();
+        let (pinned_bytes, unpinned_bytes) = db.query_row(
+            "SELECT coalesce(sum(CASE WHEN pinned THEN bytes END), 0),
+                    coalesce(sum(CASE WHEN NOT pinned THEN bytes END), 0)
+             FROM (
+                 SELECT coalesce(pin.pin_state = 1, false) AS pinned,
+                        CASE WHEN block = -1 THEN min(items.size, ?1)
+                             ELSE min(items.size - block, ?2) END AS bytes
+                 FROM sparse_range_files
+                 JOIN sparse_files USING (generation)
+                 JOIN items USING (inode)
+                 LEFT JOIN pin_directives AS pin USING (item_id)
+             )",
+            params![HEADER_BYTES, STREAM_BYTES],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let pending_uploads = db.query_row(
+            "SELECT count(*) FROM items WHERE sync_state IN (?1, ?2)",
+            params![
+                super::SyncState::Dirty as i64,
+                super::SyncState::Uploading as i64
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(SparseCacheStatus {
+            pinned_bytes,
+            unpinned_bytes,
+            below_free_disk_floor: space.f_bavail.saturating_mul(space.f_frsize) < min_free_bytes,
+            pending_uploads,
+        })
     }
 
     pub fn cache_capacity(&self) -> Result<rustix::fs::StatVfs, EngineError> {

@@ -1,10 +1,12 @@
 use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use onedrive_core::Config;
-use onedrive_graph::Auth;
+use onedrive_graph::{Auth, GraphDrive};
+use onedrive_rs::daemon::{self, mount_path, runtime_dir};
 use onedrive_rs::ipc::{IpcClient, MountPath, Request, Response, Status, Upload, socket_path};
 use serde_json::{Value, json};
 
@@ -107,11 +109,11 @@ impl Cli {
             Command::Control(command) => command,
         };
         let runtime_dir = runtime_dir()?;
-        let mount = self
-            .mount_path
-            .clone()
-            .unwrap_or_else(|| runtime_dir.join("onedrive"));
-        let path = |path: &Path| mount_relative_path(&mount, path);
+        let path = |input: &Path| {
+            let config = Config::load().map_err(|error| error.to_string())?;
+            let mount = mount_path(&runtime_dir, &config, self.mount_path.as_deref())?;
+            mount_relative_path(&mount, input)
+        };
         let request = match command {
             ControlCommand::Status => Request::Status {},
             ControlCommand::Pin { path: input } => Request::Pin { path: path(input)? },
@@ -136,7 +138,21 @@ impl Cli {
                 .build()
                 .map_err(|error| format!("Cannot initialize OneDrive authentication ({error})"))?
                 .block_on(self.run_auth(action)),
-            LocalCommand::Daemon => Err("The daemon runtime is not available in this build".into()),
+            LocalCommand::Daemon => {
+                let config = Config::load().map_err(|error| error.to_string())?;
+                let auth = Arc::new(Auth::new(&config).map_err(|error| error.to_string())?);
+                let cloud = Arc::new(GraphDrive::new(auth).map_err(|error| error.to_string())?);
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("Cannot initialize the OneDrive daemon ({error})"))?
+                    .block_on(daemon::run(config, self.mount_path.as_deref(), cloud))?;
+                Ok(if self.json {
+                    Response::Success(Value::Null).into_json().to_string()
+                } else {
+                    "OneDrive daemon stopped".into()
+                })
+            }
         }
     }
 
@@ -190,13 +206,6 @@ fn mount_relative_path(mount: &Path, input: &Path) -> Result<MountPath, String> 
     let mount_path = Path::new("/").join(relative.components().collect::<PathBuf>());
     let utf8 = mount_path.to_str().ok_or("OneDrive paths must be UTF-8")?;
     MountPath::try_from(utf8.to_owned()).map_err(str::to_owned)
-}
-
-fn runtime_dir() -> Result<PathBuf, String> {
-    env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| "XDG_RUNTIME_DIR must be an absolute directory path".to_owned())
 }
 
 fn daemon_request(runtime_dir: &Path, request: &Request) -> Result<Value, String> {

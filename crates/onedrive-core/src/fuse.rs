@@ -251,7 +251,9 @@ fn attributes(item: &CatalogItem) -> FileAttr {
         ino: INodeNo(item.inode),
         size: item.size,
         blocks: item.size.div_ceil(512),
-        atime: item.last_accessed_at.map_or(mtime, unix_time),
+        atime: item.last_accessed_at.map_or(mtime, |milliseconds| {
+            UNIX_EPOCH + Duration::from_millis(milliseconds.max(0) as u64)
+        }),
         mtime,
         ctime: mtime,
         crtime: UNIX_EPOCH,

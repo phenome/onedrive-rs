@@ -5,14 +5,26 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
-use onedrive_core::{
-    Config, Engine, FakeCloudDrive, FuseAdapter, ItemKind, RemoteItem, SystemClock,
-};
+use onedrive_core::{Clock, Config, Engine, FakeCloudDrive, FuseAdapter, ItemKind, RemoteItem};
 
 const WORKER_DIR: &str = "ONEDRIVE_LIVE_FUSE_WORKER_DIR";
 const HEADER: usize = 64 * 1024;
 const STREAM: usize = 2 * 1024 * 1024;
+
+struct FixedClock;
+
+#[async_trait::async_trait]
+impl Clock for FixedClock {
+    fn now(&self) -> Duration {
+        Duration::new(1_800_000_000, 123_000_000)
+    }
+
+    async fn sleep(&self, _: Duration) {
+        unreachable!("no retry expected")
+    }
+}
 
 fn command(program: &str) -> Command {
     let mut command = Command::new("timeout");
@@ -120,7 +132,7 @@ fn exercise_mount(dir: &Path) {
             dir.join("db"),
             &cache,
             drive.clone(),
-            Arc::new(SystemClock),
+            Arc::new(FixedClock),
             Config {
                 min_free_disk_bytes: 0,
                 ..Config::default()
@@ -151,6 +163,7 @@ fn exercise_mount(dir: &Path) {
     let metadata = fs::metadata(&path).unwrap();
     assert_eq!(metadata.len(), bytes.len() as u64);
     assert_eq!(metadata.mtime(), file.mtime);
+    assert_eq!(metadata.atime(), file.mtime);
     assert_eq!(metadata.ino(), engine.item("file").unwrap().unwrap().inode);
     assert_eq!(drive.requests(), delta_requests);
     assert!(drive.range_requests().is_empty());
@@ -181,6 +194,9 @@ fn exercise_mount(dir: &Path) {
     let mut sniff = vec![0; 32768];
     handle.read_exact(&mut sniff).unwrap();
     assert_eq!(sniff, bytes[..32768]);
+    let accessed = fs::metadata(&path).unwrap();
+    assert_eq!(accessed.atime(), 1_800_000_000);
+    assert_eq!(accessed.atime_nsec(), 123_000_000);
     assert_eq!(drive.range_requests(), [("file".into(), 0, HEADER)]);
     handle.read_exact_at(&mut sniff, 32768).unwrap();
     assert_eq!(sniff, bytes[32768..HEADER]);

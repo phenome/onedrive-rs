@@ -284,3 +284,140 @@ async fn unpin_retains_bytes_and_direct_purge_clears_pin_even_for_empty_files() 
     }
     assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 0);
 }
+
+#[tokio::test]
+async fn legacy_cached_content_gets_one_full_idle_window_on_open() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_idle_age_days = 1;
+    fixture.add("legacy", Some("root"), ItemKind::File, 8);
+    fixture.add("cloud-only", Some("root"), ItemKind::File, 8);
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.read(inode(&engine, "legacy"), 0, 8).await.unwrap();
+    drop(engine);
+
+    // Earlier sparse cache versions published ranges without recording atime.
+    let db = rusqlite::Connection::open(fixture.temp.path().join("catalog.sqlite")).unwrap();
+    db.execute("UPDATE items SET last_accessed_at = NULL", [])
+        .unwrap();
+    drop(db);
+
+    fixture.clock.advance(1_800_000_000);
+    let engine = fixture.open();
+    engine.evict().unwrap();
+    assert_eq!(state(&engine, "legacy"), "Hydrated");
+    assert_eq!(
+        engine.item("legacy").unwrap().unwrap().last_accessed_at,
+        Some(1_800_000_000_000)
+    );
+    assert_eq!(
+        engine.item("cloud-only").unwrap().unwrap().last_accessed_at,
+        None
+    );
+    drop(engine);
+
+    fixture.clock.advance(86_400);
+    let engine = fixture.open();
+    engine.evict().unwrap();
+    assert_eq!(state(&engine, "legacy"), "Hydrated");
+    fixture.clock.advance(1);
+    engine.evict().unwrap();
+    assert_eq!(state(&engine, "legacy"), "Cloud-only");
+}
+
+#[tokio::test]
+async fn empty_hydration_ages_from_pin_and_evicts_after_unpin() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_idle_age_days = 1;
+    fixture.clock.advance(1_800_000_000);
+    fixture.add("empty", Some("root"), ItemKind::File, 0);
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.pin("empty").await.unwrap();
+    engine.unpin("empty").unwrap();
+
+    engine.evict().unwrap();
+    assert_eq!(state(&engine, "empty"), "Hydrated");
+    fixture.clock.advance(86_401);
+    engine.evict().unwrap();
+    assert_eq!(state(&engine, "empty"), "Cloud-only");
+    assert!(fixture.drive.range_requests().is_empty());
+}
+
+#[tokio::test]
+async fn failed_full_hydration_retry_keeps_low_disk_warning() {
+    use onedrive_core::EngineError;
+
+    let mut fixture = Fixture::new();
+    fixture.config.min_free_disk_bytes = u64::MAX;
+    fixture.add("file", Some("root"), ItemKind::File, 65_537);
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.read(inode(&engine, "file"), 0, 1).await.unwrap();
+    assert!(matches!(
+        engine.pin("file").await,
+        Err(EngineError::LowDisk)
+    ));
+    assert!(engine.cache_status().unwrap().hydration_paused_low_disk);
+
+    // Fail before the free disk check by removing the previously cached header.
+    let mut files = std::fs::read_dir(fixture.temp.path().join("cache")).unwrap();
+    std::fs::remove_file(files.next().unwrap().unwrap().path()).unwrap();
+    assert!(matches!(engine.sync().await, Err(EngineError::CacheIo(_))));
+    assert!(engine.cache_status().unwrap().hydration_paused_low_disk);
+
+    engine.purge("file").unwrap();
+    engine.sync().await.unwrap();
+    assert!(!engine.cache_status().unwrap().hydration_paused_low_disk);
+}
+
+#[tokio::test]
+async fn failed_range_still_evicts_an_idle_hydrated_file() {
+    use onedrive_core::EngineError;
+
+    let mut fixture = Fixture::new();
+    fixture.config.max_idle_age_days = 1;
+    fixture.add("idle", Some("root"), ItemKind::File, 8);
+    fixture.add(
+        "interrupted",
+        Some("root"),
+        ItemKind::File,
+        2 * 1024 * 1024 + 1,
+    );
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.read(inode(&engine, "idle"), 0, 8).await.unwrap();
+    fixture.clock.advance(86_401);
+
+    // The first block is valid while the next range is short.
+    fixture
+        .drive
+        .set_content("interrupted", vec![13; 2 * 1024 * 1024]);
+    assert!(matches!(
+        engine
+            .read(inode(&engine, "interrupted"), 0, 2 * 1024 * 1024 + 1)
+            .await,
+        Err(EngineError::InvalidRange)
+    ));
+    assert_eq!(state(&engine, "idle"), "Cloud-only");
+}
+
+#[tokio::test]
+async fn sticky_pin_hydrates_eligible_files_around_a_failed_range() {
+    use onedrive_core::EngineError;
+
+    let fixture = Fixture::new();
+    for name in ["a", "b", "c"] {
+        fixture.add(name, Some("root"), ItemKind::File, 8);
+    }
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    fixture.drive.set_content("b", vec![]);
+    assert!(matches!(
+        engine.pin("root").await,
+        Err(EngineError::InvalidRange)
+    ));
+    assert_eq!(state(&engine, "a"), "Hydrated");
+    assert_eq!(state(&engine, "b"), "Cloud-only");
+    assert_eq!(state(&engine, "c"), "Hydrated");
+}

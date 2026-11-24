@@ -65,6 +65,7 @@ pub struct CatalogItem {
     pub etag: Option<String>,
     pub ctag: Option<String>,
     pub quickxor_hash: Option<String>,
+    /// Milliseconds since the Unix epoch.
     pub last_accessed_at: Option<i64>,
     pub pin_state: PinState,
     pub sync_state: SyncState,
@@ -158,6 +159,7 @@ impl Engine {
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("schema.sql"))?;
         crate::namespace::migrate(&transaction)?;
+        retention::initialize_cached_access_times(&transaction, clock.as_ref())?;
         transaction.commit()?;
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
         Ok(Self {

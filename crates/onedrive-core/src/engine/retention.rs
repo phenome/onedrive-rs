@@ -3,11 +3,12 @@ use std::sync::atomic::Ordering;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::sparse_cache::{
-    HAS_COMPLETE_CONTENT, HEADER_BYTES, STREAM_BYTES, allocate_generation, is_hydrated,
+    HAS_COMPLETE_CONTENT, HEADER_BYTES, ReadKind, ReadOutcome, STREAM_BYTES, allocate_generation,
+    is_hydrated,
 };
 use super::{
-    CatalogItem, Engine, EngineError, ItemKind, PinState, SyncState, item_by_id, item_by_inode,
-    write_pin,
+    CatalogItem, Clock, Engine, EngineError, ItemKind, PinState, SyncState, item_by_id,
+    item_by_inode, write_pin,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,10 +128,6 @@ impl Engine {
 
     pub(super) async fn hydrate_pins(&self, root: Option<&str>) -> Result<(), EngineError> {
         let _hydration = self.hydrating.lock().await;
-        if root.is_none() {
-            self.hydration_paused_low_disk
-                .store(false, Ordering::Relaxed);
-        }
         let candidates = self
             .db()
             .prepare_cached(&format!(
@@ -185,6 +182,9 @@ impl Engine {
                 return Ok(());
             }
             let generation = allocate_generation(&tx, item.inode)?;
+            if item.size == 0 {
+                self.touch_generation(&tx, generation)?;
+            }
             tx.commit()?;
             (item, generation)
         };
@@ -198,12 +198,11 @@ impl Engine {
                     &item,
                     generation,
                     offset,
-                    item.size <= HEADER_BYTES,
                     &mut output[..length],
-                    true,
+                    ReadKind::Pin,
                 )
                 .await?
-                .is_none()
+                == ReadOutcome::Retired
             {
                 break;
             }
@@ -221,7 +220,7 @@ impl Engine {
             available_disk_bytes: space.f_bavail.saturating_mul(space.f_frsize),
             hydration_paused_low_disk: self.hydration_paused_low_disk.load(Ordering::Relaxed),
         };
-        for entry in cached_files(&self.db())? {
+        for entry in cached_files(&self.db(), false)? {
             if entry.pinned {
                 status.pinned_bytes += entry.bytes;
             } else {
@@ -244,9 +243,17 @@ impl Engine {
 
     /// Enforce the idle-age limit, then the unpinned cache budget.
     pub fn evict(&self) -> Result<(), EngineError> {
+        self.evict_candidates(false)
+    }
+
+    pub(super) fn evict_after_failed_read(&self) -> Result<(), EngineError> {
+        self.evict_candidates(true)
+    }
+
+    fn evict_candidates(&self, hydrated_only: bool) -> Result<(), EngineError> {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let entries = cached_files(&tx)?;
+        let entries = cached_files(&tx, hydrated_only)?;
         let mut unpinned: u64 = entries
             .iter()
             .filter(|file| !file.pinned)
@@ -259,7 +266,9 @@ impl Engine {
                 continue;
             }
             let idle = now.saturating_sub(file.accessed_at).max(0) as u64;
-            if idle > max_age_ms || unpinned > self.config.max_unpinned_cache_bytes {
+            if idle > max_age_ms
+                || (file.bytes > 0 && unpinned > self.config.max_unpinned_cache_bytes)
+            {
                 tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [file.inode])?;
                 unpinned -= file.bytes;
             }
@@ -269,8 +278,29 @@ impl Engine {
     }
 
     pub(super) fn access_time(&self) -> i64 {
-        i64::try_from(self.clock.now().as_millis()).unwrap_or(i64::MAX)
+        access_time(self.clock.as_ref())
     }
+}
+
+fn access_time(clock: &dyn Clock) -> i64 {
+    i64::try_from(clock.now().as_millis()).unwrap_or(i64::MAX)
+}
+
+pub(super) fn initialize_cached_access_times(
+    db: &Connection,
+    clock: &dyn Clock,
+) -> rusqlite::Result<()> {
+    db.execute(
+        "UPDATE items SET last_accessed_at = ?1
+         WHERE last_accessed_at IS NULL AND inode IN (
+             SELECT f.inode FROM sparse_files f JOIN items i USING (inode)
+             WHERE i.size = 0 OR EXISTS (
+                 SELECT 1 FROM sparse_ranges WHERE generation = f.generation
+             )
+         )",
+        [access_time(clock)],
+    )?;
+    Ok(())
 }
 
 pub(super) fn effective_pin(db: &Connection, item_id: &str) -> rusqlite::Result<PinState> {
@@ -302,22 +332,24 @@ struct CachedFile {
     pinned: bool,
 }
 
-fn cached_files(db: &Connection) -> Result<Vec<CachedFile>, EngineError> {
-    let mut stmt = db.prepare_cached(
+fn cached_files(db: &Connection, hydrated_only: bool) -> Result<Vec<CachedFile>, EngineError> {
+    let mut stmt = db.prepare_cached(&format!(
         "SELECT i.inode, i.item_id, i.sync_state, coalesce(i.last_accessed_at, 0),
                 sum(CASE
-                    WHEN r.block >= 0 THEN min(?1, i.size - r.block)
+                    WHEN r.block IS NULL THEN 0
+                    WHEN r.block >= 0 THEN min(?3, i.size - r.block)
                     WHEN NOT EXISTS (
                         SELECT 1 FROM sparse_ranges WHERE generation = f.generation AND block = 0
                     ) THEN min(?2, i.size)
                     ELSE 0 END)
-         FROM sparse_ranges r
-         JOIN sparse_files f USING (generation)
+         FROM sparse_files f
          JOIN items i USING (inode)
+         LEFT JOIN sparse_ranges r USING (generation)
+         WHERE (i.size = 0 OR r.generation IS NOT NULL) AND (NOT ?1 OR {HAS_COMPLETE_CONTENT})
          GROUP BY f.generation
          ORDER BY coalesce(i.last_accessed_at, 0), i.inode",
-    )?;
-    let rows = stmt.query_map(params![STREAM_BYTES, HEADER_BYTES], |row| {
+    ))?;
+    let rows = stmt.query_map(params![hydrated_only, HEADER_BYTES, STREAM_BYTES], |row| {
         Ok((
             row.get(0)?,
             row.get::<_, String>(1)?,

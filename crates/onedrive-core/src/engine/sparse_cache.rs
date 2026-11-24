@@ -13,6 +13,21 @@ use super::{CatalogItem, Engine, EngineError, ItemKind};
 pub(super) const HEADER_BYTES: u64 = 64 * 1024;
 pub(super) const STREAM_BYTES: u64 = 2 * 1024 * 1024;
 const HEADER_BLOCK: i64 = -1;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadKind {
+    Header,
+    Stream,
+    Pin,
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) enum ReadOutcome {
+    Retired,
+    Cached,
+    Downloaded,
+}
+
 #[derive(Default)]
 struct RangeLocks(HashMap<(i64, u64), Weak<AsyncMutex<()>>>);
 
@@ -96,15 +111,26 @@ impl Engine {
 
             let end = offset.saturating_add(length as u64).min(item.size);
             let mut result = vec![0; (end - offset) as usize];
-            let header_sniff = offset == 0 && length as u64 <= HEADER_BYTES;
-            if let Some(downloaded) = self
-                .read_generation(&item, generation, offset, header_sniff, &mut result, false)
-                .await?
+            let kind = if offset == 0 && length as u64 <= HEADER_BYTES {
+                ReadKind::Header
+            } else {
+                ReadKind::Stream
+            };
+            match self
+                .read_generation(&item, generation, offset, &mut result, kind)
+                .await
             {
-                if downloaded {
+                Ok(ReadOutcome::Retired) => continue,
+                Ok(ReadOutcome::Cached) => return Ok(result),
+                Ok(ReadOutcome::Downloaded) => {
                     self.evict()?;
+                    return Ok(result);
                 }
-                return Ok(result);
+                Err(error) => {
+                    // Reclaim eligible hydrated files while preserving the read error.
+                    let _ = self.evict_after_failed_read();
+                    return Err(error);
+                }
             }
         }
     }
@@ -114,10 +140,9 @@ impl Engine {
         item: &CatalogItem,
         generation: i64,
         start: u64,
-        header_sniff: bool,
         output: &mut [u8],
-        pin_hydration: bool,
-    ) -> Result<Option<bool>, EngineError> {
+        kind: ReadKind,
+    ) -> Result<ReadOutcome, EngineError> {
         let mut downloaded = false;
         let end = start + output.len() as u64;
         let mut offset = start;
@@ -128,8 +153,8 @@ impl Engine {
             let _guard = lock.lock().await;
             {
                 let db = self.db();
-                if !generation_is_current(&db, item, generation, pin_hydration)? {
-                    return Ok(None);
+                if !generation_is_current(&db, item, generation, kind)? {
+                    return Ok(ReadOutcome::Retired);
                 }
                 let cached_end = if block_cached(&db, generation, stream_offset as i64)? {
                     Some(stream_offset + STREAM_BYTES)
@@ -147,9 +172,9 @@ impl Engine {
                 }
             }
 
-            let (block, fetch_offset, length) = range_for_read(stream_offset, header_sniff);
+            let (block, fetch_offset, length) = range_for_read(stream_offset, kind, item.size);
             let expected = length.min(item.size - fetch_offset) as usize;
-            if pin_hydration {
+            if kind == ReadKind::Pin {
                 self.check_hydration_space(expected as u64)?;
             }
             let bytes = self
@@ -158,15 +183,15 @@ impl Engine {
                 .await;
             let mut db = self.db();
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if !generation_is_current(&tx, item, generation, pin_hydration)? {
-                return Ok(None);
+            if !generation_is_current(&tx, item, generation, kind)? {
+                return Ok(ReadOutcome::Retired);
             }
             // Another Engine may have filled the range while the request was in flight.
             if block_cached(&tx, generation, block)? {
                 continue;
             }
             let bytes = bytes?;
-            if pin_hydration {
+            if kind == ReadKind::Pin {
                 self.check_hydration_space(expected as u64)?;
             }
             if bytes.len() != expected {
@@ -189,12 +214,21 @@ impl Engine {
             downloaded = true;
         }
         let db = self.db();
-        Ok(self
-            .touch_generation(&db, generation)?
-            .then_some(downloaded))
+        if !self.touch_generation(&db, generation)? {
+            return Ok(ReadOutcome::Retired);
+        }
+        Ok(if downloaded {
+            ReadOutcome::Downloaded
+        } else {
+            ReadOutcome::Cached
+        })
     }
 
-    fn touch_generation(&self, db: &Connection, generation: i64) -> rusqlite::Result<bool> {
+    pub(super) fn touch_generation(
+        &self,
+        db: &Connection,
+        generation: i64,
+    ) -> rusqlite::Result<bool> {
         Ok(db.execute(
             "UPDATE items SET last_accessed_at = max(coalesce(last_accessed_at, 0), ?2)
              WHERE inode = (SELECT inode FROM sparse_files WHERE generation = ?1)",
@@ -203,8 +237,8 @@ impl Engine {
     }
 }
 
-fn range_for_read(stream_offset: u64, header_sniff: bool) -> (i64, u64, u64) {
-    if header_sniff {
+fn range_for_read(stream_offset: u64, kind: ReadKind, size: u64) -> (i64, u64, u64) {
+    if kind == ReadKind::Header || (kind == ReadKind::Pin && size <= HEADER_BYTES) {
         (HEADER_BLOCK, 0, HEADER_BYTES)
     } else {
         (stream_offset as i64, stream_offset, STREAM_BYTES)
@@ -261,12 +295,12 @@ fn generation_is_current(
     db: &Connection,
     item: &CatalogItem,
     generation: i64,
-    pin_hydration: bool,
+    kind: ReadKind,
 ) -> rusqlite::Result<bool> {
     if generation_for(db, item.inode)? != Some(generation) {
         return Ok(false);
     }
-    if !pin_hydration {
+    if kind != ReadKind::Pin {
         return Ok(true);
     }
     let clean = db

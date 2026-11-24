@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 
 use onedrive_core::{
-    CloudDrive, CloudError, DeltaPage, DeltaRequest, Engine, FakeCloudDrive, ItemKind, RemoteItem,
-    SystemClock,
+    CloudDrive, CloudError, Config, DeltaPage, DeltaRequest, Engine, FakeCloudDrive, ItemKind,
+    RemoteItem, SystemClock,
 };
 use tempfile::TempDir;
 
@@ -142,6 +142,29 @@ struct InFlightRange {
     resume: Notify,
 }
 
+impl InFlightRange {
+    fn open(temp: &TempDir, fake: Arc<FakeCloudDrive>) -> (Arc<Self>, Engine) {
+        let cloud = Arc::new(Self {
+            fake,
+            pause_once: AtomicBool::new(true),
+            captured: Notify::new(),
+            resume: Notify::new(),
+        });
+        let engine = Engine::open_with_config(
+            temp.path().join("metadata.db"),
+            temp.path().join("cache"),
+            cloud.clone(),
+            Arc::new(SystemClock),
+            Config {
+                min_free_disk_bytes: 0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        (cloud, engine)
+    }
+}
+
 #[async_trait]
 impl CloudDrive for InFlightRange {
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
@@ -167,19 +190,7 @@ impl CloudDrive for InFlightRange {
 async fn in_flight_range_retries_after_delta_retires_its_generation() {
     let (temp, fake, engine, inode, original) = setup(STREAM + 200).await;
     drop(engine);
-    let cloud = Arc::new(InFlightRange {
-        fake: fake.clone(),
-        pause_once: AtomicBool::new(true),
-        captured: Notify::new(),
-        resume: Notify::new(),
-    });
-    let engine = Engine::open_with_cache(
-        temp.path().join("metadata.db"),
-        temp.path().join("cache"),
-        cloud.clone(),
-        Arc::new(SystemClock),
-    )
-    .unwrap();
+    let (cloud, engine) = InFlightRange::open(&temp, fake.clone());
     let fresh = vec![193; original.len()];
     let apply_delta = async {
         cloud.captured.notified().await;
@@ -210,23 +221,7 @@ async fn in_flight_range_retries_after_delta_retires_its_generation() {
 async fn an_in_flight_pin_cannot_restore_a_purged_generation() {
     let (temp, fake, engine, inode, _) = setup(STREAM + 200).await;
     drop(engine);
-    let cloud = Arc::new(InFlightRange {
-        fake,
-        pause_once: AtomicBool::new(true),
-        captured: Notify::new(),
-        resume: Notify::new(),
-    });
-    let engine = Engine::open_with_config(
-        temp.path().join("metadata.db"),
-        temp.path().join("cache"),
-        cloud.clone(),
-        Arc::new(SystemClock),
-        onedrive_core::Config {
-            min_free_disk_bytes: 0,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let (cloud, engine) = InFlightRange::open(&temp, fake);
     let purge = async {
         cloud.captured.notified().await;
         engine.purge("file").unwrap();
@@ -262,29 +257,13 @@ async fn cache_status_counts_sparse_holes_and_overlapping_headers_correctly() {
 
 #[tokio::test]
 async fn pin_drops_an_in_flight_download_when_a_local_upload_becomes_pending() {
-    use onedrive_core::{Config, EngineError, SyncState};
+    use onedrive_core::{EngineError, SyncState};
 
     let (temp, fake, engine, inode, _) = setup(STREAM + 200).await;
     engine.read(inode, 0, 1).await.unwrap();
     drop(engine);
 
-    let cloud = Arc::new(InFlightRange {
-        fake,
-        pause_once: AtomicBool::new(true),
-        captured: Notify::new(),
-        resume: Notify::new(),
-    });
-    let engine = Engine::open_with_config(
-        temp.path().join("metadata.db"),
-        temp.path().join("cache"),
-        cloud.clone(),
-        Arc::new(SystemClock),
-        Config {
-            min_free_disk_bytes: 0,
-            ..Config::default()
-        },
-    )
-    .unwrap();
+    let (cloud, engine) = InFlightRange::open(&temp, fake);
     let begin_writeback = async {
         cloud.captured.notified().await;
         engine.set_sync_state("file", SyncState::Dirty).unwrap();

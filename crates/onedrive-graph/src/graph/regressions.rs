@@ -249,6 +249,39 @@ async fn mount_read(cdn: &MockServer, route: &str, byte: &str) {
 }
 
 #[tokio::test]
+async fn ambiguous_upload_with_no_content_tag_checks_the_size_twice() {
+    for (second_size, second_etag, expected) in [
+        (7, "peer", CloudError::Conflict),
+        (4, "peer", CloudError::Unavailable),
+        (7, "newer", CloudError::Unavailable),
+    ] {
+        let server = MockServer::start().await;
+        let mut probes = Vec::new();
+        for (size, etag) in [(7, "peer"), (second_size, second_etag)] {
+            probes.push(
+                Mock::given(method("GET"))
+                    .and(path("/v1.0/me/drive/items/file"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "file", "file": {}, "size": size, "eTag": etag
+                    })))
+                    .up_to_n_times(1)
+                    .expect(1)
+                    .mount_as_scoped(&server)
+                    .await,
+            );
+        }
+        let result = mock_graph(&server)
+            .confirm_upload(
+                UploadTarget::Existing { item_id: "file" },
+                UploadSource::Bytes(b"ours"),
+                Some("base"),
+            )
+            .await;
+        assert_eq!(result, Err(expected));
+    }
+}
+
+#[tokio::test]
 async fn ambiguous_simple_upload_requires_current_destination_and_complete_bytes() {
     for (first, second, content, expected) in [
         (

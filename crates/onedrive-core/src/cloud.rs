@@ -120,11 +120,11 @@ pub trait CloudDrive: Send + Sync {
         if item.etag.as_deref() == if_match {
             return Ok(None);
         }
-        if item.kind == ItemKind::File && item.ctag.as_deref().is_none_or(str::is_empty) {
-            return Err(CloudError::Unavailable);
-        }
         let mut matches = item.kind == ItemKind::File && item.size == source.len() as u64;
         if matches {
+            if item.ctag.as_deref().is_none_or(str::is_empty) {
+                return Err(CloudError::Unavailable);
+            }
             const BLOCK: usize = 1024 * 1024;
             for offset in (0..source.len()).step_by(BLOCK) {
                 let length = (source.len() - offset).min(BLOCK);
@@ -142,7 +142,11 @@ pub trait CloudDrive: Send + Sync {
             .upload_destination(target)
             .await?
             .ok_or(CloudError::Unavailable)?;
-        if current.item_id != item.item_id || current.etag != item.etag || current.ctag != item.ctag
+        if current.item_id != item.item_id
+            || current.etag != item.etag
+            || current.ctag != item.ctag
+            || current.size != item.size
+            || current.kind != item.kind
         {
             return Err(CloudError::Unavailable);
         }

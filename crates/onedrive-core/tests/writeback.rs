@@ -478,8 +478,79 @@ async fn accepted_file_and_folder_survive_restart_and_delta_before_acknowledgmen
 }
 
 #[tokio::test]
+async fn upload_recovery_waits_for_remote_parent_without_blocking_other_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = drive();
+    let target = UploadTarget::New {
+        parent_id: "root",
+        name: "draft",
+    };
+    let original = inner.upload(target, b"base", None).await.unwrap();
+    let cloud = interrupted_drive(inner.clone(), true);
+    let open = || {
+        Arc::new(Engine::open(dir.path().join("db"), cloud.clone(), Arc::new(SystemClock)).unwrap())
+    };
+    let engine = open();
+    engine.sync().await.unwrap();
+    let file = engine.item(&original.item_id).unwrap().unwrap();
+    engine.write(file.inode, 0, b"ours", false).await.unwrap();
+    cancel_after_acceptance(engine, &cloud).await;
+
+    let engine = open();
+    engine.write(file.inode, 4, b"!", false).await.unwrap();
+    let independent = engine.create(1, "independent", ItemKind::File).unwrap();
+    engine
+        .write(independent.inode, 0, b"done", false)
+        .await
+        .unwrap();
+    let folder = inner.create_folder("root", "new-parent").await.unwrap();
+    inner
+        .move_item(&original.item_id, &folder.item_id, "draft")
+        .await
+        .unwrap();
+    engine.drain_uploads().await.unwrap();
+    let uploaded = inner
+        .upload_destination(UploadTarget::New {
+            parent_id: "root",
+            name: "independent",
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        inner.read_range(&uploaded.item_id, 0, 4).await.unwrap(),
+        b"done"
+    );
+    assert_eq!(
+        engine.resolve_path("/draft").unwrap().unwrap().inode,
+        file.inode
+    );
+    assert_eq!(engine.read(file.inode, 0, 5).await.unwrap(), b"ours!");
+
+    engine.sync().await.unwrap();
+    engine.drain_uploads().await.unwrap();
+    assert_eq!(
+        engine
+            .resolve_path("/new-parent/draft")
+            .unwrap()
+            .unwrap()
+            .inode,
+        file.inode
+    );
+    assert_eq!(
+        inner.read_range(&original.item_id, 0, 5).await.unwrap(),
+        b"ours!"
+    );
+    assert!(engine.pending_uploads().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn accepted_update_replays_without_overwriting_a_competing_version() {
-    for competing in [false, true] {
+    for (peer_bytes, missing_ctag) in [
+        (None, false),
+        (Some(b"peer".as_slice()), false),
+        (Some(b"longer peer edit".as_slice()), true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("catalog");
         let inner = drive();
@@ -499,11 +570,16 @@ async fn accepted_update_replays_without_overwriting_a_competing_version() {
             item_id: &original.item_id,
         };
         let accepted = inner.upload_destination(target).await.unwrap().unwrap();
-        let expected = if competing {
-            inner
-                .upload(target, b"peer", accepted.etag.as_deref())
+        let expected = if let Some(bytes) = peer_bytes {
+            let mut peer = inner
+                .upload(target, bytes, accepted.etag.as_deref())
                 .await
-                .unwrap()
+                .unwrap();
+            if missing_ctag {
+                peer.ctag = None;
+                inner.upsert(peer.clone());
+            }
+            peer
         } else {
             accepted
         };
@@ -516,8 +592,8 @@ async fn accepted_update_replays_without_overwriting_a_competing_version() {
         assert_eq!(canonical.item_id, original.item_id);
         assert_eq!(canonical.etag, expected.etag);
         assert_eq!(engine.read(file.inode, 0, 20).await.unwrap(), b"ours");
-        if competing {
-            assert_eq!(engine.read(canonical.inode, 0, 20).await.unwrap(), b"peer");
+        if let Some(bytes) = peer_bytes {
+            assert_eq!(engine.read(canonical.inode, 0, 20).await.unwrap(), bytes);
             assert_eq!(
                 engine.getattr(file.inode).unwrap().unwrap().sync_state,
                 SyncState::Conflict
@@ -527,7 +603,7 @@ async fn accepted_update_replays_without_overwriting_a_competing_version() {
         }
         assert_eq!(
             engine.list_children("root").unwrap().len(),
-            if competing { 2 } else { 1 }
+            if peer_bytes.is_some() { 2 } else { 1 }
         );
         assert!(engine.pending_uploads().unwrap().is_empty());
     }

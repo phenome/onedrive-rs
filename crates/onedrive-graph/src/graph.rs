@@ -459,13 +459,13 @@ impl GraphDrive {
         if if_match != Some("*") && tag == if_match {
             return Ok(None);
         }
-        if item.file.is_some() && item.ctag.as_deref().is_none_or(str::is_empty) {
-            return Err(CloudError::Unavailable);
-        }
         let matches = if item.file.is_some()
             && item.folder.is_none()
             && item.size == Some(source.len() as u64)
         {
+            if item.ctag.as_deref().is_none_or(str::is_empty) {
+                return Err(CloudError::Unavailable);
+            }
             let url = item
                 .download_url
                 .as_deref()
@@ -491,6 +491,9 @@ impl GraphDrive {
             || current.id != item.id
             || current.etag != item.etag
             || current.ctag != item.ctag
+            || current.size != item.size
+            || current.file.is_some() != item.file.is_some()
+            || current.folder.is_some() != item.folder.is_some()
         {
             return Err(CloudError::Unavailable);
         }

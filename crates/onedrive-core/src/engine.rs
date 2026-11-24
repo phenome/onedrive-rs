@@ -47,6 +47,8 @@ pub enum EngineError {
     SyncSuperseded,
     #[error("item does not exist")]
     NotFound,
+    #[error("waiting for the remote parent to appear in the catalog")]
+    AwaitingRemoteParent,
     #[error("cannot purge {item_id}: pending upload")]
     PendingUpload { item_id: String },
     #[error("cannot purge {item_id}: unresolved conflict")]

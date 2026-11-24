@@ -843,6 +843,9 @@ impl Engine {
             };
             match result {
                 Ok(()) => {}
+                Err(EngineError::AwaitingRemoteParent) => {
+                    skipped.insert(work.item.inode);
+                }
                 Err(
                     error @ EngineError::Cloud(
                         CloudError::Throttled { .. } | CloudError::Authentication,
@@ -969,7 +972,9 @@ impl Engine {
                     .parent_id
                     .as_deref()
                     .ok_or(EngineError::InvalidMutation)?;
-                let parent = item_by_id(tx, parent)?.ok_or(EngineError::NotFound)?;
+                let Some(parent) = item_by_id(tx, parent)? else {
+                    continue;
+                };
                 if job(tx, parent.inode)?.is_some_and(|job| job.remote_id.is_none()) {
                     continue;
                 }
@@ -1499,6 +1504,13 @@ impl Engine {
                     false
                 };
             let ready = publication_ready(tx, inode, queued.stage.as_deref())?;
+            if follow_remote_path
+                && let Some(parent) = remote.as_ref().and_then(|item| item.parent_id.as_deref())
+                && item_by_id(tx, parent)?.is_none()
+            {
+                // Keep the current path and durable attempt until delta supplies the parent.
+                return Err(EngineError::AwaitingRemoteParent);
+            }
             if observed
                 && let (Some(attempt), Some(remote)) = (&work.move_attempt, &remote)
                 && !attempt.same_version(remote)

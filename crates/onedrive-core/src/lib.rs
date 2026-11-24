@@ -9,7 +9,8 @@ mod namespace;
 
 pub use cloud::{
     Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem, RemoteThumbnail, SystemClock, UploadOutcome, UploadSource, UploadTarget,
+    RemoteItem, RemoteThumbnail, SnapshotStream, SystemClock, UploadOutcome, UploadSource,
+    UploadTarget,
 };
 pub use engine::{
     CacheStatus, CatalogItem, DesktopChanges, Engine, EngineError, PinState, SyncState,

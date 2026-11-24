@@ -666,3 +666,164 @@ async fn upgrade_retires_stale_etag_only_ranges() {
     );
     assert_eq!(drive.range_requests().len(), 2);
 }
+
+#[tokio::test]
+async fn large_snapshot_without_streaming_reports_unsupported() {
+    let (temp, drive, engine, inode, _) = setup(2 * STREAM + 1).await;
+    drop(engine);
+    let engine = Engine::open_with_cache(
+        temp.path().join("metadata.db"),
+        temp.path().join("cache"),
+        Arc::new(UnversionedDrive(drive.clone())),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        engine.pin("file").await,
+        Err(onedrive_core::EngineError::Cloud(CloudError::Unsupported))
+    ));
+    assert!(drive.range_requests().is_empty());
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Cloud-only"
+    );
+}
+
+struct PausedSnapshot {
+    drive: Arc<FakeCloudDrive>,
+    staged: Arc<Notify>,
+    finish: Arc<Notify>,
+}
+
+#[async_trait]
+impl CloudDrive for PausedSnapshot {
+    async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
+        self.drive.delta(request).await
+    }
+
+    async fn stream_snapshot(
+        &self,
+        _: &str,
+        size: u64,
+    ) -> Result<onedrive_core::SnapshotStream, CloudError> {
+        use bytes::Bytes;
+        use futures_util::{StreamExt, stream};
+
+        let staged = self.staged.clone();
+        let finish = self.finish.clone();
+        let chunk = Bytes::from_static(&[42; HEADER]);
+        let full_block = stream::iter((0..STREAM / HEADER).map(move |_| Ok(chunk.clone())));
+        Ok(Box::pin(full_block.chain(stream::once(async move {
+            staged.notify_one();
+            finish.notified().await;
+            Ok(Bytes::from(vec![42; size as usize - STREAM]))
+        }))))
+    }
+}
+
+#[tokio::test]
+async fn snapshot_is_invisible_until_complete_and_discarded_on_invalidation_or_cancel() {
+    for action in ["purge", "delta", "cancel"] {
+        let (temp, drive, original, inode, _) = setup(STREAM + 1).await;
+        drop(original);
+        let staged = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let engine = Arc::new(
+            Engine::open_with_cache(
+                temp.path().join("metadata.db"),
+                temp.path().join("cache"),
+                Arc::new(PausedSnapshot {
+                    drive: drive.clone(),
+                    staged: staged.clone(),
+                    finish: finish.clone(),
+                }),
+                Arc::new(SystemClock),
+            )
+            .unwrap(),
+        );
+        let pin = tokio::spawn(async move { engine.pin("file").await });
+        tokio::select! {
+            () = staged.notified() => (),
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("snapshot did not stage its first block");
+            }
+        }
+
+        // Reopening the catalog runs crash recovery even while Pin is active.
+        let peer = open(&temp, &drive);
+        let files = || {
+            std::fs::read_dir(cache_namespace(&temp))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>()
+        };
+        let paths = files();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            std::fs::metadata(paths[0].join("0")).unwrap().len(),
+            STREAM as u64
+        );
+        assert_eq!(peer.cache_status().unwrap().pinned_bytes, 0);
+        assert_eq!(
+            peer.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+            b"Cloud-only"
+        );
+
+        match action {
+            "purge" => peer.purge("file").unwrap(),
+            "delta" => {
+                let mut changed = fixture_file(STREAM + 1);
+                changed.ctag = Some("new-content".into());
+                drive.upsert(changed);
+                peer.sync_catalog().await.unwrap();
+            }
+            _ => pin.abort(),
+        }
+        finish.notify_one();
+        match pin.await {
+            Ok(result) => result.unwrap(),
+            Err(error) => assert!(error.is_cancelled() && action == "cancel"),
+        }
+        assert!(files().is_empty(), "{action} left staged bytes");
+        assert_eq!(peer.cache_status().unwrap().pinned_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn snapshot_requires_space_for_all_staged_blocks_before_consuming_the_body() {
+    let (temp, drive, original, _, _) = setup(1).await;
+    let space = original.cache_capacity().unwrap();
+    let size = space.f_bavail * space.f_frsize + STREAM as u64;
+    drive.upsert(RemoteItem {
+        size,
+        ..fixture_file(1)
+    });
+    original.sync_catalog().await.unwrap();
+    drop(original);
+    let engine = Engine::open_with_cache(
+        temp.path().join("metadata.db"),
+        temp.path().join("cache"),
+        Arc::new(PausedSnapshot {
+            drive,
+            staged: Arc::new(Notify::new()),
+            finish: Arc::new(Notify::new()),
+        }),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.pin("file"))
+            .await
+            .unwrap(),
+        Err(onedrive_core::EngineError::LowDisk)
+    ));
+    assert!(engine.cache_status().unwrap().hydration_paused_low_disk);
+    assert!(
+        std::fs::read_dir(cache_namespace(&temp))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}

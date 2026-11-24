@@ -2,9 +2,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use futures_util::stream;
 use onedrive_core::{
     CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem, RemoteThumbnail, UploadOutcome, UploadSource, UploadTarget,
+    RemoteItem, RemoteThumbnail, SnapshotStream, UploadOutcome, UploadSource, UploadTarget,
 };
 use reqwest::header::{self, HeaderValue};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
@@ -25,6 +26,7 @@ pub struct GraphDrive {
     auth: Arc<Auth>,
     base: Url,
     client: Client,
+    snapshot_client: Client,
     pause_until: Mutex<Instant>,
     binding: DriveBinding,
     verified: AsyncMutex<Option<(String, String)>>,
@@ -66,6 +68,11 @@ impl GraphDrive {
             auth,
             base,
             client: crate::http_client().map_err(|_| CloudError::Unavailable)?,
+            // A snapshot can take longer than the request deadline for ranges.
+            snapshot_client: crate::base_http_client_builder()
+                .read_timeout(crate::HTTP_TIMEOUT)
+                .build()
+                .map_err(|_| CloudError::Unavailable)?,
             pause_until: Mutex::new(Instant::now()),
             binding,
             verified: AsyncMutex::new(None),
@@ -217,9 +224,9 @@ impl GraphDrive {
     }
 
     async fn dispatch(&self, request: RequestBuilder) -> Result<Response, CloudError> {
-        let request = request.build().map_err(|_| CloudError::InvalidResponse)?;
-        let response = self
-            .client
+        let (client, request) = request.build_split();
+        let request = request.map_err(|_| CloudError::InvalidResponse)?;
+        let response = client
             .execute(request)
             .await
             .map_err(|_| CloudError::Unavailable)?;
@@ -273,16 +280,38 @@ impl GraphDrive {
             return Ok(Vec::new());
         }
         let range = ByteRange::new(offset, length)?;
+        let response = self
+            .content_response(item_id, version, Some(&range))
+            .await?;
+        let bytes = range_bytes(response, range).await?;
+        if version.is_some() {
+            // The CDN can serve a mutable URL. Recheck after reading so
+            // bytes obtained across a concurrent update are discarded.
+            self.download_url(item_id, version).await?;
+        }
+        Ok(bytes)
+    }
+
+    async fn content_response(
+        &self,
+        item_id: &str,
+        version: Option<(Option<&str>, Option<&str>)>,
+        range: Option<&ByteRange>,
+    ) -> Result<Response, CloudError> {
+        let client = if range.is_some() {
+            &self.client
+        } else {
+            &self.snapshot_client
+        };
         for attempt in 0..2 {
             let url = self.download_url(item_id, version).await?;
-            let request = self
-                .client
-                .get(url)
-                .header(
+            let mut request = client.get(url).header(header::ACCEPT_ENCODING, "identity");
+            if let Some(range) = range {
+                request = request.header(
                     header::RANGE,
                     format!("bytes={}-{}", range.start, range.end),
-                )
-                .header(header::ACCEPT_ENCODING, "identity");
+                );
+            }
             let response = self.send(request).await?;
             if matches!(
                 response.status(),
@@ -291,13 +320,7 @@ impl GraphDrive {
             {
                 continue;
             }
-            let bytes = range_bytes(response, range).await?;
-            if version.is_some() {
-                // The CDN can serve a mutable URL. Recheck after reading so
-                // bytes obtained across a concurrent update are discarded.
-                self.download_url(item_id, version).await?;
-            }
-            return Ok(bytes);
+            return Ok(response);
         }
         unreachable!("the second download attempt always returns")
     }
@@ -615,6 +638,35 @@ impl CloudDrive for GraphDrive {
     ) -> Result<Vec<u8>, CloudError> {
         self.read_content_range(item_id, offset, length, Some((etag, ctag)))
             .await
+    }
+
+    async fn stream_snapshot(
+        &self,
+        item_id: &str,
+        size: u64,
+    ) -> Result<SnapshotStream, CloudError> {
+        let response = self.content_response(item_id, None, None).await?;
+        if response.status() != StatusCode::OK {
+            return Err(status_error(response.status()));
+        }
+        if !identity_encoding(&response)
+            || response.headers().contains_key(header::CONTENT_RANGE)
+            || response
+                .content_length()
+                .is_some_and(|length| length != size)
+        {
+            return Err(CloudError::InvalidResponse);
+        }
+        Ok(Box::pin(stream::try_unfold(
+            response,
+            |mut response| async {
+                let chunk = response
+                    .chunk()
+                    .await
+                    .map_err(|_| CloudError::Unavailable)?;
+                Ok(chunk.map(|bytes| (bytes, response)))
+            },
+        )))
     }
 
     async fn upload(

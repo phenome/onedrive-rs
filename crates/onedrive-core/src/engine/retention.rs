@@ -138,6 +138,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Finish a Sticky Pin hydration pass, leaving low-disk status for the next retry.
+    pub async fn hydrate_pending_pins(&self) -> Result<(), EngineError> {
+        match self.hydrate_pins(None).await {
+            Err(EngineError::LowDisk) => Ok(()),
+            result => result,
+        }
+    }
+
     pub(super) async fn hydrate_pins(&self, root: Option<&str>) -> Result<(), EngineError> {
         let _hydration = self.hydrating.lock().await;
         let candidates = self
@@ -237,6 +245,7 @@ impl Engine {
 
     /// Cached content bytes, excluding sparse holes and counting overlapping ranges once.
     pub fn cache_status(&self) -> Result<CacheStatus, EngineError> {
+        let invalid = self.invalid_cache_inodes()?;
         let space = self.cache_capacity()?;
         let available_disk_bytes = space.f_bavail.saturating_mul(space.f_frsize);
         let hydration_paused_low_disk = self.hydration_paused_low_disk.load(Ordering::Relaxed);
@@ -249,6 +258,9 @@ impl Engine {
                 || available_disk_bytes < self.config.min_free_disk_bytes,
         };
         for entry in cached_files(&self.db(), false)? {
+            if invalid.contains(&entry.inode) {
+                continue;
+            }
             if entry.pinned {
                 status.pinned_bytes += entry.bytes;
             } else {
@@ -294,7 +306,7 @@ impl Engine {
                 continue;
             }
             let idle = now.saturating_sub(file.accessed_at).max(0) as u64;
-            if idle > max_age_ms
+            if (idle > max_age_ms && !self.file_is_open(file.inode))
                 || (file.bytes > 0 && unpinned > self.config.max_unpinned_cache_bytes)
             {
                 tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [file.inode])?;

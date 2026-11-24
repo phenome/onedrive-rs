@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
@@ -80,7 +80,7 @@ impl SparseCache {
         let namespace: String =
             db.query_row("SELECT name FROM sparse_namespace", [], |row| row.get(0))?;
         let root = root.join(namespace);
-        fs::create_dir_all(&root)?;
+
         let cache = Self {
             root,
             locks: Mutex::default(),
@@ -104,6 +104,13 @@ impl SparseCache {
             forget_pending(db, generation, Block::from_key(block))?;
         }
         Ok(cache)
+    }
+
+    fn ensure_root(&self) -> io::Result<()> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.root)
     }
 
     fn path(&self, generation: i64) -> PathBuf {
@@ -140,6 +147,7 @@ impl SparseCache {
     // Independent engines opening the same catalog coordinate publication and
     // reclamation. Always acquire this lock before consulting the catalog.
     pub(super) fn lock_disk(&self) -> io::Result<File> {
+        self.ensure_root()?;
         let directory = File::open(&self.root)?;
         flock(&directory, FlockOperation::LockExclusive)?;
         Ok(directory)
@@ -252,6 +260,7 @@ impl SparseCache {
 
 impl Engine {
     pub fn cache_capacity(&self) -> Result<rustix::fs::StatVfs, EngineError> {
+        self.cache.ensure_root()?;
         rustix::fs::statvfs(&self.cache.root).map_err(|err| io::Error::from(err).into())
     }
 
@@ -476,6 +485,49 @@ impl Engine {
             forget_pending(&self.db(), generation, block)?;
         }
         result
+    }
+
+    /// Status must remain available when damaged blocks cannot be opened.
+    pub(super) fn invalid_cache_inodes(
+        &self,
+    ) -> Result<std::collections::HashSet<u64>, EngineError> {
+        let blocks = {
+            let db = self.db();
+            db.prepare_cached(
+                "SELECT f.inode, f.generation, r.block, r.stamp
+                FROM sparse_files f JOIN sparse_range_files r USING (generation)",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    Block::from_key(row.get(2)?),
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut invalid = std::collections::HashSet::new();
+        for (inode, generation, block, stamp) in blocks {
+            if !invalid.contains(&inode) {
+                let intact = match fs::symlink_metadata(self.cache.block_path(generation, block)) {
+                    Ok(metadata) => metadata.is_file() && file_stamp(&metadata) == stamp,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        false
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                if !intact {
+                    invalid.insert(inode);
+                }
+            }
+        }
+        Ok(invalid)
     }
 
     pub(super) fn recover_cached_generations(&self) -> Result<(), EngineError> {

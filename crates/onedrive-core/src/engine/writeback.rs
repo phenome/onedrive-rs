@@ -542,8 +542,20 @@ impl Engine {
         if job(&db, inode)?.is_some_and(|job| job.deleted) {
             return Err(EngineError::NotFound);
         }
+        // Kernel cache hits need not issue a FUSE read, even across opens.
+        db.execute("UPDATE items SET last_accessed_at = max(coalesce(last_accessed_at, 0), ?2)
+                    WHERE inode = ?1 AND inode IN (SELECT inode FROM sparse_files WHERE inode = ?1)",
+            params![inode, self.access_time()])?;
         self.register_open(inode);
         Ok(())
+    }
+
+    pub(super) fn file_is_open(&self, inode: u64) -> bool {
+        self.writeback
+            .open_files
+            .lock()
+            .unwrap()
+            .contains_key(&inode)
     }
 
     fn register_open(&self, inode: u64) {
@@ -572,15 +584,22 @@ impl Engine {
         queued_items(&self.db())
     }
 
-    /// Resolve pending Upload paths from the same catalog snapshot as their states.
+    /// Report queued changes and preserved Conflict Copies in the same catalog snapshot.
     pub fn pending_upload_paths(&self) -> Result<Vec<(PathBuf, SyncState)>, EngineError> {
         let db = self.db();
         let tx = db.unchecked_transaction()?;
-        queued_items(&tx)?
-            .into_iter()
-            .map(|item| {
-                let path = super::path_for(&tx, &item.item_id)?.ok_or(EngineError::NotFound)?;
-                Ok((path, item.sync_state))
+        let mut select = tx.prepare_cached(
+            "SELECT item_id, sync_state FROM items
+             WHERE inode IN (SELECT inode FROM writeback_queue) OR sync_state = ?1 ORDER BY inode",
+        )?;
+        select
+            .query_map([SyncState::Conflict as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, SyncState>(1)?))
+            })?
+            .map(|row| {
+                let (id, state) = row?;
+                let path = super::path_for(&tx, &id)?.ok_or(EngineError::NotFound)?;
+                Ok((path, state))
             })
             .collect()
     }

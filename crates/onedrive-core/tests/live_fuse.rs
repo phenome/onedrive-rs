@@ -29,12 +29,15 @@ const DELTA_PAGE_SIZE: usize = 100;
 const HEADER: usize = 64 * 1024;
 const STREAM: usize = 2 * 1024 * 1024;
 
-struct FixedClock;
+struct FixedClock(std::sync::atomic::AtomicU64);
 
 #[async_trait::async_trait]
 impl Clock for FixedClock {
     fn now(&self) -> Duration {
-        Duration::new(1_800_000_000, 123_000_000)
+        Duration::new(
+            1_800_000_000 + self.0.load(std::sync::atomic::Ordering::Relaxed),
+            123_000_000,
+        )
     }
 
     async fn sleep(&self, _: Duration) {
@@ -180,12 +183,13 @@ fn exercise_mount(dir: &Path) {
         });
     }
     drive.set_content("file", bytes.clone());
+    let clock = Arc::new(FixedClock(0.into()));
     let engine = Arc::new(
         Engine::open_with_config(
             dir.join("db"),
             &cache,
             drive.clone(),
-            Arc::new(FixedClock),
+            clock.clone(),
             Config {
                 min_free_disk_bytes: 0,
                 ..Config::default()
@@ -257,6 +261,23 @@ fn exercise_mount(dir: &Path) {
     let accessed = fs::metadata(&path).unwrap();
     assert_eq!(accessed.atime(), 1_800_000_000);
     assert_eq!(accessed.atime_nsec(), 123_000_000);
+    // Reopening a cached page can result in zero FUSE read callbacks.
+    clock
+        .0
+        .store(6 * 86_400, std::sync::atomic::Ordering::Relaxed);
+    let reopened = File::open(&path).unwrap();
+    reopened.read_exact_at(&mut sniff, 0).unwrap();
+    assert_eq!(sniff, bytes[..32768]);
+    assert_eq!(
+        fs::metadata(&path).unwrap().atime(),
+        1_800_000_000 + 6 * 86_400
+    );
+    clock
+        .0
+        .store(14 * 86_400, std::sync::atomic::Ordering::Relaxed);
+    engine.evict().unwrap();
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, HEADER as u64);
+    drop(reopened);
     assert_eq!(drive.range_requests(), [("file".into(), 0, HEADER)]);
     handle.read_exact_at(&mut sniff, 32768).unwrap();
     assert_eq!(sniff, bytes[32768..HEADER]);

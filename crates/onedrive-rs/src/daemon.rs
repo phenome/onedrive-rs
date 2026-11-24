@@ -12,7 +12,7 @@ use onedrive_core::{
 use rustix::fs::{FlockOperation, flock};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
@@ -103,6 +103,7 @@ pub async fn run(
         _ = terminate.recv() => Ok(()),
         _ = delta.poll(period) => Ok(()),
         _ = delta.upload_worker() => Ok(()),
+        _ = delta.hydration_worker() => Ok(()),
         result = async {
             loop {
                 tokio::select! {
@@ -166,7 +167,9 @@ fn migrate_legacy_catalog(
     state: &Path,
     data: &Path,
 ) -> Result<Option<File>, Box<dyn std::error::Error>> {
-    if !state.try_exists()? || state.canonicalize()? == data.canonicalize()? {
+    if !Engine::catalog_storage_present(&state.join("catalog.sqlite3"))?
+        || state.canonicalize()? == data.canonicalize()?
+    {
         return Ok(None);
     }
     let legacy_lock = lock_storage(state)?;
@@ -219,6 +222,7 @@ struct DeltaSync {
     last_result: Mutex<SyncState>,
     long_jobs: Semaphore,
     mount: PathBuf,
+    hydration_requested: Notify,
 }
 
 impl DeltaSync {
@@ -229,6 +233,7 @@ impl DeltaSync {
             poll_state: watch::channel(PollState::default()).0,
             last_result: Mutex::new(SyncState::Starting),
             long_jobs: Semaphore::new(MAX_LONG_JOBS),
+            hydration_requested: Notify::new(),
         }
     }
 
@@ -244,7 +249,8 @@ impl DeltaSync {
             return Ok(());
         }
         let synced = async {
-            self.engine.sync().await?;
+            self.engine.sync_catalog().await?;
+            self.hydration_requested.notify_one();
             if !background {
                 self.engine.drain_uploads().await?;
             }
@@ -274,6 +280,24 @@ impl DeltaSync {
             tokio::select! {
                 _ = sleep_until(next) => {}
                 _ = state.wait_for(|state| state.paused || state.resume_count != resume_count) => {}
+            }
+        }
+    }
+
+    async fn hydration_worker(&self) {
+        let mut state = self.poll_state.subscribe();
+        loop {
+            self.hydration_requested.notified().await;
+            state.wait_for(|current| !current.paused).await.unwrap();
+            tokio::select! {
+                _ = state.wait_for(|current| current.paused) => {
+                    self.hydration_requested.notify_one();
+                }
+                result = self.engine.hydrate_pending_pins() => {
+                    if let Err(error) = result {
+                        eprintln!("OneDrive pinned download failed ({error})");
+                    }
+                }
             }
         }
     }

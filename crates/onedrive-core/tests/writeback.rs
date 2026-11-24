@@ -358,11 +358,30 @@ impl CloudDrive for InterruptedDrive {
         self.inner.read_range(id, offset, length).await
     }
 
+    async fn read_range_at_version(
+        &self,
+        id: &str,
+        etag: Option<&str>,
+        ctag: Option<&str>,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        self.inner
+            .read_range_at_version(id, etag, ctag, offset, length)
+            .await
+    }
+
     async fn upload_destination(
         &self,
         target: UploadTarget<'_>,
     ) -> Result<Option<RemoteItem>, CloudError> {
         self.inner.upload_destination(target).await
+    }
+
+    async fn delete_if_match(&self, id: &str, etag: &str) -> Result<(), CloudError> {
+        self.inner.delete_if_match(id, etag).await?;
+        self.after_acceptance().await;
+        Ok(())
     }
 
     async fn move_if_match(
@@ -1025,4 +1044,189 @@ async fn missing_cold_base_retains_local_extents_without_using_newer_remote_byte
         engine.getattr(inode).unwrap().unwrap().sync_state,
         SyncState::Conflict
     );
+}
+
+#[tokio::test]
+async fn offline_unlink_and_rmdir_restore_identity_when_remote_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let drive = drive();
+    let folder = drive.create_folder("root", "folder").await.unwrap();
+    let mut file = cloud_file(4);
+    drive.upsert(file.clone());
+    drive.set_content("cold", b"base".to_vec());
+    let open = || Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    let engine = open();
+    engine.sync().await.unwrap();
+    let file_inode = engine.item("cold").unwrap().unwrap().inode;
+    let folder_inode = engine.item(&folder.item_id).unwrap().unwrap().inode;
+    drive.set_online(false);
+    engine.unlink(1, "cold", ItemKind::File).unwrap();
+    engine.unlink(1, "folder", ItemKind::Folder).unwrap();
+    assert!(engine.list_children("root").unwrap().is_empty());
+    drop(engine);
+
+    drive.set_online(true);
+    file.etag = Some("peer-version".into());
+    file.ctag = Some("peer-content".into());
+    drive.upsert(file);
+    drive.set_content("cold", b"peer".to_vec());
+    // FakeCloudDrive keeps the folder's original eTag when adding its child.
+    let child = drive
+        .upload(
+            UploadTarget::New {
+                parent_id: &folder.item_id,
+                name: "remote-child",
+            },
+            b"keep me",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let engine = open();
+    assert!(matches!(
+        engine.drain_uploads().await,
+        Err(EngineError::Cloud(CloudError::Conflict))
+    ));
+    assert!(drive.recycled_items().is_empty());
+    assert!(engine.pending_uploads().unwrap().is_empty());
+    engine.sync().await.unwrap();
+    let restored_file = engine.resolve_path("/cold").unwrap().unwrap();
+    assert_eq!(
+        (restored_file.inode, restored_file.sync_state),
+        (file_inode, SyncState::Conflict)
+    );
+    assert_eq!(
+        engine.read(restored_file.inode, 0, 4).await.unwrap(),
+        b"peer"
+    );
+    let restored_folder = engine.resolve_path("/folder").unwrap().unwrap();
+    assert_eq!(
+        (restored_folder.inode, restored_folder.sync_state),
+        (folder_inode, SyncState::Conflict)
+    );
+    let restored_child = engine
+        .resolve_path("/folder/remote-child")
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_child.item_id, child.item_id);
+    assert_eq!(
+        engine.read(restored_child.inode, 0, 7).await.unwrap(),
+        b"keep me"
+    );
+}
+
+#[tokio::test]
+async fn accepted_checked_delete_replays_by_id_without_touching_new_path_occupant() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let inner = drive();
+    inner.upsert(cloud_file(4));
+    inner.set_content("cold", b"base".to_vec());
+    let drive = interrupted_drive(inner.clone(), true);
+    let open = || Arc::new(Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap());
+    let engine = open();
+    engine.sync().await.unwrap();
+    engine.unlink(1, "cold", ItemKind::File).unwrap();
+    cancel_after_acceptance(engine.clone(), &drive).await;
+    drop(engine);
+
+    let replacement = inner
+        .upload(
+            UploadTarget::New {
+                parent_id: "root",
+                name: "cold",
+            },
+            b"new item",
+            None,
+        )
+        .await
+        .unwrap();
+    let engine = open();
+    engine.sync().await.unwrap();
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+    assert_eq!(inner.recycled_items(), ["cold"]);
+    let survivor = engine.resolve_path("/cold").unwrap().unwrap();
+    assert_eq!(survivor.item_id, replacement.item_id);
+    assert_eq!(
+        engine.read(survivor.inode, 0, 8).await.unwrap(),
+        b"new item"
+    );
+}
+
+#[tokio::test]
+async fn accepted_move_rebinds_a_cold_sparse_append_after_restart() {
+    cold_edit_during_move(Some("content"), false).await;
+}
+
+#[tokio::test]
+async fn accepted_move_does_not_rebind_edited_peer_content_after_restart() {
+    cold_edit_during_move(Some("content"), true).await;
+}
+
+#[tokio::test]
+async fn accepted_move_does_not_rebind_a_sparse_base_without_content_proof() {
+    cold_edit_during_move(None, false).await;
+}
+
+async fn cold_edit_during_move(ctag: Option<&str>, peer_edit: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let inner = drive();
+    let mut base = cloud_file(4);
+    base.ctag = ctag.map(str::to_owned);
+    inner.upsert(base);
+    inner.set_content("cold", b"base".to_vec());
+    let drive = interrupted_drive(inner.clone(), true);
+    let open = || Arc::new(Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap());
+    let engine = open();
+    engine.sync().await.unwrap();
+    let inode = engine.item("cold").unwrap().unwrap().inode;
+    engine.rename(1, "cold", 1, "moved", false).unwrap();
+    let upload = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.drain_uploads().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), drive.accepted.notified())
+        .await
+        .unwrap();
+    engine.write(inode, 0, b"!", true).await.unwrap();
+    assert!(inner.range_requests().is_empty());
+    assert_eq!(engine.read(inode, 4, 1).await.unwrap(), b"!");
+    upload.abort();
+    assert!(upload.await.unwrap_err().is_cancelled());
+    drop(engine);
+
+    if peer_edit {
+        inner
+            .upload(UploadTarget::Existing { item_id: "cold" }, b"peer", None)
+            .await
+            .unwrap();
+    }
+    let engine = open();
+    let result = engine.drain_uploads().await;
+    if peer_edit || ctag.is_none() {
+        assert!(matches!(
+            result,
+            Err(EngineError::OriginalVersionUnavailable)
+        ));
+        let original = engine.resolve_path("/moved").unwrap().unwrap();
+        assert_ne!(original.inode, inode);
+        assert_eq!(original.item_id, "cold");
+        let unchanged = if peer_edit { b"peer" } else { b"base" };
+        assert_eq!(engine.read(original.inode, 0, 4).await.unwrap(), unchanged);
+        assert_eq!(
+            engine.getattr(inode).unwrap().unwrap().sync_state,
+            SyncState::Conflict
+        );
+        assert_eq!(engine.read(inode, 4, 1).await.unwrap(), b"!");
+    } else {
+        assert_eq!(result.unwrap(), 2);
+        let moved = engine.resolve_path("/moved").unwrap().unwrap();
+        assert_eq!(moved.inode, inode);
+        assert_eq!(moved.item_id, "cold");
+        assert_eq!(moved.sync_state, SyncState::Clean);
+        assert_eq!(inner.read_range("cold", 0, 5).await.unwrap(), b"base!");
+    }
 }

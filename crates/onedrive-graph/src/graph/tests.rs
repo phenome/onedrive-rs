@@ -622,3 +622,28 @@ async fn thumbnail_download_negotiates_tls_http2_without_bearer() {
     drop(graph);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn conditional_move_sends_acknowledged_etag_and_maps_precondition_failure() {
+    use wiremock::matchers::body_json;
+
+    let server = MockServer::start().await;
+    let graph = mock_graph(&server);
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/drive/items/item"))
+        .and(header("authorization", "Bearer synthetic-access"))
+        .and(header("if-match", r#""acknowledged""#))
+        .and(body_json(
+            json!({"name":"final","parentReference":{"id":"folder"}}),
+        ))
+        .respond_with(ResponseTemplate::new(412))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        graph
+            .move_if_match("item", "folder", "final", r#""acknowledged""#)
+            .await,
+        Err(CloudError::Conflict)
+    );
+}

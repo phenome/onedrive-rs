@@ -288,6 +288,19 @@ impl GraphDrive {
         }
     }
 
+    async fn move_with_condition(
+        &self,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+        etag: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        let url = self.endpoint(&["items", item_id]);
+        let body = json!({"name": name, "parentReference": {"id": parent_id}});
+        let request = conditional(self.client.patch(url).json(&body), etag);
+        decode_item(self.graph(request).await?).await
+    }
+
     async fn fetch_destination(&self, url: &Url) -> Result<Option<DriveItem>, CloudError> {
         let response = self.graph(self.client.get(url.clone())).await?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -516,9 +529,19 @@ impl CloudDrive for GraphDrive {
         parent_id: &str,
         name: &str,
     ) -> Result<RemoteItem, CloudError> {
-        let url = self.endpoint(&["items", item_id]);
-        let body = json!({"name": name, "parentReference": {"id": parent_id}});
-        decode_item(self.graph(self.client.patch(url).json(&body)).await?).await
+        self.move_with_condition(item_id, parent_id, name, None)
+            .await
+    }
+
+    async fn move_if_match(
+        &self,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+        etag: &str,
+    ) -> Result<RemoteItem, CloudError> {
+        self.move_with_condition(item_id, parent_id, name, Some(etag))
+            .await
     }
 
     async fn delete_if_match(&self, item_id: &str, etag: &str) -> Result<(), CloudError> {

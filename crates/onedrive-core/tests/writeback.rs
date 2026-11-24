@@ -286,6 +286,8 @@ async fn remote_create_at_a_dirty_path_leaves_the_staged_version_reachable() {
 }
 
 struct InterruptedDrive {
+    pause_move: std::sync::atomic::AtomicBool,
+    peer_before_move: std::sync::atomic::AtomicBool,
     inner: Arc<FakeCloudDrive>,
     pause: std::sync::atomic::AtomicBool,
     accepted: tokio::sync::Notify,
@@ -352,18 +354,37 @@ impl CloudDrive for InterruptedDrive {
         self.inner.upload_destination(target).await
     }
 
-    async fn move_item(
+    async fn move_if_match(
         &self,
         id: &str,
         parent_id: &str,
         name: &str,
+        etag: &str,
     ) -> Result<RemoteItem, CloudError> {
-        self.inner.move_item(id, parent_id, name).await
+        if self
+            .peer_before_move
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner
+                .upload(UploadTarget::Existing { item_id: id }, b"peer", None)
+                .await?;
+        }
+        let remote = self.inner.move_if_match(id, parent_id, name, etag).await?;
+        if self
+            .pause_move
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.pause.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.after_acceptance().await;
+        Ok(remote)
     }
 }
 
 fn interrupted_drive(inner: Arc<FakeCloudDrive>, pause: bool) -> Arc<InterruptedDrive> {
     Arc::new(InterruptedDrive {
+        pause_move: false.into(),
+        peer_before_move: false.into(),
         inner,
         pause: pause.into(),
         accepted: tokio::sync::Notify::new(),
@@ -629,4 +650,245 @@ async fn failed_large_sparse_upload_does_not_block_a_small_independent_file() {
     );
     assert_eq!(engine.pending_uploads().unwrap()[0].inode, large.inode);
     assert_eq!(engine.read(small.inode, 0, 20).await.unwrap(), b"progress");
+}
+
+#[tokio::test]
+async fn publication_race_preserves_staged_and_peer_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = drive();
+    let cloud = interrupted_drive(inner.clone(), false);
+    cloud
+        .peer_before_move
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let open =
+        || Engine::open(dir.path().join("db"), cloud.clone(), Arc::new(SystemClock)).unwrap();
+    let engine = open();
+    engine.sync().await.unwrap();
+    let file = engine.create(1, "draft.txt", ItemKind::File).unwrap();
+    engine.write(file.inode, 0, b"ours", false).await.unwrap();
+    engine.drain_uploads().await.unwrap();
+    drop(engine);
+
+    let engine = open();
+    engine.sync().await.unwrap();
+    let copy = engine.getattr(file.inode).unwrap().unwrap();
+    assert!(copy.name.starts_with("draft (conflict "));
+    assert!(copy.name.ends_with(").txt"));
+    assert_eq!(copy.sync_state, SyncState::Conflict);
+    assert_eq!(
+        engine
+            .resolve_path(format!("/{}", copy.name))
+            .unwrap()
+            .unwrap()
+            .inode,
+        file.inode
+    );
+    assert_eq!(engine.read(file.inode, 0, 10).await.unwrap(), b"ours");
+    assert_eq!(
+        inner.read_range(&copy.item_id, 0, 10).await.unwrap(),
+        b"ours"
+    );
+    let entries = engine.list_children("root").unwrap();
+    assert_eq!(entries.len(), 2);
+    let peer = entries
+        .iter()
+        .find(|item| item.inode != file.inode)
+        .unwrap();
+    assert!(peer.name.starts_with("onedrive-rs-upload-"));
+    assert_eq!(engine.read(peer.inode, 0, 10).await.unwrap(), b"peer");
+    assert!(engine.pending_uploads().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn accepted_move_reconciles_before_undo_after_restart() {
+    for cross_parent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = drive();
+        let original = inner
+            .upload(
+                UploadTarget::New {
+                    parent_id: "root",
+                    name: "a",
+                },
+                b"ours",
+                None,
+            )
+            .await
+            .unwrap();
+        if cross_parent {
+            inner.create_folder("root", "other").await.unwrap();
+        }
+        let cloud = interrupted_drive(inner.clone(), true);
+        let open = || {
+            Arc::new(
+                Engine::open(dir.path().join("db"), cloud.clone(), Arc::new(SystemClock)).unwrap(),
+            )
+        };
+        let engine = open();
+        engine.sync().await.unwrap();
+        let inode = engine.resolve_path("/a").unwrap().unwrap().inode;
+        let destination = if cross_parent {
+            engine.resolve_path("/other").unwrap().unwrap().inode
+        } else {
+            1
+        };
+        engine.rename(1, "a", destination, "b", false).unwrap();
+        cancel_after_acceptance(engine, &cloud).await;
+
+        let engine = open();
+        engine.rename(destination, "b", 1, "a", false).unwrap();
+        engine.drain_uploads().await.unwrap();
+        let remote = inner
+            .upload_destination(UploadTarget::Existing {
+                item_id: &original.item_id,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.name.as_deref(), Some("a"));
+        assert_eq!(remote.parent_id.as_deref(), Some("root"));
+        engine.sync().await.unwrap();
+        let file = engine.resolve_path("/a").unwrap().unwrap();
+        assert_eq!(file.inode, inode);
+        assert_eq!(file.item_id, original.item_id);
+        assert_eq!(file.sync_state, SyncState::Clean);
+        assert_eq!(engine.read(inode, 0, 10).await.unwrap(), b"ours");
+        let abandoned_path = if cross_parent { "/other/b" } else { "/b" };
+        assert!(engine.resolve_path(abandoned_path).unwrap().is_none());
+        assert!(engine.pending_uploads().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn interrupted_publication_preserves_a_superseding_partial_edit() {
+    use std::sync::atomic::Ordering;
+
+    for competing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = drive();
+        let cloud = interrupted_drive(inner.clone(), false);
+        let open = || {
+            Arc::new(
+                Engine::open(dir.path().join("db"), cloud.clone(), Arc::new(SystemClock)).unwrap(),
+            )
+        };
+        let engine = open();
+        engine.sync().await.unwrap();
+        let file = engine.create(1, "draft", ItemKind::File).unwrap();
+        engine.write(file.inode, 0, b"ours", false).await.unwrap();
+        cloud.pause_move.store(true, Ordering::SeqCst);
+        cancel_after_acceptance(engine, &cloud).await;
+
+        let published = inner
+            .upload_destination(UploadTarget::New {
+                parent_id: "root",
+                name: "draft",
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        if competing {
+            inner
+                .upload(
+                    UploadTarget::Existing {
+                        item_id: &published.item_id,
+                    },
+                    b"peer",
+                    published.etag.as_deref(),
+                )
+                .await
+                .unwrap();
+        }
+        let engine = open();
+        engine.sync().await.unwrap();
+        assert_eq!(engine.read(file.inode, 0, 10).await.unwrap(), b"ours");
+        engine.write(file.inode, 3, b"!", false).await.unwrap();
+        engine.rename(1, "draft", 1, "final", false).unwrap();
+        drop(engine);
+
+        let engine = open();
+        engine.drain_uploads().await.unwrap();
+        engine.sync().await.unwrap();
+        let item = engine.getattr(file.inode).unwrap().unwrap();
+        assert_eq!(engine.read(item.inode, 0, 10).await.unwrap(), b"our!");
+        assert_eq!(
+            inner.read_range(&item.item_id, 0, 10).await.unwrap(),
+            b"our!"
+        );
+        if competing {
+            assert!(item.name.starts_with("final (conflict "));
+            assert_eq!(item.sync_state, SyncState::Conflict);
+            let peer = engine.resolve_path("/draft").unwrap().unwrap();
+            assert_eq!(peer.item_id, published.item_id);
+            assert_eq!(engine.read(peer.inode, 0, 10).await.unwrap(), b"peer");
+        } else {
+            assert_eq!(
+                engine.resolve_path("/final").unwrap().unwrap().inode,
+                file.inode
+            );
+            assert!(engine.resolve_path("/draft").unwrap().is_none());
+            assert_eq!(item.item_id, published.item_id);
+            assert_eq!(item.sync_state, SyncState::Clean);
+        }
+        assert!(engine.pending_uploads().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn interrupted_cycle_move_is_recovered_before_publishing_either_file() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let inner = drive();
+    for (name, bytes) in [("a", b"alpha".as_slice()), ("b", b"beta".as_slice())] {
+        inner
+            .upload(
+                UploadTarget::New {
+                    parent_id: "root",
+                    name,
+                },
+                bytes,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let cloud = interrupted_drive(inner.clone(), false);
+    let open = || {
+        Arc::new(Engine::open(dir.path().join("db"), cloud.clone(), Arc::new(SystemClock)).unwrap())
+    };
+    let engine = open();
+    engine.sync().await.unwrap();
+    let a = engine.resolve_path("/a").unwrap().unwrap();
+    let b = engine.resolve_path("/b").unwrap().unwrap();
+    engine.rename(1, "a", 1, "temp", false).unwrap();
+    engine.rename(1, "b", 1, "a", false).unwrap();
+    engine.rename(1, "temp", 1, "b", false).unwrap();
+    cloud.pause_move.store(true, Ordering::SeqCst);
+    cancel_after_acceptance(engine, &cloud).await;
+
+    let engine = open();
+    engine.sync().await.unwrap();
+    engine.drain_uploads().await.unwrap();
+    engine.sync().await.unwrap();
+    assert_eq!(engine.list_children("root").unwrap().len(), 2);
+    for (path, original, bytes) in [
+        ("/a", b, b"beta".as_slice()),
+        ("/b", a, b"alpha".as_slice()),
+    ] {
+        let item = engine.resolve_path(path).unwrap().unwrap();
+        assert_eq!(item.inode, original.inode);
+        assert_eq!(item.item_id, original.item_id);
+        assert_eq!(item.sync_state, SyncState::Clean);
+        assert_eq!(engine.read(item.inode, 0, 10).await.unwrap(), bytes);
+        let remote = inner
+            .upload_destination(UploadTarget::Existing {
+                item_id: &item.item_id,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.name.as_deref(), path.strip_prefix('/'));
+    }
+    assert!(engine.pending_uploads().unwrap().is_empty());
 }

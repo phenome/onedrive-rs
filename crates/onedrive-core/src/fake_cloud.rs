@@ -228,6 +228,31 @@ impl State {
     }
 }
 
+impl FakeCloudDrive {
+    fn move_with_condition(
+        &self,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+        etag: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        let mut state = self.state.lock().unwrap();
+        state.online()?;
+        state.require_destination(parent_id, name, Some(item_id))?;
+        let mut item = state
+            .items
+            .get(item_id)
+            .cloned()
+            .ok_or(CloudError::NotFound)?;
+        if etag.is_some_and(|etag| item.etag.as_deref() != Some(etag)) {
+            return Err(CloudError::Conflict);
+        }
+        item.parent_id = Some(parent_id.into());
+        item.name = Some(name.into());
+        Ok(state.commit(item, None))
+    }
+}
+
 #[async_trait]
 impl CloudDrive for FakeCloudDrive {
     async fn upload(
@@ -298,17 +323,17 @@ impl CloudDrive for FakeCloudDrive {
         parent_id: &str,
         name: &str,
     ) -> Result<RemoteItem, CloudError> {
-        let mut state = self.state.lock().unwrap();
-        state.online()?;
-        state.require_destination(parent_id, name, Some(item_id))?;
-        let mut item = state
-            .items
-            .get(item_id)
-            .cloned()
-            .ok_or(CloudError::NotFound)?;
-        item.parent_id = Some(parent_id.into());
-        item.name = Some(name.into());
-        Ok(state.commit(item, None))
+        self.move_with_condition(item_id, parent_id, name, None)
+    }
+
+    async fn move_if_match(
+        &self,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+        etag: &str,
+    ) -> Result<RemoteItem, CloudError> {
+        self.move_with_condition(item_id, parent_id, name, Some(etag))
     }
 
     async fn delete_item(&self, item_id: &str) -> Result<(), CloudError> {

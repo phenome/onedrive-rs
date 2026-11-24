@@ -3,17 +3,19 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    Session,
 };
 use tokio::runtime::Handle;
 
-use crate::{CatalogItem, Engine, EngineError, ItemKind};
+use crate::engine::{CatalogInvalidation, CatalogObserver};
+use crate::{CatalogItem, CloudError, Engine, EngineError, ItemKind};
 
 type DirectoryEntry = (INodeNo, FileType, String);
 type DirectorySnapshot = Arc<Mutex<Option<Vec<DirectoryEntry>>>>;
@@ -29,6 +31,7 @@ pub struct FuseAdapter {
     directories: Mutex<HashMap<u64, DirectorySnapshot>>,
     paths: Option<MountPaths>,
     next_directory: AtomicU64,
+    observer: Arc<OnceLock<CatalogObserver>>,
 }
 
 impl FuseAdapter {
@@ -40,6 +43,7 @@ impl FuseAdapter {
             directories: Mutex::default(),
             paths: None,
             next_directory: AtomicU64::new(1),
+            observer: Arc::default(),
         }
     }
 
@@ -59,7 +63,31 @@ impl FuseAdapter {
             MountOption::NoSuid,
         ];
         config.n_threads = Some(4);
-        fuser::spawn_mount(self, mountpoint, &config)
+        let engine = self.engine.clone();
+        let owner = self.observer.clone();
+        let session = Session::new(self, mountpoint, &config)?;
+        let notifier = session.notifier();
+        let observer: CatalogObserver = Arc::new(move |changes: &[CatalogInvalidation]| {
+            for change in changes {
+                let result = match change {
+                    CatalogInvalidation::Inode { inode, content } => {
+                        notifier.inval_inode(INodeNo(*inode), if *content { 0 } else { -1 }, 0)
+                    }
+                    CatalogInvalidation::Entry { parent, name } => {
+                        notifier.inval_entry(INodeNo(*parent), OsStr::new(name))
+                    }
+                };
+                if let Err(error) = result
+                    && error.kind() != io::ErrorKind::NotFound
+                    && error.raw_os_error() != Some(rustix::io::Errno::NODEV.raw_os_error())
+                {
+                    log::warn!("FUSE cache invalidation failed: {error}");
+                }
+            }
+        });
+        engine.observe_catalog(&observer);
+        assert!(owner.set(observer).is_ok());
+        session.spawn()
     }
 
     fn item(&self, ino: INodeNo) -> Result<CatalogItem, Errno> {
@@ -93,12 +121,20 @@ impl FuseAdapter {
             None => ino.0,
         };
         let entries = match &self.paths {
-            Some(paths) => self.runtime.block_on(self.engine.readdir(
-                &directory.item_id,
-                &paths.mountpoint,
-                &paths.thumbnail_root,
-            )),
-            None => self.engine.list_children(&directory.item_id),
+            Some(paths) => self
+                .runtime
+                .block_on(self.engine.readdir(
+                    &directory.item_id,
+                    &paths.mountpoint,
+                    &paths.thumbnail_root,
+                ))
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|entry| (entry.inode, entry.kind, entry.name))
+                        .collect()
+                }),
+            None => self.engine.list_directory_entries(&directory.item_id),
         }
         .map_err(errno)?;
         Ok([
@@ -109,12 +145,19 @@ impl FuseAdapter {
         .chain(
             entries
                 .into_iter()
-                .map(|entry| (INodeNo(entry.inode), file_type(entry.kind), entry.name)),
+                .map(|(inode, kind, name)| (INodeNo(inode), file_type(kind), name)),
         ))
     }
 }
 
 impl Filesystem for FuseAdapter {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+        // fuser requires a positive byte limit. One byte rounds down to zero
+        // pages on Linux, keeping cached mmap and MIME sniffing demand-driven.
+        let _ = config.set_max_readahead(1);
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let item = (|| {
             let name = name.to_str().ok_or(Errno::ENOENT)?;
@@ -204,8 +247,7 @@ impl Filesystem for FuseAdapter {
         }
         match self.item(ino) {
             Ok(item) if item.kind == ItemKind::Folder => reply.error(Errno::EISDIR),
-            // Preserve the application's read sizes and let the Engine own content freshness.
-            Ok(_) => reply.opened(FileHandle(0), FopenFlags::FOPEN_DIRECT_IO),
+            Ok(_) => reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE),
             Err(error) => reply.error(error),
         }
     }
@@ -327,6 +369,46 @@ fn errno(error: EngineError) -> Errno {
         EngineError::CacheIo(error) => {
             Errno::from_i32(error.raw_os_error().unwrap_or(Errno::EIO.code()))
         }
+        EngineError::Cloud(error) => cloud_errno(error),
         _ => Errno::EIO,
+    }
+}
+
+fn cloud_errno(error: CloudError) -> Errno {
+    match error {
+        CloudError::NotFound => Errno::ENOENT,
+        CloudError::Conflict => Errno::ESTALE,
+        CloudError::Authentication => Errno::EACCES,
+        CloudError::Unsupported => Errno::EOPNOTSUPP,
+        CloudError::Throttled { .. } => Errno::EAGAIN,
+        CloudError::InvalidResponse | CloudError::ResyncRequired | CloudError::Unavailable => {
+            Errno::EIO
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_all_cloud_errors_to_fuse_errno() {
+        for (error, expected) in [
+            (CloudError::NotFound, Errno::ENOENT),
+            (CloudError::Conflict, Errno::ESTALE),
+            (CloudError::Authentication, Errno::EACCES),
+            (CloudError::Unsupported, Errno::EOPNOTSUPP),
+            (
+                CloudError::Throttled {
+                    retry_after: Duration::from_secs(5),
+                },
+                Errno::EAGAIN,
+            ),
+            (CloudError::InvalidResponse, Errno::EIO),
+            (CloudError::ResyncRequired, Errno::EIO),
+            (CloudError::Unavailable, Errno::EIO),
+        ] {
+            assert_eq!(errno(EngineError::Cloud(error)), expected);
+        }
     }
 }

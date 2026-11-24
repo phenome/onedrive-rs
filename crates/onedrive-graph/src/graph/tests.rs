@@ -32,6 +32,79 @@ pub(super) fn mock_graph(server: &MockServer) -> GraphDrive {
 }
 
 #[tokio::test]
+async fn graph_range_populates_engine_sparse_cache() {
+    use onedrive_core::{Engine, SystemClock};
+
+    let server = MockServer::start().await;
+    let cdn = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("metadata.db");
+    let cache = temp.path().join("cache");
+    let bytes: Vec<_> = (0..65_536).map(|offset| (offset % 251) as u8).collect();
+
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/drive/root/delta"))
+        .and(query_param("$top", "1000"))
+        .and(header("authorization", "Bearer synthetic-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                {"id": "root", "name": "root", "folder": {}, "root": {}},
+                {"id": "file", "name": "photo.png", "file": {}, "size": 131072,
+                 "parentReference": {"id": "root"}, "eTag": "item-1", "cTag": "content-1"}
+            ],
+            "@odata.deltaLink": format!("{}/v1.0/me/drive/root/delta?token=complete", server.uri())
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/drive/items/file"))
+        .and(header("authorization", "Bearer synthetic-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "@microsoft.graph.downloadUrl": format!("{}/content?sig=temporary", cdn.uri())
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/content"))
+        .and(query_param("sig", "temporary"))
+        .and(header("range", "bytes=0-65535"))
+        .and(anonymous)
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 0-65535/131072")
+                .set_body_bytes(bytes.clone()),
+        )
+        .expect(1)
+        .mount(&cdn)
+        .await;
+
+    let open = || {
+        Engine::open_with_cache(
+            &database,
+            &cache,
+            Arc::new(mock_graph(&server)),
+            Arc::new(SystemClock),
+        )
+        .unwrap()
+    };
+    let engine = open();
+    engine.sync().await.unwrap();
+    let inode = engine.lookup("root", "photo.png").unwrap().unwrap().inode;
+    assert_eq!(engine.read(inode, 0, 32768).await.unwrap(), bytes[..32768]);
+    drop(engine);
+
+    let engine = open();
+    assert_eq!(
+        engine.read(inode, 40000, 123).await.unwrap(),
+        bytes[40000..40123]
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(cdn.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn delta_preserves_opaque_links_and_maps_expired_cursors() {
     let server = MockServer::start().await;
     let graph = mock_graph(&server);

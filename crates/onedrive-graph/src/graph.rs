@@ -100,17 +100,71 @@ impl GraphDrive {
         Ok(response)
     }
 
-    async fn download_url(&self, item_id: &str) -> Result<Url, CloudError> {
+    async fn download_url(
+        &self,
+        item_id: &str,
+        version: Option<(Option<&str>, Option<&str>)>,
+    ) -> Result<Url, CloudError> {
         #[derive(Deserialize)]
         struct Metadata {
             #[serde(rename = "@microsoft.graph.downloadUrl")]
             download_url: String,
+            #[serde(rename = "eTag")]
+            etag: Option<String>,
+            #[serde(rename = "cTag")]
+            ctag: Option<String>,
         }
 
-        // A signed URL may keep serving an old version after its item changes.
         let url = self.endpoint(&["items", item_id]);
         let metadata: Metadata = decode(self.graph(self.client.get(url)).await?).await?;
+        if let Some((etag, ctag)) = version
+            && ((etag.is_none() && ctag.is_none())
+                || etag.is_some_and(|tag| metadata.etag.as_deref() != Some(tag))
+                || ctag.is_some_and(|tag| metadata.ctag.as_deref() != Some(tag)))
+        {
+            return Err(CloudError::Conflict);
+        }
         parse_url(&metadata.download_url)
+    }
+
+    async fn read_content_range(
+        &self,
+        item_id: &str,
+        offset: u64,
+        length: usize,
+        version: Option<(Option<&str>, Option<&str>)>,
+    ) -> Result<Vec<u8>, CloudError> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let range = ByteRange::new(offset, length)?;
+        for attempt in 0..2 {
+            let url = self.download_url(item_id, version).await?;
+            let request = self
+                .client
+                .get(url)
+                .header(
+                    header::RANGE,
+                    format!("bytes={}-{}", range.start, range.end),
+                )
+                .header(header::ACCEPT_ENCODING, "identity");
+            let response = self.send(request).await?;
+            if matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE
+            ) && attempt == 0
+            {
+                continue;
+            }
+            let bytes = range_bytes(response, range).await?;
+            if version.is_some() {
+                // The CDN can serve a mutable URL. Recheck after reading so
+                // bytes obtained across a concurrent update are discarded.
+                self.download_url(item_id, version).await?;
+            }
+            return Ok(bytes);
+        }
+        unreachable!("the second download attempt always returns")
     }
 
     async fn resumable_upload(
@@ -404,31 +458,19 @@ impl CloudDrive for GraphDrive {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, CloudError> {
-        if length == 0 {
-            return Ok(Vec::new());
-        }
-        let range = ByteRange::new(offset, length)?;
-        for attempt in 0..2 {
-            let url = self.download_url(item_id).await?;
-            let request = self
-                .client
-                .get(url)
-                .header(
-                    header::RANGE,
-                    format!("bytes={}-{}", range.start, range.end),
-                )
-                .header(header::ACCEPT_ENCODING, "identity");
-            let response = self.send(request).await?;
-            if matches!(
-                response.status(),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE
-            ) && attempt == 0
-            {
-                continue;
-            }
-            return range_bytes(response, range).await;
-        }
-        unreachable!("the second download attempt always returns")
+        self.read_content_range(item_id, offset, length, None).await
+    }
+
+    async fn read_range_at_version(
+        &self,
+        item_id: &str,
+        etag: Option<&str>,
+        ctag: Option<&str>,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        self.read_content_range(item_id, offset, length, Some((etag, ctag)))
+            .await
     }
 
     async fn upload(

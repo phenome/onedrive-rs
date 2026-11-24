@@ -29,7 +29,7 @@ An explicit user action that removes an item's locally cached bytes, unpins it (
 _Avoid_: Free up space, delete local, evict
 
 **Eviction**:
-Automatic removal of locally cached content bytes from clean, unpinned hydrated files when cache size or idle-age limits are exceeded.
+Automatic removal of cached bytes from clean, unpinned files under cache budget pressure, including partially cached files. Fully hydrated files are also eligible when their idle-age limit is exceeded.
 _Avoid_: Purge, cleanup, garbage collection
 
 **Dirty**:

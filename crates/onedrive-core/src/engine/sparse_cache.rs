@@ -337,8 +337,8 @@ impl Engine {
                     return Ok(result);
                 }
                 Err(error) => {
-                    // Reclaim eligible hydrated files while preserving the read error.
-                    let _ = self.evict_after_failed_read();
+                    // Earlier blocks may have been cached before the read failed.
+                    let _ = self.evict();
                     return Err(error);
                 }
             }

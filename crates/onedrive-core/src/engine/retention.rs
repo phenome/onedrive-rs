@@ -257,7 +257,7 @@ impl Engine {
             free_disk_floor_warning: hydration_paused_low_disk
                 || available_disk_bytes < self.config.min_free_disk_bytes,
         };
-        for entry in cached_files(&self.db(), false)? {
+        for entry in cached_files(&self.db())? {
             if invalid.contains(&entry.inode) {
                 continue;
             }
@@ -283,17 +283,9 @@ impl Engine {
 
     /// Enforce the idle-age limit, then the unpinned cache budget.
     pub fn evict(&self) -> Result<(), EngineError> {
-        self.evict_candidates(false)
-    }
-
-    pub(super) fn evict_after_failed_read(&self) -> Result<(), EngineError> {
-        self.evict_candidates(true)
-    }
-
-    fn evict_candidates(&self, hydrated_only: bool) -> Result<(), EngineError> {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let entries = cached_files(&tx, hydrated_only)?;
+        let mut entries = cached_files(&tx)?;
         let mut unpinned: u64 = entries
             .iter()
             .filter(|file| !file.pinned)
@@ -301,17 +293,21 @@ impl Engine {
             .sum();
         let now = self.access_time();
         let max_age_ms = self.config.max_idle_age_days.saturating_mul(86_400_000);
-        for file in entries {
-            if file.pinned || file.state != SyncState::Clean {
-                continue;
-            }
+        entries.retain(|file| !file.pinned && file.state == SyncState::Clean);
+        for file in &mut entries {
             let idle = now.saturating_sub(file.accessed_at).max(0) as u64;
-            if (idle > max_age_ms && !self.file_is_open(file.inode))
-                || (file.bytes > 0 && unpinned > self.config.max_unpinned_cache_bytes)
-            {
+            if file.hydrated && idle > max_age_ms && !self.file_is_open(file.inode) {
                 tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [file.inode])?;
                 unpinned -= file.bytes;
+                file.bytes = 0;
             }
+        }
+        for file in entries.into_iter().filter(|file| file.bytes > 0) {
+            if unpinned <= self.config.max_unpinned_cache_bytes {
+                break;
+            }
+            tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [file.inode])?;
+            unpinned -= file.bytes;
         }
         tx.commit()?;
         drop(db);
@@ -409,42 +405,46 @@ struct CachedFile {
     bytes: u64,
     state: SyncState,
     pinned: bool,
+    hydrated: bool,
 }
 
-fn cached_files(db: &Connection, hydrated_only: bool) -> Result<Vec<CachedFile>, EngineError> {
+fn cached_files(db: &Connection) -> Result<Vec<CachedFile>, EngineError> {
     let mut stmt = db.prepare_cached(&format!(
         "SELECT i.inode, i.item_id, i.sync_state, coalesce(i.last_accessed_at, 0),
                 sum(CASE
                     WHEN r.block IS NULL THEN 0
                     WHEN r.block >= 0 THEN min(?3, i.size - r.block)
-                    WHEN NOT EXISTS (
+                    WHEN r.block = ?1 AND NOT EXISTS (
                         SELECT 1 FROM sparse_ranges WHERE generation = f.generation AND block = 0
                     ) THEN min(?2, i.size)
-                    ELSE 0 END)
+                    ELSE 0 END),
+                {HAS_COMPLETE_CONTENT}
          FROM sparse_files f
          JOIN items i USING (inode)
          LEFT JOIN sparse_ranges r USING (generation)
-         WHERE (i.size = 0 OR r.generation IS NOT NULL) AND (NOT ?1 OR {HAS_COMPLETE_CONTENT})
+         WHERE i.size = 0 OR r.generation IS NOT NULL
          GROUP BY f.generation
          ORDER BY coalesce(i.last_accessed_at, 0), i.inode",
     ))?;
-    let rows = stmt.query_map(params![hydrated_only, HEADER_BYTES, STREAM_BYTES], |row| {
+    let rows = stmt.query_map(params![-1, HEADER_BYTES, STREAM_BYTES], |row| {
         Ok((
             row.get(0)?,
             row.get::<_, String>(1)?,
             row.get(2)?,
             row.get(3)?,
             row.get(4)?,
+            row.get(5)?,
         ))
     })?;
     rows.map(|row| {
-        let (inode, id, state, accessed_at, bytes) = row?;
+        let (inode, id, state, accessed_at, bytes, hydrated) = row?;
         Ok(CachedFile {
             inode,
             accessed_at,
             bytes,
             state,
             pinned: effective_pin(db, &id)? == PinState::Pinned,
+            hydrated,
         })
     })
     .collect()

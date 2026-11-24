@@ -135,6 +135,7 @@ async fn ctag_and_mtime_changes_each_retire_cached_bytes() {
 
 struct InFlightRange {
     fake: Arc<FakeCloudDrive>,
+    pause_offset: u64,
     pause_once: AtomicBool,
     captured: Notify,
     resume: Notify,
@@ -142,8 +143,18 @@ struct InFlightRange {
 
 impl InFlightRange {
     fn open(temp: &TempDir, fake: Arc<FakeCloudDrive>) -> (Arc<Self>, Engine) {
+        Self::open_at(temp, fake, 0, Config::default().max_unpinned_cache_bytes)
+    }
+
+    fn open_at(
+        temp: &TempDir,
+        fake: Arc<FakeCloudDrive>,
+        pause_offset: u64,
+        max_unpinned_cache_bytes: u64,
+    ) -> (Arc<Self>, Engine) {
         let cloud = Arc::new(Self {
             fake,
+            pause_offset,
             pause_once: AtomicBool::new(true),
             captured: Notify::new(),
             resume: Notify::new(),
@@ -155,6 +166,7 @@ impl InFlightRange {
             Arc::new(SystemClock),
             Config {
                 min_free_disk_bytes: 0,
+                max_unpinned_cache_bytes,
                 ..Config::default()
             },
         )
@@ -176,12 +188,40 @@ impl CloudDrive for InFlightRange {
         length: usize,
     ) -> Result<Vec<u8>, CloudError> {
         let bytes = self.fake.read_range(item, offset, length).await?;
-        if self.pause_once.swap(false, Ordering::Relaxed) {
+        if offset == self.pause_offset && self.pause_once.swap(false, Ordering::Relaxed) {
             self.captured.notify_one();
             self.resume.notified().await;
         }
         Ok(bytes)
     }
+}
+
+#[tokio::test]
+async fn eviction_reclaims_over_budget_partial_bytes_after_read_cancellation() {
+    let (temp, fake, engine, inode, original) = setup(STREAM + 200).await;
+    drop(engine);
+    let (cloud, engine) = InFlightRange::open_at(&temp, fake.clone(), STREAM as u64, 32 * 1024);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            result = engine.read(inode, 0, original.len()) => panic!("read finished early: {result:?}"),
+            () = cloud.captured.notified() => (),
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, STREAM as u64);
+
+    engine.evict().unwrap();
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 0);
+    assert_eq!(engine.read(inode, 0, 1).await.unwrap(), original[..1]);
+    assert_eq!(
+        fake.range_requests(),
+        [
+            ("file".into(), 0, STREAM),
+            ("file".into(), STREAM as u64, STREAM),
+            ("file".into(), 0, HEADER)
+        ]
+    );
 }
 
 #[tokio::test]

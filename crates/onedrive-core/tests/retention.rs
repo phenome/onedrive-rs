@@ -90,6 +90,83 @@ fn state(engine: &Engine, id: &str) -> String {
 }
 
 #[tokio::test]
+async fn header_reads_refetch_only_when_the_partial_generation_is_evicted() {
+    const HEADER: usize = 64 * 1024;
+    const SNIFF: usize = 32 * 1024;
+    for (cap, cached_bytes, fetches) in [(SNIFF, 0, 2), (2 * HEADER, HEADER, 1)] {
+        let mut fixture = Fixture::new();
+        fixture.config.max_unpinned_cache_bytes = cap as u64;
+        fixture.config.max_idle_age_days = 1;
+        fixture.add("file", Some("root"), ItemKind::File, 2 * HEADER);
+        let content: Vec<_> = (0..2 * HEADER).map(|offset| (offset % 251) as u8).collect();
+        fixture.drive.set_content("file", content.clone());
+        let engine = fixture.open();
+        engine.sync().await.unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                engine.read(inode(&engine, "file"), 0, SNIFF).await.unwrap(),
+                content[..SNIFF]
+            );
+            assert_eq!(
+                engine.cache_status().unwrap().unpinned_bytes,
+                cached_bytes as u64
+            );
+            assert_eq!(state(&engine, "file"), "Cloud-only");
+            fixture.clock.advance(86_401);
+            engine.evict().unwrap();
+        }
+        assert_eq!(
+            fixture.drive.range_requests(),
+            vec![("file".into(), 0, HEADER); fetches]
+        );
+    }
+}
+
+#[tokio::test]
+async fn budget_pressure_evicts_clean_partial_ranges_and_protects_pinned_and_dirty_bytes() {
+    use onedrive_core::SyncState;
+
+    const HEADER: usize = 64 * 1024;
+    let mut fixture = Fixture::new();
+    fixture.config.max_unpinned_cache_bytes = HEADER as u64;
+    for id in ["pinned", "dirty", "clean"] {
+        fixture.add(id, Some("root"), ItemKind::File, 2 * HEADER);
+    }
+    let engine = fixture.open();
+    engine.sync().await.unwrap();
+    engine.pin("pinned").await.unwrap();
+    engine.read(inode(&engine, "dirty"), 0, 1).await.unwrap();
+    engine.set_sync_state("dirty", SyncState::Dirty).unwrap();
+    fixture.clock.advance(1);
+
+    assert_eq!(
+        engine.read(inode(&engine, "clean"), 0, 1).await.unwrap(),
+        [13]
+    );
+    let status = engine.cache_status().unwrap();
+    assert_eq!(status.unpinned_bytes, HEADER as u64);
+    assert_eq!(status.pinned_bytes, (2 * HEADER) as u64);
+    assert_eq!(state(&engine, "pinned"), "Hydrated");
+    assert_eq!(state(&engine, "dirty"), "Dirty");
+
+    let requests = fixture.drive.range_requests();
+    assert_eq!(
+        engine.read(inode(&engine, "dirty"), 0, 1).await.unwrap(),
+        [13]
+    );
+    assert_eq!(fixture.drive.range_requests(), requests);
+    assert_eq!(
+        engine.read(inode(&engine, "clean"), 0, 1).await.unwrap(),
+        [13]
+    );
+    assert_eq!(
+        &fixture.drive.range_requests()[requests.len()..],
+        &[("clean".into(), 0, HEADER)]
+    );
+}
+
+#[tokio::test]
 async fn pin_hydrates_full_file_and_survives_restart_and_eviction() {
     let mut fixture = Fixture::new();
     fixture.config.max_unpinned_cache_bytes = 0;
@@ -392,11 +469,12 @@ async fn failed_full_hydration_retry_keeps_low_disk_warning() {
 }
 
 #[tokio::test]
-async fn failed_range_still_evicts_an_idle_hydrated_file() {
+async fn failed_range_evicts_an_idle_hydrated_file_and_over_budget_partial_bytes() {
     use onedrive_core::EngineError;
 
     let mut fixture = Fixture::new();
     fixture.config.max_idle_age_days = 1;
+    fixture.config.max_unpinned_cache_bytes = 32 * 1024;
     fixture.add("idle", Some("root"), ItemKind::File, 8);
     fixture.add(
         "interrupted",
@@ -420,6 +498,7 @@ async fn failed_range_still_evicts_an_idle_hydrated_file() {
         Err(EngineError::InvalidRange)
     ));
     assert_eq!(state(&engine, "idle"), "Cloud-only");
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 0);
 }
 
 #[tokio::test]

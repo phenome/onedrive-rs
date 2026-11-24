@@ -1,6 +1,13 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use onedrive_core::{Engine, FakeCloudDrive, ItemKind, RemoteItem, SystemClock};
+use async_trait::async_trait;
+use tokio::sync::Notify;
+
+use onedrive_core::{
+    CloudDrive, CloudError, DeltaPage, DeltaRequest, Engine, FakeCloudDrive, ItemKind, RemoteItem,
+    SystemClock,
+};
 use tempfile::TempDir;
 
 const HEADER: usize = 64 * 1024;
@@ -98,7 +105,7 @@ async fn streaming_reads_coalesce_and_hydrate_across_arbitrary_offsets() {
 
 #[tokio::test]
 async fn ctag_and_mtime_changes_each_retire_cached_bytes() {
-    let (_temp, drive, engine, inode, bytes) = setup(8192).await;
+    let (temp, drive, engine, inode, bytes) = setup(8192).await;
     assert_eq!(engine.read(inode, 0, bytes.len()).await.unwrap(), bytes);
     let mut item = fixture_file(bytes.len());
     for (version, byte) in [("ctag", 13), ("mtime", 42)] {
@@ -111,6 +118,12 @@ async fn ctag_and_mtime_changes_each_retire_cached_bytes() {
         drive.set_content("file", vec![byte; bytes.len()]);
         engine.sync().await.unwrap();
         assert_eq!(
+            std::fs::read_dir(temp.path().join("cache"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
             engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
             b"Cloud-only"
         );
@@ -120,4 +133,75 @@ async fn ctag_and_mtime_changes_each_retire_cached_bytes() {
         );
     }
     assert_eq!(drive.range_requests(), vec![("file".into(), 0, HEADER); 3]);
+}
+
+struct InFlightRange {
+    fake: Arc<FakeCloudDrive>,
+    pause_once: AtomicBool,
+    captured: Notify,
+    resume: Notify,
+}
+
+#[async_trait]
+impl CloudDrive for InFlightRange {
+    async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
+        self.fake.delta(request).await
+    }
+
+    async fn read_range(
+        &self,
+        item: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        let bytes = self.fake.read_range(item, offset, length).await?;
+        if self.pause_once.swap(false, Ordering::Relaxed) {
+            self.captured.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(bytes)
+    }
+}
+
+#[tokio::test]
+async fn in_flight_range_retries_after_delta_retires_its_generation() {
+    let (temp, fake, engine, inode, original) = setup(STREAM + 200).await;
+    drop(engine);
+    let cloud = Arc::new(InFlightRange {
+        fake: fake.clone(),
+        pause_once: AtomicBool::new(true),
+        captured: Notify::new(),
+        resume: Notify::new(),
+    });
+    let engine = Engine::open_with_cache(
+        temp.path().join("metadata.db"),
+        temp.path().join("cache"),
+        cloud.clone(),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    let fresh = vec![193; original.len()];
+    let apply_delta = async {
+        cloud.captured.notified().await;
+        let mut changed = fixture_file(original.len());
+        changed.ctag = Some("content-2".into());
+        fake.upsert(changed);
+        fake.set_content("file", fresh.clone());
+        engine.sync().await.unwrap();
+        cloud.resume.notify_one();
+    };
+    let (bytes, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(engine.read(inode, 0, fresh.len()), apply_delta)
+    })
+    .await
+    .unwrap();
+    assert_eq!(bytes.unwrap(), fresh);
+    assert_eq!(
+        fake.range_requests(),
+        [
+            ("file".into(), 0, STREAM),
+            ("file".into(), 0, STREAM),
+            ("file".into(), STREAM as u64, STREAM),
+        ]
+    );
 }

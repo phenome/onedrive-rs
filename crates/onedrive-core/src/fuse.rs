@@ -1,27 +1,38 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
 };
 use tokio::runtime::Handle;
 
 use crate::{CatalogItem, Engine, EngineError, ItemKind};
 
+type DirectoryEntry = (INodeNo, FileType, String);
+
 pub struct FuseAdapter {
     engine: Arc<Engine>,
     runtime: Handle,
+    directories: Mutex<HashMap<u64, Arc<[DirectoryEntry]>>>,
+    next_directory: AtomicU64,
 }
 
 impl FuseAdapter {
     /// The caller keeps the Tokio runtime running for the lifetime of the mount.
     pub fn new(engine: Arc<Engine>, runtime: Handle) -> Self {
-        Self { engine, runtime }
+        Self {
+            engine,
+            runtime,
+            directories: Mutex::default(),
+            next_directory: AtomicU64::new(1),
+        }
     }
 
     pub fn mount(self, mountpoint: impl AsRef<Path>) -> io::Result<BackgroundSession> {
@@ -56,7 +67,7 @@ impl FuseAdapter {
     fn directory_entries(
         &self,
         ino: INodeNo,
-    ) -> Result<impl Iterator<Item = (INodeNo, FileType, String)>, Errno> {
+    ) -> Result<impl Iterator<Item = DirectoryEntry>, Errno> {
         let directory = self.directory(ino)?;
         let parent = match directory.parent_id {
             Some(id) => {
@@ -108,24 +119,47 @@ impl Filesystem for FuseAdapter {
         }
     }
 
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let entries = match self.directory_entries(ino) {
+            Ok(entries) => entries.collect(),
+            Err(error) => return reply.error(error),
+        };
+        // Directory offsets stay stable across paginated reads and concurrent delta updates.
+        let handle = self.next_directory.fetch_add(1, Ordering::Relaxed);
+        self.directories.lock().unwrap().insert(handle, entries);
+        reply.opened(FileHandle(handle), FopenFlags::empty());
+    }
+
     fn readdir(
         &self,
         _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
+        _ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = match self.directory_entries(ino) {
-            Ok(entries) => entries,
-            Err(error) => return reply.error(error),
+        let entries = self.directories.lock().unwrap().get(&fh.0).cloned();
+        let Some(entries) = entries else {
+            return reply.error(Errno::EBADF);
         };
         let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-        for (index, (inode, kind, name)) in entries.enumerate().skip(offset) {
-            if reply.add(inode, (index + 1) as u64, kind, name) {
+        for (index, (inode, kind, name)) in entries.iter().enumerate().skip(offset) {
+            if reply.add(*inode, (index + 1) as u64, *kind, name) {
                 break;
             }
         }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.directories.lock().unwrap().remove(&fh.0);
         reply.ok();
     }
 

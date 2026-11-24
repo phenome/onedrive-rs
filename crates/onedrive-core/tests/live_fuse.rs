@@ -6,7 +6,9 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use onedrive_core::{Engine, FakeCloudDrive, FuseAdapter, ItemKind, RemoteItem, SystemClock};
+use onedrive_core::{
+    Engine, FakeCloudDrive, FuseAdapter, ItemKind, PinState, RemoteItem, SystemClock,
+};
 
 const WORKER_DIR: &str = "ONEDRIVE_LIVE_FUSE_WORKER_DIR";
 const HEADER: usize = 64 * 1024;
@@ -100,8 +102,18 @@ fn exercise_mount(dir: &Path) {
         item_id: "folder".into(),
         parent_id: Some("root".into()),
         name: Some("folder".into()),
-        ..root
+        ..root.clone()
     });
+    let expected_names: Vec<_> = (0..1500).map(|i| format!("entry-{i:04}")).collect();
+    for name in &expected_names {
+        drive.upsert(RemoteItem {
+            item_id: name.clone(),
+            parent_id: Some("folder".into()),
+            name: Some(name.clone()),
+            kind: ItemKind::File,
+            ..root.clone()
+        });
+    }
     drive.set_content("file", bytes.clone());
     let engine = Arc::new(
         Engine::open_with_cache(dir.join("db"), &cache, drive.clone(), Arc::new(SystemClock))
@@ -120,7 +132,12 @@ fn exercise_mount(dir: &Path) {
         .collect();
     names.sort();
     assert_eq!(names, ["content.bin", "folder"]);
-    assert_eq!(fs::read_dir(mount.join("folder")).unwrap().count(), 0);
+    let mut nested: Vec<_> = fs::read_dir(mount.join("folder"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    nested.sort();
+    assert_eq!(nested, expected_names);
     let path = mount.join("content.bin");
     let metadata = fs::metadata(&path).unwrap();
     assert_eq!(metadata.len(), bytes.len() as u64);
@@ -149,7 +166,7 @@ fn exercise_mount(dir: &Path) {
             .any(|errno| err.raw_os_error() == Some(errno.raw_os_error()))
     );
 
-    assert_xattrs(&path, b"Cloud-only", b"\"version-1\"");
+    assert_xattrs(&path, b"Cloud-only", b"none", b"\"version-1\"");
     let mut handle = File::open(&path).unwrap();
     assert!(drive.range_requests().is_empty());
     let mut sniff = vec![0; 32768];
@@ -170,7 +187,8 @@ fn exercise_mount(dir: &Path) {
             ("file".into(), STREAM as u64, STREAM),
         ]
     );
-    assert_xattrs(&path, b"Hydrated", b"\"version-1\"");
+    engine.set_pin_state("file", PinState::Pinned).unwrap();
+    assert_xattrs(&path, b"Hydrated", b"pinned", b"\"version-1\"");
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(drive.range_requests().len(), 3);
 
@@ -181,7 +199,7 @@ fn exercise_mount(dir: &Path) {
     drive.set_content("file", new_bytes.clone());
     runtime.block_on(engine.sync()).unwrap();
     assert_eq!(fs::metadata(&path).unwrap().mtime(), file.mtime);
-    assert_xattrs(&path, b"Cloud-only", b"\"version-2\"");
+    assert_xattrs(&path, b"Cloud-only", b"pinned", b"\"version-2\"");
     handle.read_exact_at(&mut sniff, 0).unwrap();
     assert_eq!(sniff, new_bytes[..32768]);
     assert_eq!(
@@ -203,7 +221,7 @@ fn exercise_mount(dir: &Path) {
     mounted.join().unwrap();
 }
 
-fn assert_xattrs(path: &Path, state: &[u8], etag: &[u8]) {
+fn assert_xattrs(path: &Path, state: &[u8], pin: &[u8], etag: &[u8]) {
     let mut names: Vec<_> = xattr::list(path).unwrap().collect();
     names.sort();
     assert_eq!(
@@ -214,7 +232,7 @@ fn assert_xattrs(path: &Path, state: &[u8], etag: &[u8]) {
             "user.onedrive.state"
         ]
     );
-    for (name, expected) in [("state", state), ("pin", b"none"), ("etag", etag)] {
+    for (name, expected) in [("state", state), ("pin", pin), ("etag", etag)] {
         assert_eq!(
             xattr::get(path, format!("user.onedrive.{name}"))
                 .unwrap()

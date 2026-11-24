@@ -219,7 +219,8 @@ impl Engine {
             transaction.execute("UPDATE delta_checkpoint SET full_scan = 0", [])?;
         }
         transaction.commit()?;
-        self.cache.reclaim(&db)?;
+        drop(db);
+        self.reclaim_sparse_cache()?;
         Ok(complete)
     }
 

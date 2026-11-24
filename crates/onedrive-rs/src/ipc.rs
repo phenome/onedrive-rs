@@ -32,12 +32,15 @@ pub fn socket_path(runtime_dir: &Path) -> PathBuf {
 pub enum Request {
     Status {},
     Pin {
+        mount: PathBuf,
         path: MountPath,
     },
     Unpin {
+        mount: PathBuf,
         path: MountPath,
     },
     Purge {
+        mount: PathBuf,
         path: MountPath,
     },
     Sync {},

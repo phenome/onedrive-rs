@@ -17,6 +17,8 @@ use rustix::process::{Pid, Signal, kill_process};
 use serde_json::Value;
 
 const WORKER_DIR: &str = "ONEDRIVE_DAEMON_TEST_DIR";
+const LOOKUP_PATH: &str = "ONEDRIVE_DAEMON_TEST_LOOKUP";
+const LOOKUP_NOT_FOUND: i32 = 44;
 const STALL_DELTA: &str = "ONEDRIVE_DAEMON_TEST_STALL_DELTA";
 
 struct IsolatedCloud {
@@ -29,7 +31,9 @@ struct IsolatedCloud {
 impl CloudDrive for IsolatedCloud {
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
         if let DeltaRequest::Link(link) = &request {
-            fs::write(self.dir.join("resumed-cursor"), link).unwrap();
+            let temporary = self.dir.join("resumed-cursor.tmp");
+            fs::write(&temporary, link).unwrap();
+            fs::rename(temporary, self.dir.join("resumed-cursor")).unwrap();
         }
         if self.stall_delta || self.dir.join("stall-manual").exists() {
             assert!(
@@ -45,6 +49,9 @@ impl CloudDrive for IsolatedCloud {
         if self.dir.join("remote-delete-cached").exists() {
             fs::remove_file(self.dir.join("remote-delete-cached")).unwrap();
             self.fake.delete("cached");
+        }
+        if matches!(request, DeltaRequest::Link(_)) {
+            fs::write(self.dir.join("checked-deletion"), "").unwrap();
         }
         let page = self.fake.delta(request).await?;
         if let DeltaCursor::Complete(link) = &page.cursor {
@@ -360,6 +367,29 @@ fn mounted_daemon_lifecycle() {
     );
     assert!(mounted(&mount));
     assert_eq!(sandbox.cli("status")["result"]["sync_state"], "syncing");
+    let old_mount = sandbox.dir().join("run/onedrive");
+    for (operation, name) in [
+        ("pin", "absent.txt"),
+        ("unpin", "content.txt"),
+        ("purge", "content.txt"),
+    ] {
+        let reply = sandbox.cli_args(&[
+            "--mount-path",
+            old_mount.to_str().unwrap(),
+            operation,
+            old_mount.join(name).to_str().unwrap(),
+        ]);
+        assert_eq!(reply["ok"], false);
+        let error = reply["error"].as_str().unwrap();
+        assert!(error.contains("mount does not match"), "{error}");
+        assert!(error.contains(old_mount.to_str().unwrap()), "{error}");
+        assert!(error.contains(mount.to_str().unwrap()), "{error}");
+    }
+    assert_eq!(xattr(&mount.join("content.txt"), "pin"), "pinned");
+    assert_eq!(
+        sandbox.cli_args(&["unpin", mount.to_str().unwrap()])["ok"],
+        true
+    );
     assert!(catalog_directory.join("catalog.sqlite3").is_file());
     assert!(
         !sandbox
@@ -430,21 +460,39 @@ fn mounted_daemon_observes_remote_deletion_on_the_next_poll() {
         .spawn()
         .unwrap();
     wait_for(|| sandbox.dir().join("read-started").exists());
-    wait_for(|| sandbox.dir().join("resumed-cursor").exists());
-    // The first scheduled poll has found the persistent Pin. Even though its
-    // range request remains stalled, the following poll must apply this delta.
+    wait_for(|| sandbox.dir().join("checked-deletion").exists());
+    // The first continuation checked the trigger. A later poll must apply
+    // the deletion even though the Pin's range request is still stalled.
     fs::write(sandbox.dir().join("remote-delete-cached"), "").unwrap();
     wait_for(|| {
-        !bounded("test")
-            .arg("-e")
-            .arg(&cached)
-            .status()
-            .unwrap()
-            .success()
+        let status = bounded(std::env::current_exe().unwrap().to_str().unwrap())
+            .args(["--exact", "lookup_fixture", "--nocapture"])
+            .env(LOOKUP_PATH, &cached)
+            .output()
+            .unwrap();
+        match status.status.code() {
+            Some(0) => false,
+            Some(LOOKUP_NOT_FOUND) => true,
+            _ => panic!("cached file lookup failed: {status:?}"),
+        }
     });
     assert!(mounted(&sandbox.mount));
     sandbox.stop(Signal::TERM);
     assert!(!pin.wait().unwrap().success());
+}
+
+#[test]
+fn lookup_fixture() {
+    let Some(path) = std::env::var_os(LOOKUP_PATH) else {
+        return;
+    };
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::process::exit(LOOKUP_NOT_FOUND);
+        }
+        Err(error) => panic!("lookup failed: {error}"),
+    }
 }
 
 #[test]

@@ -77,7 +77,7 @@ async fn wire_requests_require_newline_and_canonical_mount_paths() {
         serve_connection(peer, async |request| {
             assert_eq!(
                 serde_json::to_value(request).unwrap(),
-                json!({"op": "pin", "path": "/folder/été photo.png"})
+                json!({"op": "pin", "mount": "/custom mount", "path": "/folder/été photo.png"})
             );
             Ok(Value::Null)
         })
@@ -88,16 +88,31 @@ async fn wire_requests_require_newline_and_canonical_mount_paths() {
         serde_json::from_str::<Value>(&line).unwrap()
     };
 
-    let reply = exchange("{\"op\":\"pin\",\"path\":\"/folder/été photo.png\"}\n".as_bytes()).await;
+    let reply = exchange(
+        "{\"op\":\"pin\",\"mount\":\"/custom mount\",\"path\":\"/folder/été photo.png\"}\n"
+            .as_bytes(),
+    )
+    .await;
     assert_eq!(reply, json!({"ok": true, "result": null}));
 
+    for op in ["pin", "unpin", "purge"] {
+        let reply = exchange(format!("{{\"op\":\"{op}\",\"path\":\"/\"}}\n").as_bytes()).await;
+        assert_eq!(reply["ok"], false);
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("missing field `mount`")
+        );
+    }
+
     for invalid in [
-        &b"{\"op\":\"pin\",\"path\":\"folder/file\"}\n"[..],
-        b"{\"op\":\"purge\",\"path\":\"/folder/../file\"}\n",
-        b"{\"op\":\"unpin\",\"path\":\"/folder//file\"}\n",
-        b"{\"op\":\"pin\",\"path\":\"/file/\"}\n",
-        b"{\"op\":\"pin\",\"path\":\"/./file\"}\n",
-        b"{\"op\":\"pin\",\"path\":\"/file\\u0000\"}\n",
+        &b"{\"op\":\"pin\",\"mount\":\"/custom mount\",\"path\":\"folder/file\"}\n"[..],
+        b"{\"op\":\"purge\",\"mount\":\"/custom mount\",\"path\":\"/folder/../file\"}\n",
+        b"{\"op\":\"unpin\",\"mount\":\"/custom mount\",\"path\":\"/folder//file\"}\n",
+        b"{\"op\":\"pin\",\"mount\":\"/custom mount\",\"path\":\"/file/\"}\n",
+        b"{\"op\":\"pin\",\"mount\":\"/custom mount\",\"path\":\"/./file\"}\n",
+        b"{\"op\":\"pin\",\"mount\":\"/custom mount\",\"path\":\"/file\\u0000\"}\n",
         b"{\"op\":\"pin\"}\n",
         b"{\"op\":\"status\",\"path\":\"/file\"}\n",
         b"{\"op\":\"rename\"}\n",
@@ -139,7 +154,7 @@ fn binding_and_cleanup_preserve_existing_files() {
 fn private_runtime() -> tempfile::TempDir {
     tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir()
+        .tempdir_in("/tmp")
         .unwrap()
 }
 
@@ -147,10 +162,20 @@ fn private_runtime() -> tempfile::TempDir {
 fn subprocess_socket_lifecycle() {
     use std::process::{Command, Stdio};
 
+    use rustix::process::{Pid, Signal, kill_process};
+
+    #[derive(Debug)]
+    enum Outcome {
+        Ready(Pid),
+        Busy,
+    }
+
     let runtime = private_runtime();
     let path = socket_path(runtime.path());
     let spawn_server = || {
-        Command::new(std::env::current_exe().unwrap())
+        Command::new("timeout")
+            .args(["-k", "1s", "5s"])
+            .arg(std::env::current_exe().unwrap())
             .args(["--exact", "socket_process_fixture", "--nocapture"])
             .env("ONEDRIVE_TEST_SOCKET", &path)
             .stdin(Stdio::piped())
@@ -160,36 +185,56 @@ fn subprocess_socket_lifecycle() {
     };
     let read_outcome = |child: &mut std::process::Child| {
         let mut line = String::new();
-        let mut reader = BufReader::new(child.stdout.take().unwrap());
-        let outcome = loop {
-            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-            if line.contains("socket fixture ready") {
-                break true;
+        let mut reader = BufReader::new(child.stdout.as_mut().unwrap());
+        while reader.read_line(&mut line).ok()? != 0 {
+            if let Some(pid) = line.trim().strip_prefix("socket fixture ready ") {
+                return Pid::from_raw(pid.parse().ok()?).map(Outcome::Ready);
             }
-            if line.contains("socket fixture busy") {
-                break false;
+            if line.trim() == "socket fixture busy" {
+                return Some(Outcome::Busy);
             }
             line.clear();
-        };
-        child.stdout = Some(reader.into_inner());
-        outcome
+        }
+        None
     };
+
     let mut first = spawn_server();
-    assert!(read_outcome(&mut first));
-    assert!(IpcServer::bind(&path).is_err());
-    assert!(UnixStream::connect(&path).is_ok());
-    first.kill().unwrap();
-    first.wait().unwrap();
+    let outcome = read_outcome(&mut first);
+    let connected = UnixStream::connect(&path).is_ok();
+    // Kill the fixture without running its cleanup. Its timeout wrapper still reaps it.
+    let killed = if let Some(Outcome::Ready(pid)) = outcome {
+        kill_process(pid, Signal::KILL).is_ok()
+    } else {
+        false
+    };
+    drop(first.stdin.take());
+    let status = first.wait().unwrap();
+    assert!(
+        killed && connected,
+        "fixture failed to start: {outcome:?} ({status})"
+    );
     assert!(path.exists());
 
     let mut restart = spawn_server();
     let mut competitor = spawn_server();
-    assert_ne!(read_outcome(&mut restart), read_outcome(&mut competitor));
-    assert!(UnixStream::connect(&path).is_ok());
-    for child in [&mut restart, &mut competitor] {
-        drop(child.stdin.take());
-        assert!(child.wait().unwrap().success());
-    }
+    let outcomes = [read_outcome(&mut restart), read_outcome(&mut competitor)];
+    let connected = UnixStream::connect(&path).is_ok();
+    drop(restart.stdin.take());
+    drop(competitor.stdin.take());
+    let statuses = [restart.wait().unwrap(), competitor.wait().unwrap()];
+    assert!(
+        matches!(
+            outcomes,
+            [Some(Outcome::Ready(_)), Some(Outcome::Busy)]
+                | [Some(Outcome::Busy), Some(Outcome::Ready(_))]
+        ),
+        "expected one ready fixture and one busy fixture, got {outcomes:?} ({statuses:?})"
+    );
+    assert!(connected);
+    assert!(
+        statuses.iter().all(|status| status.success()),
+        "{statuses:?}"
+    );
     assert!(!path.exists());
 }
 
@@ -200,7 +245,7 @@ fn socket_process_fixture() {
     };
     match IpcServer::bind(path.as_ref()) {
         Ok(server) => {
-            println!("socket fixture ready");
+            println!("socket fixture ready {}", std::process::id());
             std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
             drop(server);
         }

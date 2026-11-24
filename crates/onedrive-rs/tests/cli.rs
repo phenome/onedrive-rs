@@ -7,13 +7,19 @@ use onedrive_rs::ipc::{IpcServer, Request, serve_connection, socket_path};
 use serde_json::{Value, json};
 
 fn cli(runtime: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_onedrive-rs"))
+    let output = Command::new("timeout")
+        .args(["-k", "1s", "5s", env!("CARGO_BIN_EXE_onedrive-rs")])
         .current_dir(runtime)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", runtime.join("config"))
         .args(args)
         .output()
-        .unwrap()
+        .unwrap();
+    assert!(
+        !matches!(output.status.code(), Some(124 | 137)),
+        "CLI timed out: {output:?}"
+    );
+    output
 }
 
 #[test]
@@ -96,22 +102,23 @@ fn control_commands_dispatch_to_the_socket_and_preserve_errors() {
         {"path": "/draft.txt", "sync_state": "dirty"},
         {"path": "/conflict.txt", "sync_state": "conflict"}
     ]);
+    let default_mount = runtime.path().join("onedrive");
     let commands = [
         (
             vec!["pin", "onedrive/photos/a b.png"],
-            json!({"op":"pin", "path":"/photos/a b.png"}),
+            json!({"op":"pin", "mount":default_mount, "path":"/photos/a b.png"}),
             Value::Null,
             "Pin completed",
         ),
         (
             vec!["unpin", "onedrive"],
-            json!({"op":"unpin", "path":"/"}),
+            json!({"op":"unpin", "mount":default_mount, "path":"/"}),
             Value::Null,
             "Unpin completed",
         ),
         (
             vec!["purge", "onedrive/clean.txt"],
-            json!({"op":"purge", "path":"/clean.txt"}),
+            json!({"op":"purge", "mount":default_mount, "path":"/clean.txt"}),
             Value::Null,
             "Purge completed",
         ),
@@ -145,7 +152,7 @@ fn control_commands_dispatch_to_the_socket_and_preserve_errors() {
         server,
         |request| {
             let request = serde_json::to_value(request).unwrap();
-            if request == json!({"op":"purge", "path":"/dirty.txt"}) {
+            if request == json!({"op":"purge", "mount":mount, "path":"/dirty.txt"}) {
                 purges += 1;
                 return Err("Cannot purge a Dirty item".into());
             }
@@ -259,6 +266,6 @@ fn argument_and_transport_failures_produce_structured_errors() {
 fn private_runtime() -> tempfile::TempDir {
     tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir()
+        .tempdir_in("/tmp")
         .unwrap()
 }

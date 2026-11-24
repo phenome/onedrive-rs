@@ -151,11 +151,11 @@ def perform_action(location, operation, status, emblem):
         f"{operation} socket reply",
         lambda: next(
             (event for event in events()[previous:]
-             if event[:3] == ["reply", operation, f"/media/{POSITIVE}"]),
+             if event[:4] == ["reply", operation, str(MOUNT), f"/media/{POSITIVE}"]),
             None,
         ),
     )
-    assert reply[3] is None, reply
+    assert reply[4] is None, reply
     wait_for(f"{operation} status and emblem refresh", observed)
     state, pin = status.split(":")
     assert os.getxattr(VIEW / POSITIVE, "user.onedrive.state") == state.encode()

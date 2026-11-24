@@ -13,7 +13,7 @@ use onedrive_graph::GraphDrive;
 use rustix::fs::{FlockOperation, flock};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{Mutex, Notify, Semaphore, watch};
+use tokio::sync::{Mutex, MutexGuard, Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
@@ -275,17 +275,14 @@ impl DeltaSync {
         }
     }
 
-    async fn sync(&self, background: bool) -> Result<(), String> {
-        let Ok(mut result) = self.last_result.try_lock() else {
-            return if background {
-                Ok(())
-            } else {
-                Err("OneDrive delta sync is already running".into())
-            };
-        };
-        if background && self.poll_state.borrow().paused {
-            return Ok(());
-        }
+    async fn sync(
+        &self,
+        mut result: MutexGuard<'_, SyncState>,
+        background: bool,
+    ) -> Result<(), String> {
+        // Status reports Syncing while the lock is held. If IPC cancels a
+        // manual sync, dropping the guard publishes this fallback.
+        *result = SyncState::Error;
         let synced = async {
             self.engine.sync_catalog().await?;
             self.hydration_requested.notify_one();
@@ -306,12 +303,15 @@ impl DeltaSync {
     async fn poll(&self, period: Duration) {
         let mut state = self.poll_state.subscribe();
         loop {
-            let resume_count = state
-                .wait_for(|state| !state.paused)
-                .await
-                .unwrap()
-                .resume_count;
-            if let Err(error) = self.sync(true).await {
+            state.wait_for(|state| !state.paused).await.unwrap();
+            // Keep a poll pending while a manual sync is draining uploads.
+            let result = self.last_result.lock().await;
+            let current = *state.borrow_and_update();
+            if current.paused {
+                continue;
+            }
+            let resume_count = current.resume_count;
+            if let Err(error) = self.sync(result, true).await {
                 eprintln!("OneDrive delta sync failed ({error})");
             }
             let next = Instant::now() + period;
@@ -383,7 +383,18 @@ impl DeltaSync {
         serde_json::to_value(uploads).map_err(|error| error.to_string())
     }
 
-    fn resolve_item(&self, path: &MountPath) -> Result<String, String> {
+    fn validate_mount(&self, mount: &Path) -> Result<(), String> {
+        if mount != self.mount {
+            return Err(format!(
+                "OneDrive mount does not match this daemon: requested {mount:?}, running at {:?}",
+                self.mount
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_item(&self, mount: &Path, path: &MountPath) -> Result<String, String> {
+        self.validate_mount(mount)?;
         self.engine
             .resolve_path(path.as_str())
             .map_err(|error| error.to_string())?
@@ -425,7 +436,13 @@ impl DeltaSync {
                 })
                 .map_err(|error| error.to_string())
             }
-            Request::Sync {} => self.sync(false).await.map(|()| Value::Null),
+            Request::Sync {} => {
+                let result = self
+                    .last_result
+                    .try_lock()
+                    .map_err(|_| "OneDrive delta sync is already running")?;
+                self.sync(result, false).await.map(|()| Value::Null)
+            }
             Request::Pause {} | Request::Resume {} => {
                 self.poll_state.send_if_modified(|state| {
                     let paused = matches!(request, Request::Pause {});
@@ -440,22 +457,22 @@ impl DeltaSync {
                 });
                 Ok(Value::Null)
             }
-            Request::Pin { path } => {
+            Request::Pin { mount, path } => {
                 self.engine
-                    .pin(&self.resolve_item(&path)?)
+                    .pin(&self.resolve_item(&mount, &path)?)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(Value::Null)
             }
-            Request::Unpin { path } => {
+            Request::Unpin { mount, path } => {
                 self.engine
-                    .unpin(&self.resolve_item(&path)?)
+                    .unpin(&self.resolve_item(&mount, &path)?)
                     .map_err(|error| error.to_string())?;
                 Ok(Value::Null)
             }
-            Request::Purge { path } => {
+            Request::Purge { mount, path } => {
                 self.engine
-                    .purge(&self.resolve_item(&path)?)
+                    .purge(&self.resolve_item(&mount, &path)?)
                     .map_err(|error| error.to_string())?;
                 Ok(Value::Null)
             }
@@ -465,9 +482,7 @@ impl DeltaSync {
                 epoch,
                 since,
             } => {
-                if mount != self.mount {
-                    return Err("OneDrive mount does not match this daemon".into());
-                }
+                self.validate_mount(&mount)?;
                 let changes = self
                     .engine
                     .desktop_changes(epoch.as_deref(), since)
@@ -499,6 +514,97 @@ mod tests {
         async fn sleep(&self, duration: Duration) {
             tokio::time::sleep(duration).await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canceled_manual_sync_reports_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cloud = Arc::new(FakeCloudDrive::new(10));
+        let sync = test_scheduler(dir.path(), cloud.clone());
+        sync.dispatch(Request::Sync {}).await.unwrap();
+        assert_eq!(
+            sync.dispatch(Request::Status {}).await.unwrap()["sync_state"],
+            "idle"
+        );
+
+        let retry_after = Duration::from_secs(30);
+        cloud.fail_after(0, onedrive_core::CloudError::Throttled { retry_after });
+        let canceled =
+            tokio::time::timeout(Duration::from_secs(1), sync.dispatch(Request::Sync {})).await;
+        assert!(canceled.is_err());
+        assert_eq!(cloud.requests().len(), 2);
+        assert_eq!(
+            sync.dispatch(Request::Status {}).await.unwrap()["sync_state"],
+            "error"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_refresh_waits_for_manual_sync_to_release_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cloud = Arc::new(FakeCloudDrive::new(10));
+        let sync = test_scheduler(dir.path(), cloud.clone());
+        let mut poller = std::pin::pin!(sync.poll(Duration::from_secs(60)));
+        sync.dispatch(Request::Pause {}).await.unwrap();
+
+        // Simulate the lock held by manual Sync after its catalog phase.
+        let manual_sync = sync.last_result.lock().await;
+        sync.dispatch(Request::Resume {}).await.unwrap();
+        tokio::select! {
+            biased;
+            _ = &mut poller => panic!("poller exited"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(cloud.requests().is_empty());
+        drop(manual_sync);
+
+        tokio::select! {
+            biased;
+            _ = &mut poller => panic!("poller exited"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(cloud.requests().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pause_allows_active_delta_pass_to_finish_after_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let cloud = Arc::new(FakeCloudDrive::new(10));
+        let sync = test_scheduler(dir.path(), cloud.clone());
+        let retry_after = Duration::from_secs(30);
+        cloud.fail_after(0, onedrive_core::CloudError::Throttled { retry_after });
+
+        let poller = async {
+            sync.poll(Duration::from_secs(60)).await;
+            panic!("poller exited");
+        };
+        let check = async {
+            assert_eq!(cloud.requests().len(), 1);
+            sync.dispatch(Request::Pause {}).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            assert_eq!(cloud.requests().len(), 1);
+            tokio::time::sleep(Duration::from_secs(16)).await;
+            assert_eq!(cloud.requests().len(), 2);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            assert_eq!(cloud.requests().len(), 2);
+        };
+        tokio::select! {
+            biased;
+            _ = poller => unreachable!(),
+            _ = check => {}
+        }
+    }
+
+    fn test_scheduler(dir: &Path, cloud: Arc<FakeCloudDrive>) -> DeltaSync {
+        let engine = Engine::open_with_config(
+            dir.join("catalog"),
+            dir.join("cache"),
+            cloud,
+            Arc::new(PollClock(Instant::now())),
+            Config::default(),
+        )
+        .unwrap();
+        DeltaSync::new(Arc::new(engine), dir.join("mount"))
     }
 
     #[tokio::test(start_paused = true)]

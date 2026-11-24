@@ -33,12 +33,12 @@ def observe_menu(self, files):
     return items
 
 
-def observe_request(socket_path, operation, path, complete):
+def observe_request(socket_path, operation, mount, path, complete):
     def observed_reply(error):
-        record("reply", operation, path, error)
+        record("reply", operation, os.fspath(mount), path, error)
         complete(error)
 
-    native_request(socket_path, operation, path, observed_reply)
+    native_request(socket_path, operation, mount, path, observed_reply)
 
 
 request = observe_request

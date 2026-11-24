@@ -20,13 +20,17 @@ socket from the opened directory.
 | Request | Successful `result` |
 | --- | --- |
 | `{"op":"status"}` | Object with `sync_state` (string), `unpinned_cache_bytes`, `pinned_cache_bytes`, `pending_upload_count` (nonnegative integers), `free_disk_floor_warning` and `paused` (booleans) |
-| `{"op":"pin","path":"/folder/file"}` | `null` |
-| `{"op":"unpin","path":"/folder/file"}` | `null` |
-| `{"op":"purge","path":"/folder/file"}` | `null` |
+| `{"op":"pin","mount":"/absolute/mount","path":"/folder/file"}` | `null` |
+| `{"op":"unpin","mount":"/absolute/mount","path":"/folder/file"}` | `null` |
+| `{"op":"purge","mount":"/absolute/mount","path":"/folder/file"}` | `null` |
 | `{"op":"sync"}` | `null` |
 | `{"op":"uploads"}` | Array of entries with `path` and `sync_state` strings, for example `[{"path":"/draft.txt","sync_state":"dirty"}]` |
 | `{"op":"pause"}` | `null` |
 | `{"op":"resume"}` | `null` |
+
+Pin, Unpin, and Purge require the expected absolute UTF-8 mount path in
+`mount`. If it differs from the daemon’s mount, the daemon rejects the request
+before looking up the item and reports both mount paths.
 
 A wire path starts at the OneDrive mount root. Use `/` for the root itself.
 Paths are UTF-8 and exclude empty components, `.`, `..`, trailing slashes
@@ -85,8 +89,10 @@ namespace under `$XDG_CACHE_HOME/onedrive-rs` (default `~/.cache/onedrive-rs`).
 Delta sync runs on startup and then every `delta_poll_interval_secs`, measured
 from the completion of the previous metadata pass. Pinned content downloads run independently, so a slow download can span several polls. The default is 60 seconds.
 `pause` prevents new background delta passes and suspends the upload worker.
-An active delta pass can finish. `sync` can run while paused and drains pending
-uploads after a successful delta pass. `resume` wakes both workers. SIGINT and
+An active background delta pass can finish, including retries after a
+throttle deadline. `sync` can run while paused and drains pending uploads after
+a successful delta pass. `resume` wakes both workers. If a manual sync is still
+running, the resumed catalog refresh waits for it to finish. SIGINT and
 SIGTERM end requests in flight, unmount the filesystem, and remove the socket.
 Committed delta pages, dirty staging, and cache files survive the restart.
 The daemon can adopt an earlier unscoped catalog from

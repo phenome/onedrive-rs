@@ -81,6 +81,116 @@ fn live_offline_save_restart_and_recycle() {
     supervise_mount("live_offline_save_restart_and_recycle", exercise_writeback);
 }
 
+#[test]
+fn live_cold_write_restart_and_reconnect() {
+    supervise_mount(
+        "live_cold_write_restart_and_reconnect",
+        exercise_cold_writeback,
+    );
+}
+
+fn exercise_cold_writeback(dir: &Path) {
+    use std::fs::OpenOptions;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mount = dir.join("mount");
+    let path = mount.join("cold");
+    let drive = Arc::new(FakeCloudDrive::new(10));
+    for (id, kind, parent, size) in [
+        ("root", ItemKind::Folder, None, 0),
+        (
+            "cold",
+            ItemKind::File,
+            Some("root".into()),
+            (2 * STREAM) as u64,
+        ),
+    ] {
+        drive.upsert(RemoteItem {
+            item_id: id.into(),
+            parent_id: parent,
+            name: Some(id.into()),
+            kind,
+            size,
+            mtime: 100,
+            etag: Some("base".into()),
+            ctag: Some("content".into()),
+            quickxor_hash: None,
+        });
+    }
+    let original: Vec<u8> = (0..2 * STREAM).map(|i| (i % 251) as u8).collect();
+    drive.set_content("cold", original.clone());
+    let open =
+        || Arc::new(Engine::open(dir.join("db"), drive.clone(), Arc::new(SystemClock)).unwrap());
+    let engine = open();
+    runtime.block_on(engine.sync()).unwrap();
+    drive.set_online(false);
+
+    let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
+        .mount(&mount)
+        .unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.write_all_at(b"edit", 31).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"tail")
+        .unwrap();
+    file.sync_all().unwrap();
+    let mut actual = [0; 4];
+    file.read_exact_at(&mut actual, 31).unwrap();
+    assert_eq!(&actual, b"edit");
+    assert!(drive.range_requests().is_empty());
+    let item = engine.item("cold").unwrap().unwrap();
+    assert_eq!(item.sync_state, SyncState::Dirty);
+    assert!(matches!(
+        engine.check_purge("cold"),
+        Err(EngineError::PendingUpload { .. })
+    ));
+    drop(file);
+    unmount(&mount, session);
+    drop(engine);
+
+    let engine = open();
+    let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
+        .mount(&mount)
+        .unwrap();
+    let file = File::open(&path).unwrap();
+    file.read_exact_at(&mut actual, 31).unwrap();
+    assert_eq!(&actual, b"edit");
+    file.read_exact_at(&mut actual, original.len() as u64)
+        .unwrap();
+    assert_eq!(&actual, b"tail");
+    assert!(drive.range_requests().is_empty());
+    drive.set_online(true);
+    let worker = runtime.spawn(Engine::run_upload_worker(Arc::downgrade(&engine)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while engine.item("cold").unwrap().unwrap().sync_state != SyncState::Clean {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    worker.abort();
+    assert!(
+        drive
+            .range_requests()
+            .iter()
+            .all(|(_, _, request)| *request <= STREAM)
+    );
+    let mut expected = original;
+    expected[31..35].copy_from_slice(b"edit");
+    expected.extend_from_slice(b"tail");
+    assert_eq!(fs::read(&path).unwrap(), expected);
+    assert_eq!(engine.item("cold").unwrap().unwrap().inode, item.inode);
+    drop(file);
+    unmount(&mount, session);
+}
+
 fn supervise_mount(test: &str, exercise: fn(&Path)) {
     if let Some(dir) = std::env::var_os(WORKER_DIR) {
         exercise(Path::new(&dir));

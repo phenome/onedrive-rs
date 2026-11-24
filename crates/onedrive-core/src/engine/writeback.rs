@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -53,6 +54,11 @@ impl Writeback {
                 fs::remove_file(entry.path())?;
             }
         }
+        tx.execute(
+            "DELETE FROM writeback_bases WHERE stage NOT IN
+             (SELECT stage FROM writeback_queue WHERE stage IS NOT NULL)",
+            [],
+        )?;
         tx.commit()?;
         Ok(Self {
             root,
@@ -65,20 +71,17 @@ impl Writeback {
     fn stage(
         &self,
         previous: Option<&str>,
-        prefix: &[u8],
         size: u64,
         write: Option<(u64, &[u8])>,
     ) -> Result<tempfile::NamedTempFile, EngineError> {
-        let mut file = tempfile::Builder::new()
+        let file = tempfile::Builder::new()
             .prefix("stage-")
             .tempfile_in(&self.root)?;
         if let Some(previous) = previous {
             let old = File::open(self.root.join(previous))?;
             if rustix::fs::ioctl_ficlone(file.as_file(), &old).is_err() {
-                io::copy(&mut old.take(size), &mut file)?;
+                copy_sparse(&old, file.as_file(), size)?;
             }
-        } else {
-            file.write_all(prefix)?;
         }
         file.as_file().set_len(size)?;
         if let Some((offset, bytes)) = write {
@@ -94,6 +97,193 @@ impl Writeback {
             // A failed cleanup can be retried on the next open.
             let _ = fs::remove_file(self.root.join(name));
         }
+    }
+}
+
+fn copy_sparse(mut old: &File, mut new: &File, size: u64) -> io::Result<()> {
+    let limit = size.min(old.metadata()?.len());
+    let mut offset = 0;
+    while offset < limit {
+        let start = match rustix::fs::seek(old, rustix::fs::SeekFrom::Data(offset)) {
+            Ok(start) if start < limit => start,
+            Ok(_) | Err(rustix::io::Errno::NXIO) => break,
+            Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP) => {
+                old.seek(SeekFrom::Start(offset))?;
+                new.seek(SeekFrom::Start(offset))?;
+                io::copy(&mut old.take(limit - offset), &mut new)?;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let end = rustix::fs::seek(old, rustix::fs::SeekFrom::Hole(start))?.min(limit);
+        old.seek(SeekFrom::Start(start))?;
+        new.seek(SeekFrom::Start(start))?;
+        io::copy(&mut old.take(end - start), &mut new)?;
+        offset = end;
+    }
+    Ok(())
+}
+
+struct Base {
+    item_id: String,
+    etag: Option<String>,
+    ctag: Option<String>,
+    cache_generation: Option<i64>,
+    missing: Vec<Range<u64>>,
+}
+
+impl Base {
+    fn load(db: &Connection, stage: &str) -> rusqlite::Result<Option<Self>> {
+        let Some(mut base) = db.query_row(
+            "SELECT item_id, etag, ctag, cache_generation FROM writeback_bases WHERE stage = ?1",
+            [stage],
+            |row| Ok(Self {
+                item_id: row.get(0)?,
+                etag: row.get(1)?,
+                ctag: row.get(2)?,
+                cache_generation: row.get(3)?,
+                missing: Vec::new(),
+            }),
+        ).optional()? else { return Ok(None) };
+        base.missing = db
+            .prepare(
+                "SELECT start, end FROM writeback_missing_ranges WHERE stage = ?1 ORDER BY start",
+            )?
+            .query_map([stage], |row| Ok(row.get(0)?..row.get(1)?))?
+            .collect::<Result<_, _>>()?;
+        Ok(Some(base))
+    }
+
+    fn edit(&mut self, size: u64, write: Option<(u64, &[u8])>) {
+        let overwritten = write.map(|(offset, bytes)| offset..offset + bytes.len() as u64);
+        self.missing = self
+            .missing
+            .drain(..)
+            .flat_map(|range| {
+                let end = size.min(range.end);
+                let (left, right) = match &overwritten {
+                    Some(write) => (
+                        range.start..end.min(write.start),
+                        range.start.max(write.end)..end,
+                    ),
+                    None => (range.start..end, 0..0),
+                };
+                [left, right].into_iter().filter(|part| !part.is_empty())
+            })
+            .collect();
+    }
+
+    fn save(&self, db: &Connection, stage: &str) -> rusqlite::Result<()> {
+        db.execute(
+            "INSERT INTO writeback_bases VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                stage,
+                self.item_id,
+                self.etag,
+                self.ctag,
+                self.cache_generation
+            ],
+        )?;
+        let mut insert = db.prepare("INSERT INTO writeback_missing_ranges VALUES (?1, ?2, ?3)")?;
+        for range in &self.missing {
+            insert.execute(params![stage, range.start, range.end])?;
+        }
+        Ok(())
+    }
+
+    async fn fill(
+        &self,
+        engine: &Engine,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), EngineError> {
+        let end = offset + output.len() as u64;
+        let first = self.missing.partition_point(|range| range.end <= offset);
+        for range in &self.missing[first..] {
+            let start = range.start.max(offset);
+            let stop = range.end.min(end);
+            if start >= stop {
+                break;
+            }
+            self.fetch(
+                engine,
+                start,
+                &mut output[(start - offset) as usize..(stop - offset) as usize],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn fetch(
+        &self,
+        engine: &Engine,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), EngineError> {
+        let end = offset + output.len() as u64;
+        let mut start = offset;
+        while start < end {
+            let filled = if let Some(generation) = self.cache_generation {
+                engine.read_verified_cache(
+                    generation,
+                    self.etag.as_deref(),
+                    self.ctag.as_deref(),
+                    start,
+                    &mut output[(start - offset) as usize..(end - offset) as usize],
+                )?
+            } else {
+                0
+            };
+            if filled > 0 {
+                start += filled as u64;
+                continue;
+            }
+            let length = (end - start).min(super::sparse_cache::STREAM_BYTES) as usize;
+            let bytes = engine
+                .cloud
+                .read_range_at_version(
+                    &self.item_id,
+                    self.etag.as_deref(),
+                    self.ctag.as_deref(),
+                    start,
+                    length,
+                )
+                .await
+                .map_err(|err| match err {
+                    CloudError::Conflict | CloudError::NotFound | CloudError::Unsupported => {
+                        EngineError::OriginalVersionUnavailable
+                    }
+                    other => other.into(),
+                })?;
+            if bytes.len() != length {
+                return Err(EngineError::InvalidRange);
+            }
+            let position = (start - offset) as usize;
+            output[position..position + length].copy_from_slice(&bytes);
+            start += length as u64;
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct Stage {
+    file: File,
+    base: Option<Base>,
+}
+
+impl Stage {
+    pub(super) async fn read(
+        &self,
+        engine: &Engine,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), EngineError> {
+        self.file.read_exact_at(output, offset)?;
+        if let Some(base) = &self.base {
+            base.fill(engine, offset, output).await?;
+        }
+        Ok(())
     }
 }
 
@@ -126,14 +316,6 @@ fn job(db: &Connection, inode: u64) -> rusqlite::Result<Option<Job>> {
         },
     )
     .optional()
-}
-
-fn same_content_version(before: &CatalogItem, after: &CatalogItem) -> bool {
-    before.item_id == after.item_id
-        && before.size == after.size
-        && before.etag == after.etag
-        && before.ctag == after.ctag
-        && before.mtime == after.mtime
 }
 
 fn enqueue_existing(tx: &Transaction<'_>, item: &CatalogItem) -> rusqlite::Result<()> {
@@ -303,113 +485,85 @@ impl Engine {
             return Ok(());
         }
         self.edit(inode, Some((offset, bytes, append)), None)
-            .await
             .map(|_| ())
     }
 
     pub async fn truncate(&self, inode: u64, size: u64) -> Result<CatalogItem, EngineError> {
-        self.edit(inode, None, Some(size)).await
+        self.edit(inode, None, Some(size))
     }
 
-    async fn edit(
+    fn edit(
         &self,
         inode: u64,
         write: Option<(u64, &[u8], bool)>,
         truncate: Option<u64>,
     ) -> Result<CatalogItem, EngineError> {
-        loop {
-            let (before, previous) = {
-                let db = self.db();
-                (
-                    item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?,
-                    job(&db, inode)?,
-                )
-            };
-            if before.kind == ItemKind::Folder {
+        let (current, previous) = self.update_catalog(|tx| {
+            let current = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
+            if current.kind == ItemKind::Folder {
                 return Err(EngineError::IsDirectory);
             }
-            let write_at = write
-                .map(|(offset, bytes, append)| (if append { before.size } else { offset }, bytes));
+            let write_at = write.map(|(offset, bytes, append)|
+                (if append { current.size } else { offset }, bytes));
             let size = if let Some((offset, bytes)) = write_at {
-                before.size.max(
-                    offset
-                        .checked_add(bytes.len() as u64)
-                        .ok_or(EngineError::InvalidMutation)?,
-                )
+                current.size.max(offset.checked_add(bytes.len() as u64).ok_or(EngineError::InvalidMutation)?)
             } else {
                 truncate.expect("edit is a write or truncate")
             };
             if size > i64::MAX as u64 {
                 return Err(EngineError::InvalidMutation);
             }
-            let stage = previous.as_ref().and_then(|job| job.stage.as_deref());
-            let overwritten = write_at
-                .is_some_and(|(offset, bytes)| offset == 0 && bytes.len() as u64 >= before.size);
-            let keep = before.size.min(size);
-            let needs_base = stage.is_none() && keep != 0 && !overwritten;
-            let prefix = if needs_base {
-                let read = self
-                    .read(
-                        inode,
-                        0,
-                        keep.try_into().map_err(|_| EngineError::InvalidMutation)?,
-                    )
-                    .await?;
-                Some(read)
+            enqueue_existing(tx, &current)?;
+            let queued = job(tx, inode)?.ok_or(EngineError::NotFound)?;
+            let mut base = if let Some(stage) = &queued.stage {
+                Base::load(tx, stage)?
+            } else if let Some(item_id) = queued.remote_id.filter(|_| current.size != 0) {
+                Some(Base {
+                    item_id,
+                    etag: current.etag,
+                    ctag: current.ctag,
+                    cache_generation: super::sparse_cache::generation_for(tx, inode)?,
+                    missing: std::iter::once(0..current.size).collect(),
+                })
             } else {
                 None
             };
-
-            let Some(current) = self.update_catalog(|tx| {
-                let current = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
-                let current_job = job(tx, inode)?;
-                if !same_content_version(&before, &current)
-                    || previous.as_ref().map(|job| job.generation)
-                        != current_job.as_ref().map(|job| job.generation)
-                {
-                    return Ok(None);
-                }
-                if prefix
-                    .as_ref()
-                    .is_some_and(|bytes| bytes.len() as u64 != keep)
-                {
-                    return Err(EngineError::InvalidRange);
-                }
-                enqueue_existing(tx, &current)?;
-                let file = self.writeback.stage(
-                    stage,
-                    prefix.as_deref().unwrap_or_default(),
-                    size,
-                    write_at,
-                )?;
-                let name = file.path().file_name().unwrap().to_str().unwrap();
-                tx.execute(
-                    "UPDATE writeback_queue SET stage = ?2, generation = generation + 1 WHERE inode = ?1",
-                    params![inode, name],
-                )?;
-                tx.execute(
-                    "UPDATE items SET size = ?2, mtime = ?3, last_accessed_at = ?4,
-                     sync_state = CASE WHEN sync_state = 3 THEN 3 ELSE 1 END WHERE inode = ?1",
-                    params![inode, size, self.write_time(), self.access_time()],
-                )?;
-                tx.execute(
-                    "UPDATE local_attributes SET mtime = NULL WHERE inode = ?1",
-                    [inode],
-                )?;
-                tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [inode])?;
-                let current = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
-                // Disarm automatic unlink before committing a reference to this file.
-                let (_file, _path) = file.keep().map_err(|err| err.error)?;
-                tx.execute("INSERT INTO changed_inodes VALUES (?1, 1)", [inode])?;
-                Ok(Some(current))
-            })? else { continue };
-            if let Some(stage) = stage {
-                self.retire_unused_stage(stage)?;
+            if let Some(base) = &mut base {
+                base.edit(size, write_at);
             }
-            let _ = self.reclaim_sparse_cache();
-            self.writeback.changed.notify_one();
-            return Ok(current);
+            let file = self.writeback.stage(queued.stage.as_deref(), size, write_at)?;
+            let name = file.path().file_name().unwrap().to_str().unwrap();
+            let base = base.filter(|base| !base.missing.is_empty());
+            if let Some(base) = &base {
+                base.save(tx, name)?;
+                tx.execute("INSERT INTO sparse_preserve_on_move VALUES (?1)", [inode])?;
+            }
+            tx.execute(
+                "UPDATE writeback_queue SET stage = ?2, generation = generation + 1 WHERE inode = ?1",
+                params![inode, name],
+            )?;
+            tx.execute(
+                "UPDATE items SET size = ?2, mtime = ?3, last_accessed_at = ?4,
+                 sync_state = CASE WHEN sync_state = 3 THEN 3 ELSE 1 END WHERE inode = ?1",
+                params![inode, size, self.write_time(), self.access_time()],
+            )?;
+            tx.execute("UPDATE local_attributes SET mtime = NULL WHERE inode = ?1", [inode])?;
+            if base.is_some() {
+                tx.execute("DELETE FROM sparse_preserve_on_move WHERE inode = ?1", [inode])?;
+            } else {
+                tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [inode])?;
+            }
+            let current = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
+            // Disarm automatic unlink before committing a reference to this file.
+            file.keep().map_err(|err| err.error)?;
+            tx.execute("INSERT INTO changed_inodes VALUES (?1, 1)", [inode])?;
+            Ok((current, queued.stage))
+        })?;
+        if let Some(stage) = previous {
+            self.retire_unused_stage(&stage)?;
         }
+        self.writeback.changed.notify_one();
+        Ok(current)
     }
 
     fn retire_unused_stage(&self, stage: &str) -> Result<(), EngineError> {
@@ -421,6 +575,7 @@ impl Engine {
             |row| row.get(0),
         )?;
         if !referenced {
+            db.execute("DELETE FROM writeback_bases WHERE stage = ?1", [stage])?;
             self.writeback.retire(Some(stage));
         }
         Ok(())
@@ -430,7 +585,7 @@ impl Engine {
         &self,
         db: &Connection,
         inode: u64,
-    ) -> Result<Option<File>, EngineError> {
+    ) -> Result<Option<Stage>, EngineError> {
         let stage = db
             .query_row(
                 "SELECT stage FROM writeback_queue WHERE inode = ?1",
@@ -439,9 +594,14 @@ impl Engine {
             )
             .optional()?
             .flatten();
-        Ok(stage
-            .map(|name| File::open(self.writeback.root.join(name)))
-            .transpose()?)
+        stage
+            .map(|name| {
+                Ok(Stage {
+                    file: File::open(self.writeback.root.join(&name))?,
+                    base: Base::load(db, &name)?,
+                })
+            })
+            .transpose()
     }
 
     /// Refuse Purge while there is local work queued for this item.
@@ -533,17 +693,28 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn open_file(&self, inode: u64) -> Result<(), EngineError> {
+    pub(crate) fn open_file(&self, inode: u64, writable: bool) -> Result<bool, EngineError> {
         let db = self.db();
         let item = item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?;
         if item.kind != ItemKind::File {
             return Err(EngineError::IsDirectory);
         }
-        if job(&db, inode)?.is_some_and(|job| job.deleted) {
+        let queued = job(&db, inode)?;
+        if queued.as_ref().is_some_and(|job| job.deleted) {
             return Err(EngineError::NotFound);
         }
+        let stage = queued.as_ref().and_then(|job| job.stage.as_deref());
+        let sparse = if let Some(stage) = stage {
+            db.query_row(
+                "SELECT EXISTS (SELECT 1 FROM writeback_bases WHERE stage = ?1)",
+                [stage],
+                |row| row.get(0),
+            )?
+        } else {
+            writable && item.size != 0 && !super::sparse_cache::is_hydrated(&db, &item)?
+        };
         self.register_open(inode);
-        Ok(())
+        Ok(sparse)
     }
 
     fn register_open(&self, inode: u64) {
@@ -606,7 +777,12 @@ impl Engine {
                 );
             let missing_update = matches!(&result, Err(EngineError::Cloud(CloudError::NotFound)))
                 && matches!(work.action, Action::Upload);
-            if result.is_ok() && !matches!(work.action, Action::CreateFolder | Action::CreateFile) {
+            if result.is_ok()
+                && !matches!(
+                    work.action,
+                    Action::CreateFolder | Action::CreateFile | Action::Assemble
+                )
+            {
                 completed += 1;
             }
             let result = if conflict || missing_update {
@@ -622,7 +798,11 @@ impl Engine {
                         CloudError::Throttled { .. } | CloudError::Authentication,
                     ),
                 ) => return Err(error),
-                Err(error @ (EngineError::Cloud(_) | EngineError::CacheIo(_))) => {
+                Err(
+                    error @ (EngineError::Cloud(_)
+                    | EngineError::CacheIo(_)
+                    | EngineError::OriginalVersionUnavailable),
+                ) => {
                     skipped.insert(work.item.inode);
                     first_error.get_or_insert(error);
                 }
@@ -755,6 +935,17 @@ impl Engine {
                     _ => Action::Acknowledge,
                 }
             };
+            let action = if matches!(action, Action::Upload | Action::CreateFile)
+                && saved.is_none()
+                && tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM writeback_bases WHERE stage = ?1)",
+                    [queued.stage.as_deref()],
+                    |row| row.get::<_, bool>(0),
+                )? {
+                Action::Assemble
+            } else {
+                action
+            };
             let replay = saved.is_some() || saved_move.is_some();
             let move_attempt = if matches!(action, Action::Move) && saved_move.is_none() {
                 Some(save_move(&tx, &item, item.parent_id.as_deref(), false)?)
@@ -861,6 +1052,7 @@ impl Engine {
             Action::CreateFolder | Action::CreateFile | Action::Upload => {
                 self.dispatch_attempt(work).await?
             }
+            Action::Assemble => return self.assemble_stage(work).await,
             Action::Move => return self.dispatch_move(work).await,
             Action::Acknowledge => return self.acknowledge(work, None, false),
         };
@@ -974,6 +1166,75 @@ impl Engine {
         Ok(())
     }
 
+    async fn assemble_stage(&self, work: &Work) -> Result<(), EngineError> {
+        let previous = work
+            .queued
+            .stage
+            .as_deref()
+            .ok_or(EngineError::InvalidMutation)?;
+        let (base, file) = {
+            let db = self.db();
+            let current = job(&db, work.item.inode)?.ok_or(EngineError::NotFound)?;
+            if current.stage != work.queued.stage || current.deleted {
+                return Ok(());
+            }
+            let base = Base::load(&db, previous)?.ok_or(EngineError::InvalidMutation)?;
+            (
+                base,
+                self.writeback.stage(Some(previous), work.item.size, None)?,
+            )
+        };
+
+        let mut buffer = vec![0; super::sparse_cache::STREAM_BYTES as usize];
+        for range in &base.missing {
+            let mut start = range.start;
+            while start < range.end {
+                let length = (range.end - start).min(buffer.len() as u64) as usize;
+                if let Err(error) = base.fetch(self, start, &mut buffer[..length]).await {
+                    if matches!(error, EngineError::OriginalVersionUnavailable) {
+                        self.update_catalog(|tx| {
+                            if tx.execute(
+                                "UPDATE items SET sync_state = 3 WHERE inode = ?1
+                                 AND EXISTS (SELECT 1 FROM writeback_queue
+                                    WHERE inode = ?1 AND stage = ?2 AND NOT deleted)",
+                                params![work.item.inode, previous],
+                            )? != 0
+                            {
+                                tx.execute(
+                                    "INSERT INTO changed_inodes VALUES (?1, 0)",
+                                    [work.item.inode],
+                                )?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    return Err(error);
+                }
+                file.as_file().write_all_at(&buffer[..length], start)?;
+                start += length as u64;
+            }
+        }
+        file.as_file().sync_all()?;
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        self.update_catalog(|tx| {
+            if tx.execute(
+                "UPDATE writeback_queue SET stage = ?3 WHERE inode = ?1 AND stage = ?2 AND NOT deleted",
+                params![work.item.inode, previous, name],
+            )? != 0 {
+                file.keep().map_err(|error| error.error)?;
+            }
+            Ok(())
+        })?;
+        self.retire_unused_stage(previous)?;
+        Ok(())
+    }
+
     async fn dispatch_attempt(&self, work: &Work) -> Result<RemoteItem, EngineError> {
         let attempt = work.attempt.as_ref().ok_or(EngineError::InvalidMutation)?;
         let target = if let Some(id) = &attempt.remote_id {
@@ -1014,6 +1275,18 @@ impl Engine {
         } else {
             None
         };
+        if let (Some(etag), Some(ctag)) = (etag, work.item.ctag.as_deref()) {
+            match self.cloud.upload_destination(target).await {
+                Ok(Some(remote))
+                    if remote.etag.as_deref() == Some(etag)
+                        && remote.ctag.as_deref() != Some(ctag) =>
+                {
+                    return Err(CloudError::Conflict.into());
+                }
+                Ok(_) | Err(CloudError::Unsupported) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         if work.replay
             && let Some(remote) = self.cloud.confirm_upload(target, source, etag).await?
         {
@@ -1080,7 +1353,9 @@ impl Engine {
             tx.execute("DELETE FROM items WHERE inode = ?1", [work.item.inode])?;
             Ok(stage)
         })?;
-        self.writeback.retire(stage.as_deref());
+        if let Some(stage) = stage {
+            self.retire_unused_stage(&stage)?;
+        }
         self.reclaim_sparse_cache()?;
         Ok(())
     }
@@ -1134,11 +1409,11 @@ impl Engine {
                     params![inode, attempted_stage],
                 )?;
             }
-            let completed = if let Some(remote) = remote {
+            let completed = if let Some(remote) = &remote {
                 let (parent, name) = (remote.parent_id.as_deref(), remote.name.as_deref());
                 if matches!(work.action, Action::CreateFolder | Action::CreateFile)
                     || work.move_attempt.as_ref().is_some_and(|attempt| {
-                        attempt.temporary && attempt.matches_path(&remote)
+                        attempt.temporary && attempt.matches_path(remote)
                     })
                 {
                     tx.execute(
@@ -1149,7 +1424,7 @@ impl Engine {
                 let replacement_base = work.attempt.as_ref().and_then(|attempt| attempt.etag.as_deref())
                     .or_else(|| {
                         work.move_attempt.as_ref()
-                            .filter(|attempt| !observed_move || attempt.same_version(&remote))
+                            .filter(|attempt| !observed_move || attempt.same_version(remote))
                             .and_then(|attempt| attempt.etag.as_deref())
                     });
                 if let Some(base) = replacement_base {
@@ -1219,6 +1494,14 @@ impl Engine {
                 tx.execute_batch("SAVEPOINT cache_uploaded_content")?;
                 if self.cache.retain_upload(directory, tx, inode, current.size, &source).is_err() {
                     tx.execute_batch("ROLLBACK TO cache_uploaded_content")?;
+                } else if let Some(remote) = &remote {
+                    tx.execute(
+                        "INSERT INTO sparse_range_versions
+                         SELECT ranges.generation, ranges.block, ?2, ?3 FROM sparse_ranges AS ranges
+                         JOIN sparse_files AS files ON ranges.generation = files.generation
+                         WHERE files.inode = ?1",
+                        params![inode, remote.etag, remote.ctag],
+                    )?;
                 }
                 tx.execute_batch("RELEASE cache_uploaded_content")?;
             }
@@ -1258,6 +1541,7 @@ fn queued_items(db: &Connection) -> Result<Vec<CatalogItem>, EngineError> {
 }
 
 enum Action {
+    Assemble,
     Delete,
     CreateFolder,
     CreateFile,

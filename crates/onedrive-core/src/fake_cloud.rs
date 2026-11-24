@@ -390,6 +390,32 @@ impl CloudDrive for FakeCloudDrive {
         bytes.range(start, end)
     }
 
+    async fn read_range_at_version(
+        &self,
+        item_id: &str,
+        etag: Option<&str>,
+        ctag: Option<&str>,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        tokio::task::yield_now().await;
+        let mut state = self.state.lock().unwrap();
+        state.range_requests.push((item_id.into(), offset, length));
+        state.online()?;
+        let item = state.items.get(item_id).ok_or(CloudError::NotFound)?;
+        if (etag.is_none() && ctag.is_none())
+            || etag.is_some_and(|tag| item.etag.as_deref() != Some(tag))
+            || ctag.is_some_and(|tag| item.ctag.as_deref() != Some(tag))
+        {
+            return Err(CloudError::Conflict);
+        }
+        let bytes = state.contents.get(item_id).ok_or(CloudError::Unavailable)?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        bytes.range(start, start.saturating_add(length).min(bytes.len()))
+    }
+
     async fn list_thumbnails(&self, folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
         tokio::task::yield_now().await;
         let mut state = self.state.lock().unwrap();

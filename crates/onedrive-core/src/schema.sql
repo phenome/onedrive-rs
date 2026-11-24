@@ -164,3 +164,28 @@ CREATE TABLE IF NOT EXISTS writeback_moves (
     ctag TEXT,
     temporary INTEGER NOT NULL
 );
+
+-- An immutable stage with missing ranges refers to one original cloud version.
+CREATE TABLE IF NOT EXISTS writeback_bases (
+    stage TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL,
+    etag TEXT,
+    ctag TEXT,
+    cache_generation INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS writeback_missing_ranges (
+    stage TEXT NOT NULL REFERENCES writeback_bases(stage) ON DELETE CASCADE,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    PRIMARY KEY (stage, start)
+);
+
+CREATE TABLE IF NOT EXISTS sparse_range_versions (
+    generation INTEGER NOT NULL,
+    block INTEGER NOT NULL,
+    etag TEXT,
+    ctag TEXT,
+    PRIMARY KEY (generation, block),
+    FOREIGN KEY (generation, block) REFERENCES sparse_ranges(generation, block) ON DELETE CASCADE
+);

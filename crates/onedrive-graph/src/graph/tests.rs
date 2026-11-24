@@ -61,9 +61,11 @@ async fn graph_range_populates_engine_sparse_cache() {
         .and(path("/v1.0/me/drive/items/file"))
         .and(header("authorization", "Bearer synthetic-access"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "eTag": "item-1",
+            "cTag": "content-1",
             "@microsoft.graph.downloadUrl": format!("{}/content?sig=temporary", cdn.uri())
         })))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -100,7 +102,7 @@ async fn graph_range_populates_engine_sparse_cache() {
         engine.read(inode, 40000, 123).await.unwrap(),
         bytes[40000..40123]
     );
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
     assert_eq!(cdn.received_requests().await.unwrap().len(), 1);
 }
 
@@ -643,6 +645,54 @@ async fn conditional_move_sends_acknowledged_etag_and_maps_precondition_failure(
     assert_eq!(
         graph
             .move_if_match("item", "folder", "final", r#""acknowledged""#)
+            .await,
+        Err(CloudError::Conflict)
+    );
+}
+
+#[tokio::test]
+async fn versioned_range_rejects_bytes_if_the_item_changes_during_download() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let server = MockServer::start().await;
+    let cdn = MockServer::start().await;
+    let graph = mock_graph(&server);
+    let metadata_requests = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/drive/items/file"))
+        .respond_with({
+            let url = format!("{}/content", cdn.uri());
+            move |_: &wiremock::Request| {
+                let tag = if metadata_requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                    "original"
+                } else {
+                    "changed"
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "eTag": tag,
+                    "cTag": tag,
+                    "@microsoft.graph.downloadUrl": url,
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/content"))
+        .and(header("range", "bytes=1-2"))
+        .and(anonymous)
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 1-2/4")
+                .set_body_bytes(b"xx"),
+        )
+        .expect(1)
+        .mount(&cdn)
+        .await;
+    assert_eq!(
+        graph
+            .read_range_at_version("file", Some("original"), Some("original"), 1, 2)
             .await,
         Err(CloudError::Conflict)
     );

@@ -22,6 +22,18 @@ pub trait CloudDrive: Send + Sync {
         Err(CloudError::Unsupported)
     }
 
+    /// Read a range whose source is verified against the supplied version.
+    async fn read_range_at_version(
+        &self,
+        _item_id: &str,
+        _etag: Option<&str>,
+        _ctag: Option<&str>,
+        _offset: u64,
+        _length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
     async fn list_thumbnails(&self, _folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
         Err(CloudError::Unsupported)
     }

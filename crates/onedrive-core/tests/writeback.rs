@@ -67,7 +67,10 @@ async fn conditional_upload_preserves_remote_and_local_versions() {
     let engine = Engine::open(dir.path().join("db"), drive.clone(), Arc::new(SystemClock)).unwrap();
     engine.sync().await.unwrap();
     let editor = engine.item("document").unwrap().unwrap().inode;
+    assert_eq!(engine.read(editor, 0, 4).await.unwrap(), b"base");
+    let calls = drive.range_requests();
     engine.write(editor, 1, b"EDIT", false).await.unwrap();
+    assert_eq!(drive.range_requests(), calls);
 
     remote.etag = Some("new-remote".into());
     remote.ctag = Some("content-2".into());
@@ -891,4 +894,127 @@ async fn interrupted_cycle_move_is_recovered_before_publishing_either_file() {
         assert_eq!(remote.name.as_deref(), path.strip_prefix('/'));
     }
     assert!(engine.pending_uploads().unwrap().is_empty());
+}
+
+fn cloud_file(size: u64) -> RemoteItem {
+    RemoteItem {
+        item_id: "cold".into(),
+        parent_id: Some("root".into()),
+        name: Some("cold".into()),
+        kind: ItemKind::File,
+        size,
+        mtime: 100,
+        etag: Some("base".into()),
+        ctag: Some("content".into()),
+        quickxor_hash: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_multigib_edit_is_sparse_and_concurrent_appends_survive_restart() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let drive = drive();
+    let original_size = 3 * 1024 * 1024 * 1024;
+    // The fake only needs the prefix that survives the later truncate.
+    drive.upsert(cloud_file(original_size));
+    drive.set_content("cold", b"ABCD".to_vec());
+    let engine = Arc::new(Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap());
+    engine.sync().await.unwrap();
+    let inode = engine.item("cold").unwrap().unwrap().inode;
+    drive.set_online(false);
+    engine.write(inode, 1, b"xy", false).await.unwrap();
+    let append = |bytes| {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.write(inode, 0, bytes, true).await.unwrap() })
+    };
+    let left = append(b"L");
+    let right = append(b"R");
+    left.await.unwrap();
+    right.await.unwrap();
+    assert!(drive.range_requests().is_empty());
+    let stage = std::fs::read_dir(db.with_added_extension("staging"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .metadata()
+        .unwrap();
+    assert_eq!(stage.len(), original_size + 2);
+    assert!(stage.blocks() * 512 < 128 * 1024);
+    drop(engine);
+
+    let engine = Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    assert_eq!(engine.read(inode, 1, 2).await.unwrap(), b"xy");
+    let tail = engine.read(inode, original_size, 2).await.unwrap();
+    assert!(tail == b"LR" || tail == b"RL");
+    engine.truncate(inode, 4).await.unwrap();
+    engine.truncate(inode, 12).await.unwrap();
+    assert_eq!(engine.read(inode, 4, 8).await.unwrap(), [0; 8]);
+    assert!(drive.range_requests().is_empty());
+
+    drive.set_online(true);
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+    assert_eq!(
+        drive.range_requests(),
+        [("cold".into(), 0, 1), ("cold".into(), 3, 1)]
+    );
+    assert_eq!(
+        engine.read(inode, 0, 12).await.unwrap(),
+        b"AxyD\0\0\0\0\0\0\0\0"
+    );
+}
+
+#[tokio::test]
+async fn missing_cold_base_retains_local_extents_without_using_newer_remote_bytes() {
+    use onedrive_core::{CloudDrive, EngineError};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let drive = drive();
+    let mut remote = cloud_file(4);
+    drive.upsert(remote.clone());
+    drive.set_content("cold", b"base".to_vec());
+    let engine = Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    engine.sync().await.unwrap();
+    let inode = engine.item("cold").unwrap().unwrap().inode;
+    engine.write(inode, 1, b"XY", false).await.unwrap();
+    assert!(drive.range_requests().is_empty());
+
+    // A cTag mismatch alone rejects bytes even if the eTag has not changed.
+    remote.ctag = Some("new-content".into());
+    drive.upsert(remote.clone());
+    drive.set_content("cold", b"peer".to_vec());
+    assert!(matches!(
+        engine.drain_uploads().await,
+        Err(EngineError::OriginalVersionUnavailable)
+    ));
+    assert_eq!(
+        engine.pending_uploads().unwrap()[0].sync_state,
+        SyncState::Conflict
+    );
+    drop(engine);
+
+    let engine = Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    assert_eq!(engine.read(inode, 1, 2).await.unwrap(), b"XY");
+    assert!(matches!(
+        engine.read(inode, 0, 4).await,
+        Err(EngineError::OriginalVersionUnavailable)
+    ));
+    assert_eq!(drive.read_range("cold", 0, 4).await.unwrap(), b"peer");
+
+    // Completing the stage locally can recover a full Conflict Copy.
+    remote.etag = Some("new-base".into());
+    drive.upsert(remote);
+    engine.write(inode, 0, b"A", false).await.unwrap();
+    engine.write(inode, 3, b"D", false).await.unwrap();
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+    assert_eq!(engine.read(inode, 0, 4).await.unwrap(), b"AXYD");
+    assert_eq!(drive.read_range("cold", 0, 4).await.unwrap(), b"peer");
+    assert_eq!(
+        engine.getattr(inode).unwrap().unwrap().sync_state,
+        SyncState::Conflict
+    );
 }

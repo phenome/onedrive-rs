@@ -285,7 +285,7 @@ impl Engine {
         length: usize,
     ) -> Result<Vec<u8>, EngineError> {
         loop {
-            let (item, generation) = {
+            let (item, stage, generation) = {
                 let mut db = self.db();
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let item = super::item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
@@ -295,19 +295,23 @@ impl Engine {
                 if offset >= item.size || length == 0 {
                     return Ok(Vec::new());
                 }
-                if let Some(stage) = self.open_stage(&tx, inode)? {
-                    let end = offset.saturating_add(length as u64).min(item.size);
-                    let mut bytes = vec![0; (end - offset) as usize];
-                    stage.read_exact_at(&mut bytes, offset)?;
-                    return Ok(bytes);
-                }
-                let generation = allocate_generation(&tx, inode)?;
+                let stage = self.open_stage(&tx, inode)?;
+                let generation = if stage.is_none() {
+                    Some(allocate_generation(&tx, inode)?)
+                } else {
+                    None
+                };
                 tx.commit()?;
-                (item, generation)
+                (item, stage, generation)
             };
 
             let end = offset.saturating_add(length as u64).min(item.size);
             let mut result = vec![0; (end - offset) as usize];
+            if let Some(stage) = stage {
+                stage.read(self, offset, &mut result).await?;
+                return Ok(result);
+            }
+            let generation = generation.expect("clean read has a cache generation");
             let kind = if offset == 0 && length as u64 <= HEADER_BYTES {
                 ReadKind::Header
             } else {
@@ -330,6 +334,44 @@ impl Engine {
                 }
             }
         }
+    }
+
+    pub(super) fn read_verified_cache(
+        &self,
+        generation: i64,
+        etag: Option<&str>,
+        ctag: Option<&str>,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, EngineError> {
+        let stream = Block::Stream(offset / STREAM_BYTES * STREAM_BYTES);
+        let db = self.db();
+        for block in [stream, Block::Header] {
+            if offset >= block.offset() + block.capacity() {
+                continue;
+            }
+            let verified = db.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sparse_range_versions
+                    WHERE generation = ?1 AND block = ?2 AND etag IS ?3 AND ctag IS ?4)",
+                params![generation, block.key(), etag, ctag],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if verified
+                && let Some(stamp) = block_stamp(&db, generation, block)?
+                && let Some(file) = self.cache.open_block(generation, block, &stamp)?
+            {
+                let start = offset - block.offset();
+                let length =
+                    (file.metadata()?.len().saturating_sub(start) as usize).min(output.len());
+                if length > 0
+                    && file.read_exact_at(&mut output[..length], start).is_ok()
+                    && matches_stamp(&file, &stamp)?
+                {
+                    return Ok(length);
+                }
+            }
+        }
+        Ok(0)
     }
 
     pub(super) async fn read_generation(
@@ -389,10 +431,29 @@ impl Engine {
             if kind == ReadKind::Pin {
                 self.check_hydration_space(block.capacity().min(item.size - block.offset()))?;
             }
-            let bytes = self
-                .cloud
-                .read_range(&item.item_id, block.offset(), block.capacity() as usize)
-                .await;
+            let offset = block.offset();
+            let length = block.capacity() as usize;
+            let versioned = if item.etag.is_some() || item.ctag.is_some() {
+                self.cloud
+                    .read_range_at_version(
+                        &item.item_id,
+                        item.etag.as_deref(),
+                        item.ctag.as_deref(),
+                        offset,
+                        length,
+                    )
+                    .await
+            } else {
+                Err(crate::CloudError::Unsupported)
+            };
+            let bytes = match versioned {
+                Err(crate::CloudError::Unsupported) => self
+                    .cloud
+                    .read_range(&item.item_id, offset, length)
+                    .await
+                    .map(|bytes| (bytes, false)),
+                result => result.map(|bytes| (bytes, true)),
+            };
             match self.publish_block(item, generation, block, kind, bytes)? {
                 ReadOutcome::Retired => return Ok(ReadOutcome::Retired),
                 ReadOutcome::Downloaded => downloaded = true,
@@ -418,10 +479,10 @@ impl Engine {
         generation: i64,
         block: Block,
         kind: ReadKind,
-        bytes: Result<Vec<u8>, crate::CloudError>,
+        bytes: Result<(Vec<u8>, bool), crate::CloudError>,
     ) -> Result<ReadOutcome, EngineError> {
         let directory = self.cache.lock_disk()?;
-        let bytes = {
+        let (bytes, verified) = {
             let mut db = self.db();
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if !generation_is_current(&tx, item, generation, kind)? {
@@ -430,7 +491,7 @@ impl Engine {
             if block_stamp(&tx, generation, block)?.is_some() {
                 return Ok(ReadOutcome::Cached);
             }
-            let bytes = bytes?;
+            let (bytes, verified) = bytes?;
             let expected = block.capacity().min(item.size - block.offset()) as usize;
             if kind == ReadKind::Pin {
                 self.check_hydration_space(expected as u64)?;
@@ -445,7 +506,7 @@ impl Engine {
                 params![generation, block.key()],
             )?;
             tx.commit()?;
-            bytes
+            (bytes, verified)
         };
         let result = (|| {
             self.cache.remove_pending(generation, block)?;
@@ -465,6 +526,12 @@ impl Engine {
                 "INSERT INTO sparse_range_files VALUES (?1, ?2, ?3)",
                 params![generation, block.key(), stamp],
             )?;
+            if verified {
+                tx.execute(
+                    "INSERT INTO sparse_range_versions VALUES (?1, ?2, ?3, ?4)",
+                    params![generation, block.key(), item.etag, item.ctag],
+                )?;
+            }
             self.touch_generation(&tx, generation)?;
             forget_pending(&tx, generation, block)?;
             tx.commit()?;
@@ -610,7 +677,11 @@ fn generation_is_current(
         return Ok(false);
     }
     if kind != ReadKind::Pin {
-        return Ok(true);
+        return db.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM writeback_queue WHERE inode = ?1 AND stage IS NOT NULL)",
+            [item.inode],
+            |row| row.get(0),
+        );
     }
     let clean = db
         .query_row(

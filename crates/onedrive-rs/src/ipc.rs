@@ -53,6 +53,17 @@ impl TryFrom<String> for MountPath {
     }
 }
 
+/// Result payload for a successful status request.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Status {
+    pub sync_state: String,
+    pub unpinned_cache_bytes: u64,
+    pub pinned_cache_bytes: u64,
+    pub free_disk_floor_warning: bool,
+    pub pending_upload_count: u64,
+    pub paused: bool,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
     Success(Value),

@@ -328,6 +328,7 @@ impl GraphDrive {
         if !current.matches_destination(target)
             || current.id != item.id
             || current.etag != item.etag
+            || current.ctag != item.ctag
         {
             return Err(CloudError::Unavailable);
         }

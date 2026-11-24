@@ -252,38 +252,44 @@ async fn mount_read(cdn: &MockServer, route: &str, byte: &str) {
 async fn ambiguous_simple_upload_requires_current_destination_and_complete_bytes() {
     for (first, second, content, expected) in [
         (
-            Some(("file", "after")),
-            Some(("file", "after")),
+            Some(("file", "after", "same-content")),
+            Some(("file", "after", "same-content")),
             "sent",
             Ok("after"),
         ),
+        (
+            Some(("file", "after", "uploaded-content")),
+            Some(("file", "after", "peer-content")),
+            "sent",
+            Err(CloudError::Unavailable),
+        ),
         (None, None, "", Err(CloudError::Unavailable)),
         (
-            Some(("other", "after")),
+            Some(("other", "after", "same-content")),
             None,
             "",
             Err(CloudError::Unavailable),
         ),
         (
-            Some(("file", "before")),
+            Some(("file", "before", "same-content")),
             None,
             "",
             Err(CloudError::Unavailable),
         ),
         (
-            Some(("file", "after")),
-            Some(("file", "later")),
+            Some(("file", "after", "same-content")),
+            Some(("file", "later", "same-content")),
             "sent",
             Err(CloudError::Unavailable),
         ),
         (
-            Some(("file", "after")),
+            Some(("file", "after", "same-content")),
             None,
             "sent!",
             Err(CloudError::Unavailable),
         ),
         (
-            Some(("file", "after")),
+            Some(("file", "after", "same-content")),
             None,
             "sen",
             Err(CloudError::Unavailable),
@@ -306,9 +312,9 @@ async fn ambiguous_simple_upload_requires_current_destination_and_complete_bytes
             vec![first]
         };
         for version in variants {
-            let reply = if let Some((id, etag)) = version {
+            let reply = if let Some((id, etag, ctag)) = version {
                 ResponseTemplate::new(200).set_body_json(json!({
-                    "id": id, "size": 4, "eTag": etag, "file": {},
+                    "id": id, "size": 4, "eTag": etag, "cTag": ctag, "file": {},
                     "@microsoft.graph.downloadUrl": format!("{}/committed", cdn.uri())
                 }))
             } else {

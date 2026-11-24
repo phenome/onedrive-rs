@@ -95,6 +95,7 @@ async fn graph_range_populates_engine_sparse_cache() {
     engine.sync().await.unwrap();
     let inode = engine.lookup("root", "photo.png").unwrap().unwrap().inode;
     assert_eq!(engine.read(inode, 0, 32768).await.unwrap(), bytes[..32768]);
+    let metadata_requests = server.received_requests().await.unwrap().len();
     drop(engine);
 
     let engine = open();
@@ -102,7 +103,10 @@ async fn graph_range_populates_engine_sparse_cache() {
         engine.read(inode, 40000, 123).await.unwrap(),
         bytes[40000..40123]
     );
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        metadata_requests
+    );
     assert_eq!(cdn.received_requests().await.unwrap().len(), 1);
 }
 

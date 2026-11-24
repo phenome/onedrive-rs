@@ -113,7 +113,8 @@ pub trait CloudDrive: Send + Sync {
             .upload_destination(target)
             .await?
             .ok_or(CloudError::Unavailable)?;
-        if current.item_id != item.item_id || current.etag != item.etag {
+        if current.item_id != item.item_id || current.etag != item.etag || current.ctag != item.ctag
+        {
             return Err(CloudError::Unavailable);
         }
         if matches {

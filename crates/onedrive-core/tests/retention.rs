@@ -184,6 +184,13 @@ async fn purge_folder_is_atomic_on_pending_upload_then_clears_descendant_pins() 
         assert_eq!(engine.pin_state(id).unwrap(), PinState::None);
         assert_eq!(state(&engine, id), "Cloud-only");
     }
+    let namespace = std::fs::read_dir(fixture.temp.path().join("cache"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(std::fs::read_dir(namespace).unwrap().count(), 0);
     let requests = fixture.drive.range_requests().len();
     assert_eq!(
         engine.read(inode(&engine, "dirty"), 0, 10).await.unwrap(),
@@ -360,9 +367,22 @@ async fn failed_full_hydration_retry_keeps_low_disk_warning() {
     ));
     assert!(engine.cache_status().unwrap().hydration_paused_low_disk);
 
-    // Fail before the free disk check by removing the previously cached header.
-    let mut files = std::fs::read_dir(fixture.temp.path().join("cache")).unwrap();
-    std::fs::remove_file(files.next().unwrap().unwrap().path()).unwrap();
+    // Opening a socket as a cached range produces an I/O error before the disk check.
+    let namespace = std::fs::read_dir(fixture.temp.path().join("cache"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let generation = std::fs::read_dir(namespace)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let header = generation.join("-1");
+    std::fs::remove_file(&header).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(header).unwrap();
     assert!(matches!(engine.sync().await, Err(EngineError::CacheIo(_))));
     assert!(engine.cache_status().unwrap().hydration_paused_low_disk);
 

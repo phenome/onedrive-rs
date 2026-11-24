@@ -118,9 +118,7 @@ async fn ctag_and_mtime_changes_each_retire_cached_bytes() {
         drive.set_content("file", vec![byte; bytes.len()]);
         engine.sync().await.unwrap();
         assert_eq!(
-            std::fs::read_dir(temp.path().join("cache"))
-                .unwrap()
-                .count(),
+            std::fs::read_dir(cache_namespace(&temp)).unwrap().count(),
             0
         );
         assert_eq!(
@@ -284,4 +282,191 @@ async fn pin_drops_an_in_flight_download_when_a_local_upload_becomes_pending() {
         engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
         b"Dirty"
     );
+}
+
+fn cache_namespace(temp: &TempDir) -> std::path::PathBuf {
+    std::fs::read_dir(temp.path().join("cache"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+}
+
+#[tokio::test]
+async fn catalogs_sharing_a_cache_root_never_share_bytes_or_reclamation() {
+    let (temp, first_drive, first, inode, authentic) = setup(8192).await;
+    assert_eq!(
+        first.read(inode, 0, authentic.len()).await.unwrap(),
+        authentic
+    );
+    let second_drive = Arc::new(FakeCloudDrive::new(100));
+    second_drive.upsert(RemoteItem {
+        item_id: "root".into(),
+        parent_id: None,
+        name: Some("root".into()),
+        kind: ItemKind::Folder,
+        ..fixture_file(0)
+    });
+    let mut remote = fixture_file(authentic.len());
+    second_drive.upsert(remote.clone());
+    let other = vec![171; authentic.len()];
+    second_drive.set_content("file", other.clone());
+    let second = Engine::open_with_cache(
+        temp.path().join("other.db"),
+        temp.path().join("cache"),
+        second_drive.clone(),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    second.sync().await.unwrap();
+    assert_eq!(
+        second.lookup("root", "file.bin").unwrap().unwrap().inode,
+        inode
+    );
+    assert_eq!(second.read(inode, 0, other.len()).await.unwrap(), other);
+    remote.ctag = Some("content-2".into());
+    second_drive.upsert(remote);
+    second.sync().await.unwrap();
+    drop(first);
+    assert_eq!(
+        open(&temp, &first_drive)
+            .read(inode, 0, authentic.len())
+            .await
+            .unwrap(),
+        authentic
+    );
+    assert_eq!(first_drive.range_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn missing_or_truncated_range_retires_coverage_and_recovers_authentic_bytes() {
+    let (temp, drive, mut engine, inode, bytes) = setup(STREAM + 200).await;
+    for (restart, remove, query_state_first) in [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        assert_eq!(engine.read(inode, 0, bytes.len()).await.unwrap(), bytes);
+        let directory = std::fs::read_dir(cache_namespace(&temp))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let damaged = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| std::fs::metadata(path).unwrap().len() == STREAM as u64)
+            .unwrap();
+        if remove {
+            std::fs::remove_file(damaged).unwrap();
+        } else {
+            let handle = std::fs::OpenOptions::new()
+                .write(true)
+                .open(damaged)
+                .unwrap();
+            handle.set_len(1).unwrap();
+            // A later extension creates holes and restores the original size.
+            if restart {
+                handle.set_len(STREAM as u64).unwrap();
+            }
+        }
+        if restart {
+            drop(engine);
+            engine = open(&temp, &drive);
+        }
+        if query_state_first {
+            assert_eq!(
+                engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+                b"Cloud-only"
+            );
+        }
+        let requests = drive.range_requests().len();
+        assert_eq!(engine.read(inode, 0, 32768).await.unwrap(), bytes[..32768]);
+        assert_eq!(
+            drive.range_requests()[requests..],
+            [("file".into(), 0, HEADER)]
+        );
+        assert!(!directory.exists());
+        assert_eq!(
+            engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+            b"Cloud-only"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_reclaims_an_installed_range_without_published_coverage() {
+    let (temp, drive, engine, inode, bytes) = setup(STREAM + 200).await;
+    assert_eq!(engine.read(inode, 0, 32768).await.unwrap(), bytes[..32768]);
+    drop(engine);
+
+    let db = rusqlite::Connection::open(temp.path().join("metadata.db")).unwrap();
+    let generation: i64 = db
+        .query_row(
+            "SELECT generation FROM sparse_files WHERE inode = ?1",
+            [inode],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let block = STREAM as i64;
+    db.execute(
+        "INSERT INTO sparse_pending VALUES (?1, ?2)",
+        [generation, block],
+    )
+    .unwrap();
+    let directory = cache_namespace(&temp).join(format!("{generation}.sparse"));
+    let abandoned = directory.join(block.to_string());
+    std::fs::write(&abandoned, vec![187; 200]).unwrap();
+    drop(db);
+
+    let engine = open(&temp, &drive);
+    assert!(!abandoned.exists());
+    assert_eq!(engine.read(inode, 0, 32768).await.unwrap(), bytes[..32768]);
+    assert_eq!(drive.range_requests(), [("file".into(), 0, HEADER)]);
+    assert_eq!(
+        engine.read(inode, STREAM as u64, 200).await.unwrap(),
+        bytes[STREAM..]
+    );
+    assert_eq!(drive.range_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn sync_recovers_damaged_content_for_an_existing_pin() {
+    let (temp, drive, engine, inode, bytes) = setup(8192).await;
+    engine
+        .set_pin_state("file", onedrive_core::PinState::Pinned)
+        .unwrap();
+    // Fill through a read so this test does not depend on the host's free-disk floor.
+    engine.read(inode, 0, bytes.len()).await.unwrap();
+
+    let generation = std::fs::read_dir(cache_namespace(&temp))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(generation.join("-1")).unwrap();
+    let engine = Engine::open_with_config(
+        temp.path().join("metadata.db"),
+        temp.path().join("cache"),
+        drive.clone(),
+        Arc::new(SystemClock),
+        onedrive_core::Config {
+            min_free_disk_bytes: 0,
+            ..onedrive_core::Config::default()
+        },
+    )
+    .unwrap();
+    engine.sync().await.unwrap();
+
+    assert!(!generation.exists());
+    assert_eq!(
+        engine.cache_status().unwrap().pinned_bytes,
+        bytes.len() as u64
+    );
+    assert_eq!(engine.read(inode, 0, bytes.len()).await.unwrap(), bytes);
+    assert_eq!(drive.range_requests().len(), 2);
 }

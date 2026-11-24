@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::sparse_cache::{
     HAS_COMPLETE_CONTENT, HEADER_BYTES, ReadKind, ReadOutcome, STREAM_BYTES, allocate_generation,
-    is_hydrated,
+    generation_for, is_hydrated,
 };
 use super::{
     CatalogItem, Clock, Engine, EngineError, ItemKind, PinState, SyncState, item_by_id,
@@ -48,12 +48,15 @@ impl Engine {
         let db = self.db();
         let item = item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?;
         let value = match name {
-            "user.onedrive.state" => match item.sync_state {
-                SyncState::Conflict => "Conflict",
-                SyncState::Dirty | SyncState::Uploading => "Dirty",
-                SyncState::Clean if content_is_hydrated(&db, &item)? => "Hydrated",
-                SyncState::Clean => "Cloud-only",
-            },
+            "user.onedrive.state" => {
+                drop(db);
+                match item.sync_state {
+                    SyncState::Conflict => "Conflict",
+                    SyncState::Dirty | SyncState::Uploading => "Dirty",
+                    SyncState::Clean if self.content_is_hydrated(&item)? => "Hydrated",
+                    SyncState::Clean => "Cloud-only",
+                }
+            }
             "user.onedrive.pin" => match effective_pin(&db, &item.item_id)? {
                 PinState::None => "none",
                 PinState::Pinned => "pinned",
@@ -81,39 +84,49 @@ impl Engine {
 
     /// Retire all cached bytes and explicit pins in a clean subtree.
     pub fn purge(&self, item_id: &str) -> Result<(), EngineError> {
-        let mut db = self.db();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let item = item_by_id(&tx, item_id)?.ok_or(EngineError::NotFound)?;
-        let protected = tx
-            .prepare_cached(&format!(
-                "{SUBTREE} SELECT i.item_id, i.sync_state FROM items i JOIN subtree USING (item_id)
-             WHERE i.sync_state <> 0 ORDER BY i.sync_state, i.inode LIMIT 1",
-            ))?
-            .query_row([item_id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?;
-        if let Some((item_id, state)) = protected {
-            return Err(match state {
-                SyncState::Conflict => EngineError::UnresolvedConflict { item_id },
-                _ => EngineError::PendingUpload { item_id },
-            });
-        }
+        self.update_catalog(|tx| {
+            let item = item_by_id(tx, item_id)?.ok_or(EngineError::NotFound)?;
+            let protected = tx
+                .prepare_cached(&format!(
+                    "{SUBTREE} SELECT i.item_id, i.sync_state FROM items i JOIN subtree USING (item_id)
+                 WHERE i.sync_state <> 0 ORDER BY i.sync_state, i.inode LIMIT 1",
+                ))?
+                .query_row([item_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if let Some((item_id, state)) = protected {
+                return Err(match state {
+                    SyncState::Conflict => EngineError::UnresolvedConflict { item_id },
+                    _ => EngineError::PendingUpload { item_id },
+                });
+            }
 
-        let pin = unpin_directive(&tx, item.parent_id.as_deref())?;
-        tx.execute(
-            &format!(
-                "{SUBTREE} DELETE FROM sparse_files WHERE inode IN (
-                SELECT inode FROM items JOIN subtree USING (item_id)
-            )"
-            ),
-            [item_id],
-        )?;
-        tx.execute(
-            &format!("{SUBTREE} DELETE FROM pin_directives WHERE item_id IN (SELECT item_id FROM subtree)"),
-            [item_id],
-        )?;
-        write_pin(&tx, item_id, pin)?;
-        tx.commit()?;
-        self.cache.reclaim(&db)
+            let pin = unpin_directive(tx, item.parent_id.as_deref())?;
+            tx.execute(
+                &format!(
+                    "{SUBTREE} INSERT INTO changed_inodes
+                     SELECT inode, 1 FROM items JOIN subtree USING (item_id) WHERE kind = 0"
+                ),
+                [item_id],
+            )?;
+            tx.execute(
+                &format!(
+                    "{SUBTREE} DELETE FROM sparse_files WHERE inode IN (
+                    SELECT inode FROM items JOIN subtree USING (item_id)
+                )"
+                ),
+                [item_id],
+            )?;
+            tx.execute(
+                &format!(
+                    "{SUBTREE} DELETE FROM pin_directives
+                     WHERE item_id IN (SELECT item_id FROM subtree)"
+                ),
+                [item_id],
+            )?;
+            write_pin(tx, item_id, pin)?;
+            Ok(())
+        })?;
+        self.reclaim_sparse_cache()
     }
 
     /// Persist a Pin (Sticky Pin for folders) and hydrate its eligible files.
@@ -130,7 +143,7 @@ impl Engine {
         let _hydration = self.hydrating.lock().await;
         let candidates = self
             .db()
-            .prepare_cached(&format!(
+            .prepare_cached(
                 "WITH RECURSIVE pinned(item_id) AS (
                  SELECT i.item_id FROM items i JOIN pin_directives p USING (item_id)
                  WHERE p.pin_state = 1 AND (?1 IS NULL OR i.item_id = ?1)
@@ -141,10 +154,10 @@ impl Engine {
                  )
              )
              SELECT i.item_id FROM items i JOIN pinned USING (item_id)
-             WHERE i.kind = 0 AND i.sync_state = 0 AND i.remote_missing = 0 AND NOT {HAS_COMPLETE_CONTENT}
+             WHERE i.kind = 0 AND i.sync_state = 0 AND i.remote_missing = 0
              ORDER BY i.inode",
-            ))?
-            .query_map(params![root, HEADER_BYTES, STREAM_BYTES], |row| row.get::<_, String>(0))?
+            )?
+            .query_map([root], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         let mut failure = None;
         for id in candidates {
@@ -168,6 +181,18 @@ impl Engine {
     }
 
     async fn hydrate_pinned_file(&self, item_id: &str) -> Result<(), EngineError> {
+        let existing = {
+            let db = self.db();
+            match item_by_id(&db, item_id)? {
+                Some(item) => {
+                    generation_for(&db, item.inode)?.map(|generation| (item.inode, generation))
+                }
+                None => None,
+            }
+        };
+        if let Some((inode, generation)) = existing {
+            self.validate_cached_generation(inode, generation)?;
+        }
         let (item, generation) = {
             let mut db = self.db();
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -274,7 +299,46 @@ impl Engine {
             }
         }
         tx.commit()?;
-        self.cache.reclaim(&db)
+        drop(db);
+        self.reclaim_sparse_cache()
+    }
+
+    fn content_is_hydrated(&self, item: &CatalogItem) -> Result<bool, EngineError> {
+        let generations = {
+            let db = self.db();
+            if item.kind == ItemKind::File {
+                let Some(generation) = generation_for(&db, item.inode)? else {
+                    return Ok(false);
+                };
+                vec![(item.inode, Some(generation), is_hydrated(&db, item)?)]
+            } else {
+                let mut files = db.prepare_cached(&format!(
+                    "{SUBTREE} SELECT i.inode, f.generation, {HAS_COMPLETE_CONTENT}
+                     FROM items i JOIN subtree USING (item_id)
+                     LEFT JOIN sparse_files f USING (inode) WHERE i.kind = 0",
+                ))?;
+                let generations = files
+                    .query_map(params![item.item_id, HEADER_BYTES, STREAM_BYTES], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if generations.is_empty() {
+                    return Ok(effective_pin(&db, &item.item_id)? == PinState::Pinned);
+                }
+                generations
+            }
+        };
+
+        let mut hydrated = true;
+        for (inode, generation, complete) in generations {
+            if let Some(generation) = generation {
+                let intact = self.validate_cached_generation(inode, generation)?;
+                hydrated &= complete && intact;
+            } else {
+                hydrated = false;
+            }
+        }
+        Ok(hydrated)
     }
 
     pub(super) fn access_time(&self) -> i64 {
@@ -378,28 +442,4 @@ fn unpin_directive(db: &Connection, parent_id: Option<&str>) -> rusqlite::Result
         return Ok(PinState::UnpinOverride);
     }
     Ok(PinState::None)
-}
-
-fn content_is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
-    if item.kind == ItemKind::File {
-        return is_hydrated(db, item);
-    }
-    // Directories have no content cache. A folder is hydrated when its
-    // descendant files are available, or when an empty folder is pinned.
-    db.prepare_cached(&format!(
-        "{SUBTREE}, files AS NOT MATERIALIZED (
-             SELECT i.inode, i.size FROM items i JOIN subtree USING (item_id) WHERE i.kind = 0
-         )
-         SELECT NOT EXISTS (SELECT 1 FROM files i WHERE NOT {HAS_COMPLETE_CONTENT})
-                AND (?4 OR EXISTS (SELECT 1 FROM files))",
-    ))?
-    .query_row(
-        params![
-            item.item_id,
-            HEADER_BYTES,
-            STREAM_BYTES,
-            effective_pin(db, &item.item_id)? == PinState::Pinned,
-        ],
-        |row| row.get(0),
-    )
 }

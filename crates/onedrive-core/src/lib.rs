@@ -13,3 +13,7 @@ pub use cloud::{
 };
 pub use engine::{CatalogItem, Engine, EngineError, PinState, SyncState};
 pub use fake_cloud::FakeCloudDrive;
+
+mod fuse;
+
+pub use fuse::FuseAdapter;

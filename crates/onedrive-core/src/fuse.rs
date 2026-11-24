@@ -187,8 +187,8 @@ impl Filesystem for FuseAdapter {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         _flags: i32,
         _kill_suid_gid: bool,
         _owner: Owner,
@@ -197,7 +197,12 @@ impl Filesystem for FuseAdapter {
         let result = (|| {
             let item = self
                 .engine
-                .create(parent.0, file_name(name)?, ItemKind::File)
+                .create_with_mode(
+                    parent.0,
+                    file_name(name)?,
+                    ItemKind::File,
+                    Some(permissions(mode & !umask)),
+                )
                 .map_err(errno)?;
             self.engine.open_file(item.inode).map_err(errno)?;
             Ok::<_, Errno>(item)
@@ -219,14 +224,19 @@ impl Filesystem for FuseAdapter {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         _owner: Owner,
         reply: ReplyEntry,
     ) {
         match file_name(name).and_then(|name| {
             self.engine
-                .create(parent.0, name, ItemKind::Folder)
+                .create_with_mode(
+                    parent.0,
+                    name,
+                    ItemKind::Folder,
+                    Some(permissions(mode & !umask)),
+                )
                 .map_err(errno)
         }) {
             Ok(item) => reply.entry(&Duration::ZERO, &attributes(&item), Generation(0)),
@@ -275,16 +285,32 @@ impl Filesystem for FuseAdapter {
         _kill_suid_gid: bool,
         reply: ReplyAttr,
     ) {
-        if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
-            return reply.error(Errno::EOPNOTSUPP);
+        if uid.is_some_and(|uid| uid != rustix::process::geteuid().as_raw())
+            || gid.is_some_and(|gid| gid != rustix::process::getegid().as_raw())
+        {
+            return reply.error(Errno::EPERM);
         }
-        let result = match size {
-            Some(size) => self
-                .runtime
-                .block_on(self.engine.truncate(ino.0, size))
-                .map_err(errno),
-            None => self.item(ino),
-        };
+        let result = (|| {
+            let item = match size {
+                Some(size) => self
+                    .runtime
+                    .block_on(self.engine.truncate(ino.0, size))
+                    .map_err(errno)?,
+                None => self.item(ino)?,
+            };
+            if mode.is_some() || atime.is_some() || mtime.is_some() {
+                return self
+                    .engine
+                    .set_local_attributes(
+                        ino.0,
+                        mode.map(permissions),
+                        atime.map(set_time),
+                        mtime.map(set_time),
+                    )
+                    .map_err(errno);
+            }
+            Ok::<_, Errno>(item)
+        })();
         match result {
             Ok(item) => reply.attr(&Duration::ZERO, &attributes(&item)),
             Err(error) => reply.error(error),
@@ -447,18 +473,36 @@ fn attributes(item: &CatalogItem) -> FileAttr {
         ino: INodeNo(item.inode),
         size: item.size,
         blocks: item.size.div_ceil(512),
-        atime: item.last_accessed_at.map_or(mtime, unix_time),
-        mtime,
+        atime: item
+            .local_atime
+            .or(item.last_accessed_at)
+            .map_or(mtime, unix_time),
+        mtime: item.local_mtime.map_or(mtime, unix_time),
         ctime: mtime,
         crtime: UNIX_EPOCH,
         kind: file_type(item.kind),
-        perm: if directory { 0o755 } else { 0o644 },
+        perm: item.mode.unwrap_or(if directory { 0o755 } else { 0o644 }),
         nlink: if directory { 2 } else { 1 },
         uid: rustix::process::geteuid().as_raw(),
         gid: rustix::process::getegid().as_raw(),
         rdev: 0,
         blksize: 4096,
         flags: 0,
+    }
+}
+
+fn permissions(mode: u32) -> u16 {
+    (mode & 0o777) as u16
+}
+
+fn set_time(time: TimeOrNow) -> i64 {
+    let time = match time {
+        TimeOrNow::SpecificTime(time) => time,
+        TimeOrNow::Now => SystemTime::now(),
+    };
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(delta) => i64::try_from(delta.as_secs()).unwrap_or(i64::MAX),
+        Err(delta) => -i64::try_from(delta.duration().as_secs()).unwrap_or(i64::MAX),
     }
 }
 

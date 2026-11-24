@@ -30,8 +30,10 @@ pub enum EngineError {
     NotFound,
     #[error("cannot read a directory as a file")]
     IsDirectory,
-    #[error("item is Dirty and cannot be purged")]
-    Dirty,
+    #[error("item {item_id} is Dirty and cannot be purged")]
+    PendingUpload { item_id: String },
+    #[error("item {item_id} is a Conflict Copy and cannot be purged")]
+    UnresolvedConflict { item_id: String },
     #[error("item is not a directory")]
     NotDirectory,
     #[error("directory is not empty")]
@@ -65,6 +67,9 @@ pub struct CatalogItem {
     pub last_accessed_at: Option<i64>,
     pub pin_state: PinState,
     pub sync_state: SyncState,
+    pub mode: Option<u16>,
+    pub local_atime: Option<i64>,
+    pub local_mtime: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,7 +118,10 @@ pub struct Engine {
 
 const ITEM_COLUMNS: &str =
     "inode, item_id, parent_id, name, kind, size, mtime, etag, ctag, quickxor_hash, last_accessed_at, sync_state,
-     (SELECT pin_state FROM pin_directives WHERE item_id = items.item_id)";
+     (SELECT pin_state FROM pin_directives WHERE item_id = items.item_id),
+     (SELECT mode FROM local_attributes WHERE inode = items.inode),
+     (SELECT atime FROM local_attributes WHERE inode = items.inode),
+     (SELECT mtime FROM local_attributes WHERE inode = items.inode)";
 
 impl Engine {
     pub fn open(
@@ -414,6 +422,9 @@ fn catalog_item(row: &Row<'_>) -> rusqlite::Result<CatalogItem> {
         quickxor_hash: row.get(9)?,
         last_accessed_at: row.get(10)?,
         sync_state: row.get(11)?,
+        mode: row.get(13)?,
+        local_atime: row.get(14)?,
+        local_mtime: row.get(15)?,
         pin_state: row
             .get::<_, Option<PinState>>(12)?
             .unwrap_or(PinState::None),
@@ -444,13 +455,22 @@ fn apply_change(
     match change {
         DeltaChange::Delete(item_id) => {
             transaction.execute(
+                "DELETE FROM writeback_recycled WHERE item_id = ?1",
+                [&item_id],
+            )?;
+            transaction.execute(
                 "INSERT OR IGNORE INTO delta_deletions VALUES (?1)",
                 [item_id],
             )?;
         }
         DeltaChange::Upsert(item) => {
             record_sighting(transaction, &item.item_id, full_scan)?;
-            if item.name.is_some() {
+            let recycled: bool = transaction.query_row(
+                "SELECT EXISTS (SELECT 1 FROM writeback_recycled WHERE item_id = ?1)",
+                [&item.item_id],
+                |row| row.get(0),
+            )?;
+            if !recycled && item.name.is_some() {
                 upsert_remote_item(transaction, item)?;
             }
         }

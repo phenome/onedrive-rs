@@ -310,7 +310,7 @@ fn exercise_writeback(dir: &Path) {
     assert_xattrs(&mount.join("work/final"), b"Dirty", b"none", b"");
     assert!(matches!(
         engine.check_purge(&file.item_id),
-        Err(EngineError::Dirty)
+        Err(EngineError::PendingUpload { .. })
     ));
     assert_eq!(
         engine.resolve_path("/work").unwrap().unwrap().sync_state,

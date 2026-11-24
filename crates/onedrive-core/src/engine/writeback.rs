@@ -159,11 +159,16 @@ fn directory(db: &Connection, inode: u64) -> Result<CatalogItem, EngineError> {
     Ok(item)
 }
 
-/// The Purge preflight must run under the same catalog lock as cache removal.
-pub(super) fn refuse_dirty(state: SyncState) -> Result<(), EngineError> {
+/// Run while holding the catalog transaction that retires cached bytes.
+pub(super) fn refuse_purge(item_id: &str, state: SyncState) -> Result<(), EngineError> {
     match state {
-        SyncState::Dirty | SyncState::Uploading => Err(EngineError::Dirty),
-        _ => Ok(()),
+        SyncState::Dirty | SyncState::Uploading => Err(EngineError::PendingUpload {
+            item_id: item_id.into(),
+        }),
+        SyncState::Conflict => Err(EngineError::UnresolvedConflict {
+            item_id: item_id.into(),
+        }),
+        SyncState::Clean => Ok(()),
     }
 }
 
@@ -173,6 +178,16 @@ impl Engine {
         parent: u64,
         name: &str,
         kind: ItemKind,
+    ) -> Result<CatalogItem, EngineError> {
+        self.create_with_mode(parent, name, kind, None)
+    }
+
+    pub(crate) fn create_with_mode(
+        &self,
+        parent: u64,
+        name: &str,
+        kind: ItemKind,
+        mode: Option<u16>,
     ) -> Result<CatalogItem, EngineError> {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -194,9 +209,40 @@ impl Engine {
         )?;
         let inode = tx.last_insert_rowid();
         tx.execute("INSERT INTO writeback_queue (inode) VALUES (?1)", [inode])?;
+        if let Some(mode) = mode {
+            tx.execute(
+                "INSERT INTO local_attributes (inode, mode) VALUES (?1, ?2)",
+                params![inode, mode],
+            )?;
+        }
         let item = item_by_inode(&tx, inode as u64)?.ok_or(EngineError::NotFound)?;
         tx.commit()?;
         self.writeback.changed.notify_one();
+        Ok(item)
+    }
+
+    pub(crate) fn set_local_attributes(
+        &self,
+        inode: u64,
+        mode: Option<u16>,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+    ) -> Result<CatalogItem, EngineError> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if item_by_inode(&tx, inode)?.is_none() {
+            return Err(EngineError::NotFound);
+        }
+        tx.execute(
+            "INSERT INTO local_attributes (inode, mode, atime, mtime) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(inode) DO UPDATE SET
+                mode = coalesce(excluded.mode, local_attributes.mode),
+                atime = coalesce(excluded.atime, local_attributes.atime),
+                mtime = coalesce(excluded.mtime, local_attributes.mtime)",
+            params![inode, mode, atime, mtime],
+        )?;
+        let item = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
+        tx.commit()?;
         Ok(item)
     }
 
@@ -304,11 +350,17 @@ impl Engine {
                 "UPDATE items SET size = ?2, mtime = ?3, sync_state = CASE WHEN sync_state = 3 THEN 3 ELSE 1 END WHERE inode = ?1",
                 params![inode, size, self.write_time()],
             )?;
+            tx.execute(
+                "UPDATE local_attributes SET mtime = NULL WHERE inode = ?1",
+                [inode],
+            )?;
+            tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [inode])?;
             let current = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
             // Disarm automatic unlink before committing a reference to this file.
             let (_file, _path) = file.keep().map_err(|err| err.error)?;
             tx.commit()?;
             self.writeback.retire(stage);
+            let _ = self.cache.reclaim(&db);
             self.writeback.changed.notify_one();
             return Ok(current);
         }
@@ -336,11 +388,7 @@ impl Engine {
     pub fn check_purge(&self, item_id: &str) -> Result<(), EngineError> {
         let db = self.db();
         let item = item_by_id(&db, item_id)?.ok_or(EngineError::NotFound)?;
-        refuse_dirty(item.sync_state)?;
-        if job(&db, item.inode)?.is_some() {
-            return Err(EngineError::Dirty);
-        }
-        Ok(())
+        refuse_purge(item_id, item.sync_state)
     }
 }
 
@@ -503,6 +551,16 @@ impl Engine {
                 if open_files.contains_key(&inode) {
                     continue;
                 }
+                if item.kind == ItemKind::Folder
+                    && tx.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM writeback_queue WHERE remote_parent = ?1)",
+                        [&item.item_id],
+                        |row| row.get::<_, bool>(0),
+                    )?
+                {
+                    // A child moved out locally may still be under this folder in OneDrive.
+                    continue;
+                }
                 Action::Delete
             } else {
                 let parent = item
@@ -605,6 +663,12 @@ impl Engine {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stage = job(&tx, work.item.inode)?.and_then(|job| job.stage);
+        if let Some(id) = work.queued.remote_id.as_deref() {
+            tx.execute(
+                "INSERT OR IGNORE INTO writeback_recycled (item_id) VALUES (?1)",
+                [id],
+            )?;
+        }
         tx.execute("DELETE FROM items WHERE inode = ?1", [work.item.inode])?;
         tx.commit()?;
         self.writeback.retire(stage.as_deref());

@@ -85,3 +85,16 @@ CREATE TABLE IF NOT EXISTS writeback_queue (
     deleted INTEGER NOT NULL DEFAULT 0,
     conflict INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS writeback_remote_namespace ON writeback_queue (remote_parent, remote_name);
+
+CREATE TABLE IF NOT EXISTS writeback_recycled (
+    item_id TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS local_attributes (
+    inode INTEGER PRIMARY KEY REFERENCES items(inode) ON DELETE CASCADE,
+    mode INTEGER,
+    atime INTEGER,
+    mtime INTEGER
+);

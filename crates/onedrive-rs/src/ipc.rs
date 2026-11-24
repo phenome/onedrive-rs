@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File, Permissions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -21,6 +21,7 @@ use tokio::time::timeout;
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const LONG_JOB_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn socket_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("onedrive-rs/daemon.sock")
@@ -37,6 +38,12 @@ pub enum Request {
     Uploads {},
     Pause {},
     Resume {},
+}
+
+impl Request {
+    pub(crate) fn is_long_running(&self) -> bool {
+        matches!(self, Self::Pin { .. } | Self::Sync {})
+    }
 }
 
 /// A canonical UTF-8 path in the OneDrive namespace. "/" is the drive root.
@@ -137,6 +144,12 @@ impl IpcClient {
     pub fn request(&self, request: &Request) -> io::Result<Response> {
         let mut stream = UnixStream::connect(&self.path)?;
         stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+        let response_timeout = if request.is_long_running() {
+            LONG_JOB_TIMEOUT + SOCKET_TIMEOUT
+        } else {
+            SOCKET_TIMEOUT
+        };
+        stream.set_read_timeout(Some(response_timeout))?;
         write_frame(&mut stream, request)?;
         let mut line = Vec::new();
         BufReader::new(stream).read_until(b'\n', &mut line)?;
@@ -259,32 +272,9 @@ impl IpcServer {
         Ok(server)
     }
 
-    pub(crate) fn async_listener(&self) -> io::Result<AsyncListener> {
-        self.set_nonblocking(true)?;
+    pub fn async_listener(&self) -> io::Result<AsyncListener> {
+        self.listener.set_nonblocking(true)?;
         AsyncListener::from_std(self.listener.try_clone()?)
-    }
-
-    pub fn set_nonblocking(&self, enabled: bool) -> io::Result<()> {
-        self.listener.set_nonblocking(enabled)
-    }
-
-    /// Accept and handle one connection. In nonblocking mode, an empty accept
-    /// queue returns WouldBlock. Accepted streams still use blocking I/O.
-    pub fn serve_one(
-        &self,
-        dispatch: impl FnOnce(Request) -> Result<Value, String>,
-    ) -> io::Result<()> {
-        let (mut stream, _) = self.listener.accept()?;
-        stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
-        stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-        let response = match read_request(&stream) {
-            Ok(request) => match dispatch(request) {
-                Ok(result) => Response::Success(result),
-                Err(error) => Response::Error(error),
-            },
-            Err(error) => Response::Error(format!("invalid request: {error}")),
-        };
-        write_frame(&mut stream, &response.into_json())
     }
 }
 
@@ -296,7 +286,7 @@ impl Drop for IpcServer {
     }
 }
 
-pub(crate) async fn serve_connection(
+pub async fn serve_connection(
     mut stream: AsyncStream,
     dispatch: impl AsyncFnOnce(Request) -> Result<Value, String>,
 ) -> io::Result<()> {
@@ -314,10 +304,18 @@ pub(crate) async fn serve_connection(
         Err(error) => return Err(error.into()),
     };
     let response = match request {
-        Ok(request) => match dispatch(request).await {
-            Ok(result) => Response::Success(result),
-            Err(error) => Response::Error(error),
-        },
+        Ok(request) => {
+            let deadline = if request.is_long_running() {
+                LONG_JOB_TIMEOUT
+            } else {
+                SOCKET_TIMEOUT
+            };
+            match timeout(deadline, dispatch(request)).await {
+                Ok(Ok(result)) => Response::Success(result),
+                Ok(Err(error)) => Response::Error(error),
+                Err(_) => Response::Error("OneDrive request timed out".into()),
+            }
+        }
         Err(error) => Response::Error(format!("invalid request: {error}")),
     };
     timeout(
@@ -364,14 +362,6 @@ fn same_entry(
     Ok(found.file_type().is_socket()
         && found.dev() == expected.dev()
         && found.ino() == expected.ino())
-}
-
-fn read_request(stream: &UnixStream) -> io::Result<Request> {
-    let mut frame = Vec::new();
-    BufReader::new(stream)
-        .take(MAX_REQUEST_BYTES)
-        .read_until(b'\n', &mut frame)?;
-    decode_request(&frame)
 }
 
 fn decode_request(frame: &[u8]) -> io::Result<Request> {

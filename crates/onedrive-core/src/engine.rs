@@ -176,7 +176,7 @@ impl Engine {
         transaction.commit()?;
         catalog_invalidation::install(&db)?;
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
-        Ok(Self {
+        let engine = Self {
             cache,
             thumbnails: ThumbnailCache::default(),
             db: Mutex::new(db),
@@ -187,7 +187,9 @@ impl Engine {
             hydrating: tokio::sync::Mutex::new(()),
             hydration_paused_low_disk: AtomicBool::new(false),
             observers: Mutex::default(),
-        })
+        };
+        engine.recover_cached_generations()?;
+        Ok(engine)
     }
 
     fn db(&self) -> MutexGuard<'_, Connection> {
@@ -369,6 +371,14 @@ impl Engine {
             "UPDATE items SET sync_state = ?2 WHERE item_id = ?1",
             params![item_id, state as i64],
         )? != 0)
+    }
+
+    pub fn pending_upload_count(&self) -> Result<u64, EngineError> {
+        Ok(self.db().query_row(
+            "SELECT count(*) FROM items WHERE sync_state IN (?1, ?2)",
+            params![SyncState::Dirty as i64, SyncState::Uploading as i64],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn root(&self) -> Result<Option<CatalogItem>, EngineError> {

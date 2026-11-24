@@ -438,6 +438,19 @@ impl Engine {
         result
     }
 
+    pub(super) fn recover_cached_generations(&self) -> Result<(), EngineError> {
+        let generations = {
+            let db = self.db();
+            db.prepare("SELECT inode, generation FROM sparse_files")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (inode, generation) in generations {
+            self.validate_cached_generation(inode, generation)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_cached_generation(
         &self,
         inode: u64,

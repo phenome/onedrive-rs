@@ -228,6 +228,17 @@ pub struct Auth {
     access: Mutex<Option<AccessToken>>,
 }
 
+struct StoreGuard<'a> {
+    transaction: Option<Box<dyn TokenStore>>,
+    fallback: &'a dyn TokenStore,
+}
+
+impl StoreGuard<'_> {
+    fn store(&self) -> &dyn TokenStore {
+        self.transaction.as_deref().unwrap_or(self.fallback)
+    }
+}
+
 struct AccessToken {
     value: String,
     refresh: String,
@@ -349,8 +360,8 @@ impl Auth {
         .await
         .map_err(|_| AuthError::Timeout)??;
 
-        let transaction = self.store.begin_transaction().await?;
-        let store = transaction.as_deref().unwrap_or(self.store.as_ref());
+        let guard = self.lock_store().await?;
+        let store = guard.store();
         let grant = self
             .exchange(&[
                 ("grant_type", "authorization_code"),
@@ -363,24 +374,31 @@ impl Auth {
         Ok(())
     }
 
+    async fn lock_store(&self) -> Result<StoreGuard<'_>, AuthError> {
+        Ok(StoreGuard {
+            transaction: self.store.begin_transaction().await?,
+            fallback: self.store.as_ref(),
+        })
+    }
+
     pub async fn is_signed_in(&self) -> Result<bool, AuthError> {
-        let transaction = self.store.begin_transaction().await?;
-        let store = transaction.as_deref().unwrap_or(self.store.as_ref());
+        let guard = self.lock_store().await?;
+        let store = guard.store();
         Ok(store.load_refresh_token().await?.is_some())
     }
 
     pub async fn logout(&self) -> Result<(), AuthError> {
         let mut access = self.access.lock().await;
         *access = None;
-        let transaction = self.store.begin_transaction().await?;
-        let store = transaction.as_deref().unwrap_or(self.store.as_ref());
+        let guard = self.lock_store().await?;
+        let store = guard.store();
         store.clear_refresh_token().await
     }
 
     pub(crate) async fn bearer(&self) -> Result<String, AuthError> {
         let mut access = self.access.lock().await;
-        let transaction = self.store.begin_transaction().await?;
-        let store = transaction.as_deref().unwrap_or(self.store.as_ref());
+        let guard = self.lock_store().await?;
+        let store = guard.store();
         let refresh = match store.load_refresh_token().await {
             Ok(Some(refresh)) => refresh,
             result => {

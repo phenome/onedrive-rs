@@ -21,8 +21,7 @@ use rustix::fs::inotify;
 
 use onedrive_core::{
     Clock, CloudDrive, CloudError, Config, DeltaPage, DeltaRequest, Engine, EngineError,
-    FakeCloudDrive, FuseAdapter, ItemKind, PinState, RemoteItem, RemoteThumbnail, SyncState,
-    SystemClock,
+    FakeCloudDrive, FuseAdapter, ItemKind, RemoteItem, RemoteThumbnail, SyncState, SystemClock,
 };
 
 const WORKER_DIR: &str = "ONEDRIVE_LIVE_FUSE_WORKER_DIR";

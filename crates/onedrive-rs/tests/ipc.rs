@@ -4,11 +4,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use onedrive_rs::ipc::{IpcServer, Request, socket_path};
+use onedrive_rs::ipc::{IpcServer, Request, serve_connection, socket_path};
 use serde_json::{Value, json};
 
-#[test]
-fn status_round_trips_over_a_private_socket_removed_on_drop() {
+#[tokio::test]
+async fn status_round_trips_over_a_private_socket_removed_on_drop() {
     let runtime = private_runtime();
     let path = socket_path(runtime.path());
     let server = IpcServer::bind(&path).unwrap();
@@ -30,12 +30,14 @@ fn status_round_trips_over_a_private_socket_removed_on_drop() {
     peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     peer.write_all(b"{\"op\":\"status\"}\n").unwrap();
 
-    server
-        .serve_one(|request| {
-            assert_eq!(request, Request::Status {});
-            Ok(status.clone())
-        })
-        .unwrap();
+    let listener = server.async_listener().unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    serve_connection(stream, async |request| {
+        assert_eq!(request, Request::Status {});
+        Ok(status.clone())
+    })
+    .await
+    .unwrap();
 
     let mut line = String::new();
     let mut reader = BufReader::new(peer);
@@ -48,20 +50,22 @@ fn status_round_trips_over_a_private_socket_removed_on_drop() {
     line.clear();
     assert_eq!(reader.read_line(&mut line).unwrap(), 0);
 
+    drop(listener);
     drop(server);
     assert!(!path.exists());
     drop(IpcServer::bind(&path).unwrap());
 }
 
-#[test]
-fn wire_requests_require_newline_and_canonical_mount_paths() {
+#[tokio::test]
+async fn wire_requests_require_newline_and_canonical_mount_paths() {
     use std::net::Shutdown;
 
     let runtime = private_runtime();
     let path = socket_path(runtime.path());
     let server = IpcServer::bind(&path).unwrap();
 
-    let exchange = |request: &[u8]| {
+    let listener = server.async_listener().unwrap();
+    let exchange = async |request: &[u8]| {
         let mut stream = UnixStream::connect(&path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -69,21 +73,22 @@ fn wire_requests_require_newline_and_canonical_mount_paths() {
         stream.write_all(request).unwrap();
         stream.shutdown(Shutdown::Write).unwrap();
 
-        server
-            .serve_one(|request| {
-                assert_eq!(
-                    serde_json::to_value(request).unwrap(),
-                    json!({"op": "pin", "path": "/folder/été photo.png"})
-                );
-                Ok(Value::Null)
-            })
-            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        serve_connection(peer, async |request| {
+            assert_eq!(
+                serde_json::to_value(request).unwrap(),
+                json!({"op": "pin", "path": "/folder/été photo.png"})
+            );
+            Ok(Value::Null)
+        })
+        .await
+        .unwrap();
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).unwrap();
         serde_json::from_str::<Value>(&line).unwrap()
     };
 
-    let reply = exchange("{\"op\":\"pin\",\"path\":\"/folder/été photo.png\"}\n".as_bytes());
+    let reply = exchange("{\"op\":\"pin\",\"path\":\"/folder/été photo.png\"}\n".as_bytes()).await;
     assert_eq!(reply, json!({"ok": true, "result": null}));
 
     for invalid in [
@@ -98,7 +103,7 @@ fn wire_requests_require_newline_and_canonical_mount_paths() {
         b"{\"op\":\"rename\"}\n",
         b"{\"op\":\"status\"}",
     ] {
-        let reply = exchange(invalid);
+        let reply = exchange(invalid).await;
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("invalid request"));
     }

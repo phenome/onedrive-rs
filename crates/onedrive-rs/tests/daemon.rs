@@ -1,4 +1,6 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -7,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use onedrive_core::{
-    CloudDrive, CloudError, Config, DeltaPage, DeltaRequest, FakeCloudDrive, ItemKind, RemoteItem,
+    CloudDrive, CloudError, Config, DeltaCursor, DeltaPage, DeltaRequest, FakeCloudDrive, ItemKind,
+    RemoteItem, RemoteThumbnail,
 };
 use onedrive_rs::{daemon, ipc::socket_path};
 use rustix::process::{Pid, Signal, kill_process};
@@ -32,7 +35,11 @@ impl CloudDrive for IsolatedCloud {
             fs::write(self.dir.join("resumed-cursor"), link).unwrap();
             return std::future::pending().await;
         }
-        self.fake.delta(request).await
+        let page = self.fake.delta(request).await?;
+        if let DeltaCursor::Complete(link) = &page.cursor {
+            fs::write(self.dir.join("issued-cursor"), link).unwrap();
+        }
+        Ok(page)
     }
 
     async fn read_range(
@@ -45,7 +52,22 @@ impl CloudDrive for IsolatedCloud {
             fs::write(self.dir.join("read-started"), "").unwrap();
             return std::future::pending().await;
         }
+        assert!(
+            !matches!(item_id, "photo" | "missing-thumbnail"),
+            "read original while seeding"
+        );
         self.fake.read_range(item_id, offset, length).await
+    }
+    async fn list_thumbnails(&self, folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
+        if folder_id == "blocked-folder" {
+            fs::write(self.dir.join("thumbnail-started"), "").unwrap();
+            return std::future::pending().await;
+        }
+        self.fake.list_thumbnails(folder_id).await
+    }
+
+    async fn download_thumbnail(&self, rendition: &RemoteThumbnail) -> Result<Vec<u8>, CloudError> {
+        self.fake.download_thumbnail(rendition).await
     }
 }
 
@@ -54,6 +76,7 @@ fn daemon_worker() {
     let Some(dir) = std::env::var_os(WORKER_DIR).map(PathBuf::from) else {
         return;
     };
+    fs::write(dir.join("worker-pid"), std::process::id().to_string()).unwrap();
     let fake = FakeCloudDrive::new(10);
     let root = RemoteItem {
         item_id: "root".into(),
@@ -67,19 +90,44 @@ fn daemon_worker() {
         quickxor_hash: None,
     };
     fake.upsert(root.clone());
-    for (id, name) in [("content", "content.txt"), ("blocked", "blocked.txt")] {
+    for (id, parent, name, kind) in [
+        ("content", "root", "content.txt", ItemKind::File),
+        ("cached", "root", "cached.txt", ItemKind::File),
+        ("blocked", "root", "blocked.txt", ItemKind::File),
+        ("photo", "root", "photo.png", ItemKind::File),
+        ("missing-thumbnail", "root", "missing.png", ItemKind::File),
+        ("blocked-folder", "root", "blocked-folder", ItemKind::Folder),
+        (
+            "blocked-thumbnail",
+            "blocked-folder",
+            "blocked.png",
+            ItemKind::File,
+        ),
+    ] {
         fake.upsert(RemoteItem {
             item_id: id.into(),
-            parent_id: Some("root".into()),
+            parent_id: Some(parent.into()),
             name: Some(name.into()),
-            kind: ItemKind::File,
-            size: 5,
+            kind,
+            size: if kind == ItemKind::File { 5 } else { 0 },
+            etag: Some("fixture-etag".into()),
             ..root.clone()
         });
     }
+    let mut thumbnail = Vec::new();
+    let mut encoder = png::Encoder::new(&mut thumbnail, 1, 1);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .unwrap()
+        .write_image_data(&[0, 0, 0, 255])
+        .unwrap();
+    fake.set_thumbnail("photo", thumbnail);
     let stall_delta = std::env::var_os(STALL_DELTA).is_some();
     if !stall_delta {
         fake.set_content("content", b"hello".to_vec());
+        fake.set_content("cached", b"world".to_vec());
     }
     let cloud = IsolatedCloud {
         fake,
@@ -121,10 +169,61 @@ fn mounted_daemon_lifecycle() {
     assert_eq!(sandbox.cli("sync")["ok"], true);
     assert_eq!(sandbox.cli("resume")["ok"], true);
     assert_eq!(sandbox.cli("uploads")["ok"], false);
+    let content_path = mount.join("content.txt");
+    let content = content_path.to_str().unwrap();
+    assert_eq!(xattr(&content_path, "state"), "Hydrated");
+    assert_eq!(xattr(&content_path, "etag"), "fixture-etag");
+    assert_eq!(sandbox.cli_args(&["pin", content])["ok"], true);
+    assert_eq!(xattr(&content_path, "pin"), "pinned");
+    assert_eq!(sandbox.cli("status")["result"]["pinned_cache_bytes"], 5);
+    assert_eq!(sandbox.cli_args(&["unpin", content])["ok"], true);
+    assert_eq!(xattr(&content_path, "pin"), "none");
+    assert_eq!(sandbox.cli("status")["result"]["unpinned_cache_bytes"], 5);
+    assert_eq!(sandbox.cli_args(&["purge", content])["ok"], true);
+    assert_eq!(xattr(&content_path, "state"), "Cloud-only");
+    assert_eq!(sandbox.cli("status")["result"]["unpinned_cache_bytes"], 0);
+    let missing_path = mount.join("absent.txt");
+    let missing = sandbox.cli_args(&["pin", missing_path.to_str().unwrap()]);
+    assert_eq!(missing["ok"], false);
+    assert!(missing["error"].as_str().unwrap().contains("was not found"));
     assert_eq!(
-        sandbox.cli_args(&["pin", mount.join("content.txt").to_str().unwrap()])["error"],
-        "Cache retention commands are unavailable in this build"
+        bounded("cat").arg(content).output().unwrap().stdout,
+        b"hello"
     );
+    assert_eq!(sandbox.cli_args(&["pin", content])["ok"], true);
+    assert_eq!(
+        bounded("cat")
+            .arg(mount.join("cached.txt"))
+            .output()
+            .unwrap()
+            .stdout,
+        b"world"
+    );
+
+    assert!(bounded("ls").arg(&mount).output().unwrap().status.success());
+    let thumbnail_root = sandbox.dir().join("cache/thumbnails");
+    for (directory, uri) in [
+        ("x-large", "photo.png"),
+        ("fail/gnome-thumbnail-factory", "missing.png"),
+    ] {
+        let mut entries = fs::read_dir(thumbnail_root.join(directory)).unwrap();
+        let file = fs::File::open(entries.next().unwrap().unwrap().path()).unwrap();
+        assert!(entries.next().is_none());
+        let decoder = png::Decoder::new(BufReader::new(file));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = [0; 4];
+        reader.next_frame(&mut pixels).unwrap();
+        let fields = &reader.info().uncompressed_latin1_text;
+        assert!(fields.iter().any(|entry| entry.keyword == "Thumb::URI"
+            && entry.text == format!("file://{}/{}", mount.display(), uri)));
+        assert!(
+            fields
+                .iter()
+                .any(|entry| entry.keyword == "Thumb::MTime" && entry.text == "1700000000")
+        );
+        assert_eq!(pixels[3], if directory == "x-large" { 255 } else { 0 });
+    }
+    assert_eq!(xattr(&mount.join("photo.png"), "state"), "Cloud-only");
 
     assert_eq!(sandbox.cli("pause")["ok"], true);
     assert_eq!(sandbox.cli("sync")["ok"], true);
@@ -137,6 +236,31 @@ fn mounted_daemon_lifecycle() {
         .spawn()
         .unwrap();
     wait_for(|| sandbox.dir().join("resumed-cursor").exists());
+
+    let duplicates: Vec<_> = (0..32)
+        .map(|_| {
+            let mut peer = UnixStream::connect(&socket).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            peer.write_all(b"{\"op\":\"sync\"}\n").unwrap();
+            BufReader::new(peer)
+        })
+        .collect();
+    assert_eq!(sandbox.cli("status")["result"]["sync_state"], "syncing");
+    assert_eq!(sandbox.cli("resume")["ok"], true);
+    assert_eq!(sandbox.cli("pause")["ok"], true);
+    for mut peer in duplicates {
+        let mut reply = String::new();
+        peer.read_line(&mut reply).unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["error"], "OneDrive delta sync is already running");
+    }
+    let mut listing = bounded("ls")
+        .arg(mount.join("blocked-folder"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(|| sandbox.dir().join("thumbnail-started").exists());
 
     let mut reader = bounded("cat")
         .arg(mount.join("blocked.txt"))
@@ -151,14 +275,19 @@ fn mounted_daemon_lifecycle() {
     let reply: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(reply["ok"], false);
     assert!(!reader.wait().unwrap().success());
+    assert!(!listing.wait().unwrap().success());
     assert!(!socket.exists());
     assert!(!mounted(&mount));
 
-    let checkpoint = sandbox.checkpoint();
+    let checkpoint = fs::read_to_string(sandbox.dir().join("issued-cursor")).unwrap();
     let prior_cursor = sandbox.dir().join("resumed-cursor");
     assert_eq!(fs::read_to_string(&prior_cursor).unwrap(), checkpoint);
     fs::remove_file(prior_cursor).unwrap();
     fs::remove_file(sandbox.dir().join("stall-manual")).unwrap();
+    let catalog_directory = sandbox.dir().join("data/onedrive-rs");
+    assert!(catalog_directory.join("catalog.sqlite3").is_file());
+    fs::create_dir(sandbox.dir().join("state")).unwrap();
+    fs::rename(&catalog_directory, sandbox.dir().join("state/onedrive-rs")).unwrap();
     sandbox.use_custom_mount();
     let mount = sandbox.mount.clone();
     sandbox.start(true);
@@ -169,10 +298,14 @@ fn mounted_daemon_lifecycle() {
     );
     assert!(mounted(&mount));
     assert_eq!(sandbox.cli("status")["result"]["sync_state"], "syncing");
-    assert_eq!(
-        sandbox.cli_args(&["purge", mount.join("content.txt").to_str().unwrap()])["error"],
-        "Cache retention commands are unavailable in this build"
+    assert!(catalog_directory.join("catalog.sqlite3").is_file());
+    assert!(
+        !sandbox
+            .dir()
+            .join("state/onedrive-rs/catalog.sqlite3")
+            .exists()
     );
+    assert_eq!(sandbox.cli("status")["result"]["pinned_cache_bytes"], 5);
     assert_eq!(sandbox.cli("status")["result"]["unpinned_cache_bytes"], 5);
     assert_eq!(
         bounded("cat")
@@ -185,7 +318,20 @@ fn mounted_daemon_lifecycle() {
     sandbox.stop(Signal::INT);
     assert!(!socket.exists());
     assert!(!mounted(&mount));
-    assert_eq!(sandbox.checkpoint(), checkpoint);
+    fs::remove_file(sandbox.dir().join("resumed-cursor")).unwrap();
+    fs::remove_dir_all(sandbox.dir().join("cache/onedrive-rs")).unwrap();
+    sandbox.start(true);
+    wait_for(|| sandbox.dir().join("resumed-cursor").exists());
+    assert_eq!(
+        fs::read_to_string(sandbox.dir().join("resumed-cursor")).unwrap(),
+        checkpoint
+    );
+    let status = sandbox.cli("status");
+    assert_eq!(status["result"]["pinned_cache_bytes"], 0);
+    assert_eq!(status["result"]["unpinned_cache_bytes"], 0);
+    assert_eq!(xattr(&mount.join("content.txt"), "pin"), "pinned");
+    assert_eq!(xattr(&mount.join("content.txt"), "state"), "Cloud-only");
+    sandbox.stop(Signal::TERM);
 }
 
 struct Sandbox {
@@ -233,12 +379,20 @@ impl Sandbox {
             .env("HOME", self.dir().join("home"))
             .env("XDG_CONFIG_HOME", self.dir().join("config"))
             .env("XDG_RUNTIME_DIR", self.dir().join("run"))
+            .env("XDG_DATA_HOME", self.dir().join("data"))
             .env("XDG_STATE_HOME", self.dir().join("state"))
             .env("XDG_CACHE_HOME", self.dir().join("cache"));
     }
 
     fn start(&mut self, stall_delta: bool) {
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        let pid_file = self.dir().join("worker-pid");
+        if pid_file.exists() {
+            fs::remove_file(&pid_file).unwrap();
+        }
+        let mut command = Command::new("timeout");
+        command
+            .args(["-k", "2s", "30s"])
+            .arg(std::env::current_exe().unwrap());
         command
             .args(["--exact", "daemon_worker", "--nocapture"])
             .env(WORKER_DIR, self.dir());
@@ -251,8 +405,9 @@ impl Sandbox {
     }
 
     fn stop(&mut self, signal: Signal) {
+        let pid = fs::read_to_string(self.dir().join("worker-pid")).unwrap();
+        kill_process(Pid::from_raw(pid.parse().unwrap()).unwrap(), signal).unwrap();
         let worker = self.worker.as_mut().unwrap();
-        kill_process(Pid::from_child(worker), signal).unwrap();
         let mut status: Option<ExitStatus> = None;
         wait_for(|| {
             status = worker.try_wait().unwrap();
@@ -273,27 +428,12 @@ impl Sandbox {
         serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("invalid CLI response ({error}): {output:?}"))
     }
-
-    fn checkpoint(&self) -> String {
-        let db = rusqlite::Connection::open(self.dir().join("state/onedrive-rs/catalog.sqlite3"))
-            .unwrap();
-        let mode: String = db
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))
-            .unwrap();
-        assert_eq!(mode, "wal");
-        db.query_row(
-            "SELECT link FROM delta_checkpoint WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
 }
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(mut worker) = self.worker.take() {
-            let _ = worker.kill();
+            let _ = kill_process(Pid::from_child(&worker), Signal::TERM);
             let _ = worker.wait();
         }
         if mounted(&self.mount) {
@@ -306,6 +446,16 @@ impl Drop for Sandbox {
             let _ = bounded("rm").args(["-rf", "--"]).arg(root).status();
         }
     }
+}
+
+fn xattr(path: &Path, attribute: &str) -> String {
+    let output = bounded("getfattr")
+        .args(["--only-values", "-n", &format!("user.onedrive.{attribute}")])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap()
 }
 
 fn mounted(path: &Path) -> bool {

@@ -1590,6 +1590,7 @@ dependencies = [
  "clap",
  "onedrive-core",
  "onedrive-graph",
+ "png",
  "rusqlite",
  "rustix",
  "serde",

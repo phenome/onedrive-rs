@@ -3,7 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use onedrive_rs::ipc::{IpcServer, Request, socket_path};
+use onedrive_rs::ipc::{IpcServer, Request, serve_connection, socket_path};
 use serde_json::{Value, json};
 
 fn cli(runtime: &Path, args: &[&str]) -> Output {
@@ -66,17 +66,23 @@ fn with_server<T: Send>(
 ) -> T {
     std::thread::scope(|scope| {
         let child = scope.spawn(run);
-        server.set_nonblocking(true).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !child.is_finished() && std::time::Instant::now() < deadline {
-            match server.serve_one(&mut dispatch) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = server.async_listener().unwrap();
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !child.is_finished() && tokio::time::Instant::now() < deadline {
+                    tokio::select! {
+                        connection = listener.accept() => {
+                            let (stream, _) = connection.unwrap();
+                            serve_connection(stream, async |request| dispatch(request)).await.unwrap();
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
                 }
-                Err(error) => panic!("{error}"),
-            }
-        }
+            });
         drop(server);
         child.join().unwrap()
     })

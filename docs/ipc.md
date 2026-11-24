@@ -66,8 +66,8 @@ access. Requests that have already obtained an access token can still finish.
 After signing in, run `onedrive-rs daemon` in the foreground. The default mount
 is `$XDG_RUNTIME_DIR/onedrive`. The daemon creates the mount directory if needed
 and requires it to be empty. The catalog and delta checkpoint are stored in
-`$XDG_STATE_HOME/onedrive-rs/catalog.sqlite3` (default
-`~/.local/state/onedrive-rs/catalog.sqlite3`). File content is cached under
+`$XDG_DATA_HOME/onedrive-rs/catalog.sqlite3` (default
+`~/.local/share/onedrive-rs/catalog.sqlite3`). File content is cached under
 `$XDG_CACHE_HOME/onedrive-rs` (default `~/.cache/onedrive-rs`).
 
 Delta sync runs on startup and then every `delta_poll_interval_secs`, measured
@@ -77,7 +77,9 @@ from the completion of the previous background pass. The default is 60 seconds.
 SIGTERM end requests in flight, unmount the filesystem, and remove the socket.
 Committed delta pages and cache files survive the restart.
 
-This build implements `status`, `sync`, `pause`, and `resume`. Status reports
-committed sparse cache bytes, the cache filesystem's free disk floor, and the
-count of catalog entries marked Dirty or Uploading. The retention commands
-and `uploads` return explicit errors until their Engine operations are wired.
+Status reports cached content bytes, the cache filesystem's free disk floor,
+and the count of catalog entries marked Dirty or Uploading. A second sync
+request returns an error while a delta pass is active. Pin and sync requests
+can run for up to five minutes. The daemon reserves connection capacity for
+short requests while these operations run. The uploads queue awaits writeback
+integration.

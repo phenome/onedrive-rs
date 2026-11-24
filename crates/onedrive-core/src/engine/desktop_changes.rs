@@ -38,13 +38,17 @@ pub(super) fn install(db: &Connection) -> rusqlite::Result<()> {
              INSERT INTO desktop_change SELECT inode, 0 FROM items WHERE item_id = OLD.parent_id;
          END;
          CREATE TEMP TRIGGER desktop_item_changed
-         AFTER UPDATE OF sync_state, parent_id, size, kind ON main.items
+         AFTER UPDATE OF sync_state, parent_id, size, kind, alias, name ON main.items
          WHEN (CASE OLD.sync_state WHEN {uploading} THEN {dirty} ELSE OLD.sync_state END)
                 IS NOT (CASE NEW.sync_state WHEN {uploading} THEN {dirty} ELSE NEW.sync_state END)
               OR OLD.parent_id IS NOT NEW.parent_id OR OLD.size IS NOT NEW.size
               OR OLD.kind IS NOT NEW.kind
+              OR coalesce(OLD.alias, OLD.name) IS NOT coalesce(NEW.alias, NEW.name)
          BEGIN
-             INSERT INTO desktop_change VALUES (NEW.inode, NEW.kind AND OLD.parent_id IS NOT NEW.parent_id);
+             INSERT INTO desktop_change VALUES (NEW.inode, NEW.kind AND (
+                 OLD.parent_id IS NOT NEW.parent_id
+                 OR coalesce(OLD.alias, OLD.name) IS NOT coalesce(NEW.alias, NEW.name)
+             ));
              INSERT INTO desktop_change
                  SELECT inode, 0 FROM items WHERE item_id = OLD.parent_id
                  AND OLD.parent_id IS NOT NEW.parent_id;

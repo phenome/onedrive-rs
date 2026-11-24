@@ -154,6 +154,42 @@ impl Base {
         Ok(Some(base))
     }
 
+    fn rebind_after_move(
+        db: &Connection,
+        stage: &str,
+        remote: &RemoteItem,
+    ) -> Result<(), EngineError> {
+        let base = db
+            .query_row(
+                "SELECT item_id, etag, ctag FROM writeback_bases WHERE stage = ?1",
+                [stage],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((item_id, etag, ctag)) = base else {
+            return Ok(());
+        };
+        let same_content = ctag.is_some() && ctag == remote.ctag;
+        let same_version =
+            etag.is_some() && etag == remote.etag && (ctag.is_none() || ctag == remote.ctag);
+        if item_id != remote.item_id || !(same_content || same_version) {
+            return Err(CloudError::Conflict.into());
+        }
+        if same_content {
+            db.execute(
+                "UPDATE writeback_bases SET etag = ?2 WHERE stage = ?1",
+                params![stage, remote.etag],
+            )?;
+        }
+        Ok(())
+    }
+
     fn edit(&mut self, size: u64, write: Option<(u64, &[u8])>) {
         let overwritten = write.map(|(offset, bytes)| offset..offset + bytes.len() as u64);
         self.missing = self
@@ -1107,7 +1143,12 @@ impl Engine {
                     && remote.etag.is_some()
                     && attempt.matches_path(&remote) =>
             {
-                self.acknowledge(work, Some(remote), false)
+                match self.acknowledge(work, Some(remote), false) {
+                    Err(EngineError::Cloud(CloudError::Conflict)) => {
+                        self.preserve_conflict(work, true).await
+                    }
+                    result => result,
+                }
             }
             Ok(_) => Err(CloudError::InvalidResponse.into()),
             Err(CloudError::NotFound) => self.missing_move_source(work).await,
@@ -1413,6 +1454,11 @@ impl Engine {
                 && (queued.stage.is_some() || has_publication(tx, inode)?)
             {
                 return Err(CloudError::Conflict.into());
+            }
+            if work.move_attempt.is_some()
+                && let (Some(stage), Some(remote)) = (&queued.stage, &remote)
+            {
+                Base::rebind_after_move(tx, stage, remote)?;
             }
             let retire = (sent_content && queued.stage.as_deref() == attempted_stage
                 && (at_local_path || follow_remote_path))
@@ -1795,12 +1841,23 @@ impl Engine {
             // A stale conditional upload forks the item; a destination-name
             // collision can keep the current item and use a different destination.
             if fork {
+                let preserve_base = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM writeback_bases WHERE stage = ?1)",
+                    [queued.stage.as_deref()],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if preserve_base {
+                    tx.execute("INSERT INTO sparse_preserve_on_move VALUES (?1)", [item.inode])?;
+                }
                 tx.execute("DELETE FROM writeback_publication WHERE inode = ?1", [item.inode])?;
                 tx.execute(
                     "UPDATE items SET item_id = 'local:' || lower(hex(randomblob(16))),
                      etag = NULL, ctag = NULL, quickxor_hash = NULL, remote_missing = 0 WHERE inode = ?1",
                     [item.inode],
                 )?;
+                if preserve_base {
+                    tx.execute("DELETE FROM sparse_preserve_on_move WHERE inode = ?1", [item.inode])?;
+                }
                 tx.execute(
                     "UPDATE writeback_queue SET remote_id = NULL, remote_parent = NULL, remote_name = NULL WHERE inode = ?1",
                     [item.inode],

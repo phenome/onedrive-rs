@@ -350,6 +350,19 @@ impl CloudDrive for InterruptedDrive {
         self.inner.read_range(id, offset, length).await
     }
 
+    async fn read_range_at_version(
+        &self,
+        id: &str,
+        etag: Option<&str>,
+        ctag: Option<&str>,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        self.inner
+            .read_range_at_version(id, etag, ctag, offset, length)
+            .await
+    }
+
     async fn upload_destination(
         &self,
         target: UploadTarget<'_>,
@@ -1132,4 +1145,80 @@ async fn accepted_checked_delete_replays_by_id_without_touching_new_path_occupan
         engine.read(survivor.inode, 0, 8).await.unwrap(),
         b"new item"
     );
+}
+
+#[tokio::test]
+async fn accepted_move_rebinds_a_cold_sparse_append_after_restart() {
+    cold_edit_during_move(Some("content"), false).await;
+}
+
+#[tokio::test]
+async fn accepted_move_does_not_rebind_edited_peer_content_after_restart() {
+    cold_edit_during_move(Some("content"), true).await;
+}
+
+#[tokio::test]
+async fn accepted_move_does_not_rebind_a_sparse_base_without_content_proof() {
+    cold_edit_during_move(None, false).await;
+}
+
+async fn cold_edit_during_move(ctag: Option<&str>, peer_edit: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let inner = drive();
+    let mut base = cloud_file(4);
+    base.ctag = ctag.map(str::to_owned);
+    inner.upsert(base);
+    inner.set_content("cold", b"base".to_vec());
+    let drive = interrupted_drive(inner.clone(), true);
+    let open = || Arc::new(Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap());
+    let engine = open();
+    engine.sync().await.unwrap();
+    let inode = engine.item("cold").unwrap().unwrap().inode;
+    engine.rename(1, "cold", 1, "moved", false).unwrap();
+    let upload = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.drain_uploads().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), drive.accepted.notified())
+        .await
+        .unwrap();
+    engine.write(inode, 0, b"!", true).await.unwrap();
+    assert!(inner.range_requests().is_empty());
+    assert_eq!(engine.read(inode, 4, 1).await.unwrap(), b"!");
+    upload.abort();
+    assert!(upload.await.unwrap_err().is_cancelled());
+    drop(engine);
+
+    if peer_edit {
+        inner
+            .upload(UploadTarget::Existing { item_id: "cold" }, b"peer", None)
+            .await
+            .unwrap();
+    }
+    let engine = open();
+    let result = engine.drain_uploads().await;
+    if peer_edit || ctag.is_none() {
+        assert!(matches!(
+            result,
+            Err(EngineError::OriginalVersionUnavailable)
+        ));
+        let original = engine.resolve_path("/moved").unwrap().unwrap();
+        assert_ne!(original.inode, inode);
+        assert_eq!(original.item_id, "cold");
+        let unchanged = if peer_edit { b"peer" } else { b"base" };
+        assert_eq!(engine.read(original.inode, 0, 4).await.unwrap(), unchanged);
+        assert_eq!(
+            engine.getattr(inode).unwrap().unwrap().sync_state,
+            SyncState::Conflict
+        );
+        assert_eq!(engine.read(inode, 4, 1).await.unwrap(), b"!");
+    } else {
+        assert_eq!(result.unwrap(), 2);
+        let moved = engine.resolve_path("/moved").unwrap().unwrap();
+        assert_eq!(moved.inode, inode);
+        assert_eq!(moved.item_id, "cold");
+        assert_eq!(moved.sync_state, SyncState::Clean);
+        assert_eq!(inner.read_range("cold", 0, 5).await.unwrap(), b"base!");
+    }
 }

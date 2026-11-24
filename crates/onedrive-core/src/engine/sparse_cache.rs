@@ -352,7 +352,9 @@ impl Engine {
             }
             let verified = db.query_row(
                 "SELECT EXISTS (SELECT 1 FROM sparse_range_versions
-                    WHERE generation = ?1 AND block = ?2 AND etag IS ?3 AND ctag IS ?4)",
+                    WHERE generation = ?1 AND block = ?2
+                    AND ((?4 IS NOT NULL AND ctag IS ?4)
+                         OR (?4 IS NULL AND ?3 IS NOT NULL AND etag IS ?3)))",
                 params![generation, block.key(), etag, ctag],
                 |row| row.get::<_, bool>(0),
             )?;

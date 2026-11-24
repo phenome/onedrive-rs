@@ -8,7 +8,7 @@ use onedrive_core::{
     RemoteItem, RemoteThumbnail, UploadTarget,
 };
 use reqwest::header::{self, HeaderValue};
-use reqwest::{Client, Request, RequestBuilder, Response, StatusCode, Url};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep_until};
@@ -89,7 +89,12 @@ impl GraphDrive {
 
     async fn send(&self, request: RequestBuilder) -> Result<Response, CloudError> {
         let request = request.build().map_err(|_| CloudError::InvalidResponse)?;
-        let response = self.dispatch(request).await?;
+        self.wait_until_allowed().await;
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| CloudError::Unavailable)?;
         if matches!(
             response.status(),
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
@@ -100,14 +105,6 @@ impl GraphDrive {
             return Err(CloudError::Throttled { retry_after });
         }
         Ok(response)
-    }
-
-    async fn dispatch(&self, request: Request) -> Result<Response, CloudError> {
-        self.wait_until_allowed().await;
-        self.client
-            .execute(request)
-            .await
-            .map_err(|_| CloudError::Unavailable)
     }
 
     async fn download_url(&self, item_id: &str) -> Result<Url, CloudError> {
@@ -465,10 +462,18 @@ async fn range_bytes(
     end: u64,
     length: usize,
 ) -> Result<Vec<u8>, CloudError> {
-    let content_range = response.headers().get(header::CONTENT_RANGE);
+    let headers = response.headers();
+    if headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| value != "identity")
+    {
+        return Err(CloudError::InvalidResponse);
+    }
+    let content_range = headers.get(header::CONTENT_RANGE);
     let wanted = match response.status() {
         StatusCode::PARTIAL_CONTENT => checked_range(content_range, offset, end)?,
-        StatusCode::OK if offset == 0 => length,
+        StatusCode::OK if offset == 0 && content_range.is_none() => length,
         StatusCode::OK => return Err(CloudError::InvalidResponse),
         StatusCode::RANGE_NOT_SATISFIABLE => {
             let size = content_range

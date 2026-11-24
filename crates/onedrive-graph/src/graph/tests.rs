@@ -105,10 +105,12 @@ fn anonymous(request: &wiremock::Request) -> bool {
 }
 
 #[tokio::test]
-async fn folder_thumbnails_follow_pages_and_download_large_payload_without_bearer() {
+async fn folder_thumbnails_follow_pages_and_download_over_http2_without_bearer() {
     let server = MockServer::start().await;
     let cdn = MockServer::start().await;
-    let graph = mock_graph(&server);
+    let mut graph = mock_graph(&server);
+    // Wiremock runs over cleartext. Production negotiates HTTP/2 via TLS ALPN.
+    graph.client = Client::builder().http2_prior_knowledge().build().unwrap();
     let thumbnail = format!("{}/image.jpg?sig=temporary", cdn.uri());
     Mock::given(method("GET"))
         .and(path("/v1.0/me/drive/items/folder/children"))
@@ -202,6 +204,22 @@ async fn ranged_cdn_reads_refresh_expired_urls_and_validate_responses() {
                 .mount(&cdn)
                 .await;
         }
+        Mock::given(method("GET"))
+            .and(path("/content"))
+            .and(anonymous)
+            .and(header("range", "bytes=0-0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(vec![0x1f, 0x8b]),
+            )
+            .expect(1)
+            .mount(&cdn)
+            .await;
+        assert_eq!(
+            graph.read_range("file", 0, 1).await,
+            Err(CloudError::InvalidResponse)
+        );
         assert_eq!(graph.read_range("file", 2, 5).await.unwrap(), b"cde");
         assert_eq!(graph.read_range("file", 9, 2).await.unwrap(), b"");
         assert_eq!(graph.read_range("file", 0, 2).await.unwrap(), b"ab");

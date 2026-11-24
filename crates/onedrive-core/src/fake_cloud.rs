@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::File;
 use std::num::NonZeroUsize;
+use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
 use crate::{
     CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem, UploadTarget,
+    RemoteItem, UploadSource, UploadTarget,
 };
 
 /// A versioned in-memory drive. Changes during enumeration are delivered on
@@ -24,11 +26,37 @@ struct State {
     next_token: u64,
     failures: VecDeque<(usize, CloudError)>,
     requests: Vec<DeltaRequest>,
-    contents: HashMap<String, Vec<u8>>,
+    contents: HashMap<String, Content>,
     range_requests: Vec<(String, u64, usize)>,
     offline: bool,
     next_version: u64,
     recycled: Vec<String>,
+}
+
+enum Content {
+    Bytes(Vec<u8>),
+    File { file: File, size: usize },
+}
+
+impl Content {
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::File { size, .. } => *size,
+        }
+    }
+
+    fn range(&self, start: usize, end: usize) -> Result<Vec<u8>, CloudError> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes[start..end].to_vec()),
+            Self::File { file, .. } => {
+                let mut bytes = vec![0; end - start];
+                file.read_exact_at(&mut bytes, start as u64)
+                    .map_err(|_| CloudError::Unavailable)?;
+                Ok(bytes)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -87,11 +115,23 @@ impl FakeCloudDrive {
             .lock()
             .unwrap()
             .contents
-            .insert(item_id.into(), bytes);
+            .insert(item_id.into(), Content::Bytes(bytes));
     }
 
     pub fn range_requests(&self) -> Vec<(String, u64, usize)> {
         self.state.lock().unwrap().range_requests.clone()
+    }
+
+    fn recycle(&self, item_id: &str, etag: Option<&str>) -> Result<(), CloudError> {
+        let mut state = self.state.lock().unwrap();
+        state.online()?;
+        let item = state.items.get(item_id).ok_or(CloudError::NotFound)?;
+        if etag.is_some() && item.etag.as_deref() != etag {
+            return Err(CloudError::Conflict);
+        }
+        state.remove(item_id);
+        state.recycled.push(item_id.into());
+        Ok(())
     }
 
     pub fn requests(&self) -> Vec<DeltaRequest> {
@@ -172,7 +212,7 @@ impl State {
         })
     }
 
-    fn commit(&mut self, mut item: RemoteItem, bytes: Option<&[u8]>) -> RemoteItem {
+    fn commit(&mut self, mut item: RemoteItem, bytes: Option<Content>) -> RemoteItem {
         self.next_version += 1;
         let version = self.next_version;
         item.etag = Some(format!("\"fake-{version}\""));
@@ -180,7 +220,7 @@ impl State {
         if let Some(bytes) = bytes {
             item.size = bytes.len() as u64;
             item.ctag = Some(format!("fake-content-{version}"));
-            self.contents.insert(item.item_id.clone(), bytes.to_vec());
+            self.contents.insert(item.item_id.clone(), bytes);
         }
         self.items.insert(item.item_id.clone(), item.clone());
         self.changes.push(DeltaChange::Upsert(item.clone()));
@@ -196,6 +236,23 @@ impl CloudDrive for FakeCloudDrive {
         bytes: &[u8],
         if_match: Option<&str>,
     ) -> Result<RemoteItem, CloudError> {
+        self.upload_from(target, UploadSource::Bytes(bytes), if_match)
+            .await
+    }
+
+    async fn upload_from(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        let bytes = match source {
+            UploadSource::Bytes(bytes) => Content::Bytes(bytes.to_vec()),
+            UploadSource::File { file, size } => Content::File {
+                file: file.try_clone().map_err(|_| CloudError::Unavailable)?,
+                size,
+            },
+        };
         let mut state = self.state.lock().unwrap();
         state.online()?;
         let item = match target {
@@ -211,6 +268,21 @@ impl CloudDrive for FakeCloudDrive {
             }
         };
         Ok(state.commit(item, Some(bytes)))
+    }
+
+    async fn upload_destination(
+        &self,
+        target: UploadTarget<'_>,
+    ) -> Result<Option<RemoteItem>, CloudError> {
+        let state = self.state.lock().unwrap();
+        state.online()?;
+        Ok(match target {
+            UploadTarget::Existing { item_id } => state.items.get(item_id),
+            UploadTarget::New { parent_id, name } => state.items.values().find(|item| {
+                item.parent_id.as_deref() == Some(parent_id) && item.name.as_deref() == Some(name)
+            }),
+        }
+        .cloned())
     }
 
     async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteItem, CloudError> {
@@ -240,14 +312,11 @@ impl CloudDrive for FakeCloudDrive {
     }
 
     async fn delete_item(&self, item_id: &str) -> Result<(), CloudError> {
-        let mut state = self.state.lock().unwrap();
-        state.online()?;
-        if !state.items.contains_key(item_id) {
-            return Err(CloudError::NotFound);
-        }
-        state.remove(item_id);
-        state.recycled.push(item_id.into());
-        Ok(())
+        self.recycle(item_id, None)
+    }
+
+    async fn delete_if_match(&self, item_id: &str, etag: &str) -> Result<(), CloudError> {
+        self.recycle(item_id, Some(etag))
     }
 
     async fn read_range(
@@ -265,7 +334,7 @@ impl CloudDrive for FakeCloudDrive {
             .unwrap_or(usize::MAX)
             .min(bytes.len());
         let end = start.saturating_add(length).min(bytes.len());
-        Ok(bytes[start..end].to_vec())
+        bytes.range(start, end)
     }
 
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {

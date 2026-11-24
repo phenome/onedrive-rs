@@ -42,7 +42,7 @@ async fn staged_bytes_survive_restart_and_upload_keeps_the_inode() {
     assert_ne!(uploaded.item_id, file.item_id);
     assert_eq!(uploaded.sync_state, SyncState::Clean);
     assert!(uploaded.etag.is_some() && uploaded.ctag.is_some());
-    assert_eq!(uploaded.mtime, 1_700_000_001);
+    assert_eq!(uploaded.mtime, 1_700_000_002);
     drive.set_online(false);
     assert_eq!(engine.read(file.inode, 0, 20).await.unwrap(), b"\0\0draft");
 }
@@ -267,7 +267,15 @@ async fn remote_create_at_a_dirty_path_leaves_the_staged_version_reachable() {
         1
     );
     assert_eq!(
-        engine.resolve_path("/draft.txt").unwrap().unwrap().inode,
+        engine.resolve_path("/draft.txt").unwrap().unwrap().item_id,
+        "remote"
+    );
+    assert_eq!(
+        engine
+            .resolve_path("/draft (conflict).txt")
+            .unwrap()
+            .unwrap()
+            .inode,
         local.inode
     );
     engine.drain_uploads().await.unwrap();
@@ -275,4 +283,350 @@ async fn remote_create_at_a_dirty_path_leaves_the_staged_version_reachable() {
     assert_eq!(engine.read(original.inode, 0, 20).await.unwrap(), b"remote");
     assert_eq!(engine.read(local.inode, 0, 20).await.unwrap(), b"local");
     assert_eq!(engine.list_children("root").unwrap().len(), 2);
+}
+
+struct InterruptedDrive {
+    inner: Arc<FakeCloudDrive>,
+    pause: std::sync::atomic::AtomicBool,
+    accepted: tokio::sync::Notify,
+}
+
+impl InterruptedDrive {
+    async fn after_acceptance(&self) {
+        if self.pause.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.accepted.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+use onedrive_core::{
+    CloudDrive, CloudError, DeltaPage, DeltaRequest, EngineError, UploadSource, UploadTarget,
+};
+
+#[async_trait::async_trait]
+impl CloudDrive for InterruptedDrive {
+    async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
+        self.inner.delta(request).await
+    }
+
+    async fn upload_from(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        etag: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        if source.len() > 1024 * 1024 * 1024 {
+            let UploadSource::File { file, size } = source else {
+                panic!("large upload should use the seekable staging file");
+            };
+            use std::os::unix::fs::MetadataExt;
+            assert!(file.metadata().unwrap().blocks() * 512 < 1024 * 1024);
+            assert_eq!(source.read(size - 4, 4).await?, [0; 4]);
+            return Err(CloudError::Unavailable);
+        }
+        let remote = self.inner.upload_from(target, source, etag).await?;
+        self.after_acceptance().await;
+        Ok(remote)
+    }
+
+    async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteItem, CloudError> {
+        let remote = self.inner.create_folder(parent_id, name).await?;
+        self.after_acceptance().await;
+        Ok(remote)
+    }
+
+    async fn read_range(
+        &self,
+        id: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        self.inner.read_range(id, offset, length).await
+    }
+
+    async fn upload_destination(
+        &self,
+        target: UploadTarget<'_>,
+    ) -> Result<Option<RemoteItem>, CloudError> {
+        self.inner.upload_destination(target).await
+    }
+
+    async fn move_item(
+        &self,
+        id: &str,
+        parent_id: &str,
+        name: &str,
+    ) -> Result<RemoteItem, CloudError> {
+        self.inner.move_item(id, parent_id, name).await
+    }
+}
+
+fn interrupted_drive(inner: Arc<FakeCloudDrive>, pause: bool) -> Arc<InterruptedDrive> {
+    Arc::new(InterruptedDrive {
+        inner,
+        pause: pause.into(),
+        accepted: tokio::sync::Notify::new(),
+    })
+}
+
+async fn cancel_after_acceptance(engine: Arc<Engine>, drive: &InterruptedDrive) {
+    let task = tokio::spawn(async move { engine.drain_uploads().await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), drive.accepted.notified())
+        .await
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn accepted_file_and_folder_survive_restart_and_delta_before_acknowledgment() {
+    for folder in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog");
+        let cloud = interrupted_drive(drive(), true);
+        let open = || Arc::new(Engine::open(&db, cloud.clone(), Arc::new(SystemClock)).unwrap());
+        let engine = open();
+        engine.sync().await.unwrap();
+        let kind = if folder {
+            ItemKind::Folder
+        } else {
+            ItemKind::File
+        };
+        let entry = engine.create(1, "entry", kind).unwrap();
+        let child = if folder {
+            engine.create(entry.inode, "child", ItemKind::File).unwrap()
+        } else {
+            entry.clone()
+        };
+        engine
+            .write(child.inode, 0, b"staged", false)
+            .await
+            .unwrap();
+        cancel_after_acceptance(engine, &cloud).await;
+
+        let engine = open();
+        engine.sync().await.unwrap();
+        assert_eq!(engine.list_children("root").unwrap().len(), 1);
+        engine.drain_uploads().await.unwrap();
+        engine.sync().await.unwrap();
+        let contents = engine.list_children("root").unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].inode, entry.inode);
+        assert_eq!(contents[0].name, "entry");
+        assert_eq!(contents[0].sync_state, SyncState::Clean);
+        assert_eq!(engine.read(child.inode, 0, 20).await.unwrap(), b"staged");
+        assert!(engine.pending_uploads().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn accepted_update_replays_without_overwriting_a_competing_version() {
+    for competing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog");
+        let inner = drive();
+        let target = UploadTarget::New {
+            parent_id: "root",
+            name: "report",
+        };
+        let original = inner.upload(target, b"base", None).await.unwrap();
+        let cloud = interrupted_drive(inner.clone(), true);
+        let open = || Arc::new(Engine::open(&db, cloud.clone(), Arc::new(SystemClock)).unwrap());
+        let engine = open();
+        engine.sync().await.unwrap();
+        let file = engine.item(&original.item_id).unwrap().unwrap();
+        engine.write(file.inode, 0, b"ours", false).await.unwrap();
+        cancel_after_acceptance(engine, &cloud).await;
+        let target = UploadTarget::Existing {
+            item_id: &original.item_id,
+        };
+        let accepted = inner.upload_destination(target).await.unwrap().unwrap();
+        let expected = if competing {
+            inner
+                .upload(target, b"peer", accepted.etag.as_deref())
+                .await
+                .unwrap()
+        } else {
+            accepted
+        };
+
+        let engine = open();
+        engine.sync().await.unwrap();
+        engine.drain_uploads().await.unwrap();
+        engine.sync().await.unwrap();
+        let canonical = engine.resolve_path("/report").unwrap().unwrap();
+        assert_eq!(canonical.item_id, original.item_id);
+        assert_eq!(canonical.etag, expected.etag);
+        assert_eq!(engine.read(file.inode, 0, 20).await.unwrap(), b"ours");
+        if competing {
+            assert_eq!(engine.read(canonical.inode, 0, 20).await.unwrap(), b"peer");
+            assert_eq!(
+                engine.getattr(file.inode).unwrap().unwrap().sync_state,
+                SyncState::Conflict
+            );
+        } else {
+            assert_eq!(canonical.inode, file.inode);
+        }
+        assert_eq!(
+            engine.list_children("root").unwrap().len(),
+            if competing { 2 } else { 1 }
+        );
+        assert!(engine.pending_uploads().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn full_scan_reveals_restored_ids_after_missing_tombstones_and_keeps_pending_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog");
+    let drive = drive();
+    let open = || Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    for name in ["restored", "pending"] {
+        drive
+            .upload(
+                UploadTarget::New {
+                    parent_id: "root",
+                    name,
+                },
+                name.as_bytes(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let engine = open();
+    engine.sync().await.unwrap();
+    let id = engine.resolve_path("/restored").unwrap().unwrap().item_id;
+    let target = UploadTarget::Existing { item_id: &id };
+    let remote = drive.upload_destination(target).await.unwrap().unwrap();
+    engine.unlink(1, "restored", ItemKind::File).unwrap();
+    engine.drain_uploads().await.unwrap();
+    engine.unlink(1, "pending", ItemKind::File).unwrap();
+    drive.upsert(remote.clone());
+    drive.set_content(&id, b"restored".to_vec());
+    drive.expire_tokens();
+    drop(engine);
+
+    let engine = open();
+    engine.sync().await.unwrap();
+    assert_eq!(
+        engine.resolve_path("/restored").unwrap().unwrap().item_id,
+        id
+    );
+    assert!(engine.resolve_path("/pending").unwrap().is_none());
+    assert_eq!(engine.pending_uploads().unwrap().len(), 1);
+    drop(engine);
+    let engine = open();
+    engine.sync().await.unwrap();
+    assert_eq!(engine.list_children("root").unwrap().len(), 1);
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn create_and_open_survives_unlink_until_handle_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let drive = drive();
+    let engine = Engine::open(dir.path().join("catalog"), drive, Arc::new(SystemClock)).unwrap();
+    engine.sync().await.unwrap();
+    let file = engine.create_and_open(1, "temporary", Some(0o600)).unwrap();
+    engine.unlink(1, "temporary", ItemKind::File).unwrap();
+    assert!(engine.resolve_path("/temporary").unwrap().is_none());
+    assert_eq!(engine.drain_uploads().await.unwrap(), 0);
+    engine
+        .write(file.inode, 0, b"still open", false)
+        .await
+        .unwrap();
+    assert_eq!(engine.read(file.inode, 0, 20).await.unwrap(), b"still open");
+    engine.release_file(file.inode);
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+    assert!(engine.getattr(file.inode).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn offline_editor_replacement_preserves_a_newer_remote_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog");
+    let drive = drive();
+    let open = || Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    let original = drive
+        .upload(
+            UploadTarget::New {
+                parent_id: "root",
+                name: "report.txt",
+            },
+            b"base",
+            None,
+        )
+        .await
+        .unwrap();
+    let engine = open();
+    engine.sync().await.unwrap();
+    drive.set_online(false);
+    let draft = engine
+        .create_and_open(1, ".report.txt.tmp", Some(0o600))
+        .unwrap();
+    engine
+        .write(draft.inode, 0, b"editor", false)
+        .await
+        .unwrap();
+    engine.release_file(draft.inode);
+    engine
+        .rename(1, ".report.txt.tmp", 1, "report.txt", false)
+        .unwrap();
+    drop(engine);
+    drive.set_online(true);
+    drive
+        .upload(
+            UploadTarget::Existing {
+                item_id: &original.item_id,
+            },
+            b"newer!",
+            original.etag.as_deref(),
+        )
+        .await
+        .unwrap();
+
+    let engine = open();
+    engine.sync().await.unwrap();
+    engine.drain_uploads().await.unwrap();
+    let canonical = engine.resolve_path("/report.txt").unwrap().unwrap();
+    assert_eq!(canonical.item_id, original.item_id);
+    assert_eq!(
+        engine.read(canonical.inode, 0, 20).await.unwrap(),
+        b"newer!"
+    );
+    let conflict = engine.getattr(draft.inode).unwrap().unwrap();
+    assert_eq!(conflict.sync_state, SyncState::Conflict);
+    assert_eq!(engine.read(conflict.inode, 0, 20).await.unwrap(), b"editor");
+    assert!(drive.recycled_items().is_empty());
+    assert!(engine.pending_uploads().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_large_sparse_upload_does_not_block_a_small_independent_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cloud = interrupted_drive(drive(), false);
+    let engine = Engine::open(dir.path().join("catalog"), cloud, Arc::new(SystemClock)).unwrap();
+    engine.sync().await.unwrap();
+    let large = engine.create(1, "large", ItemKind::File).unwrap();
+    engine
+        .truncate(large.inode, 2 * 1024 * 1024 * 1024 * 1024)
+        .await
+        .unwrap();
+    let small = engine.create(1, "small", ItemKind::File).unwrap();
+    engine
+        .write(small.inode, 0, b"progress", false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        engine.drain_uploads().await,
+        Err(EngineError::Cloud(CloudError::Unavailable))
+    ));
+    assert_eq!(
+        engine.getattr(small.inode).unwrap().unwrap().sync_state,
+        SyncState::Clean
+    );
+    assert_eq!(engine.pending_uploads().unwrap()[0].inode, large.inode);
+    assert_eq!(engine.read(small.inode, 0, 20).await.unwrap(), b"progress");
 }

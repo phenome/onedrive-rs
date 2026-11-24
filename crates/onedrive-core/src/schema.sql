@@ -81,10 +81,13 @@ CREATE TABLE IF NOT EXISTS sparse_retired (
     generation INTEGER PRIMARY KEY
 );
 
-CREATE TRIGGER IF NOT EXISTS sparse_invalidate_on_content_change
+CREATE TABLE IF NOT EXISTS sparse_preserve_on_move (inode INTEGER PRIMARY KEY);
+DROP TRIGGER IF EXISTS sparse_invalidate_on_content_change;
+CREATE TRIGGER sparse_invalidate_on_content_change
 AFTER UPDATE OF ctag, mtime, size, kind ON items
-WHEN OLD.ctag IS NOT NEW.ctag OR OLD.mtime IS NOT NEW.mtime
-     OR OLD.size IS NOT NEW.size OR OLD.kind IS NOT NEW.kind
+WHEN (OLD.ctag IS NOT NEW.ctag OR OLD.mtime IS NOT NEW.mtime
+     OR OLD.size IS NOT NEW.size OR OLD.kind IS NOT NEW.kind)
+     AND NOT EXISTS (SELECT 1 FROM sparse_preserve_on_move WHERE inode = NEW.inode)
 BEGIN
     DELETE FROM sparse_files WHERE inode = NEW.inode;
 END;
@@ -120,4 +123,28 @@ CREATE TABLE IF NOT EXISTS local_attributes (
     mode INTEGER,
     atime INTEGER,
     mtime INTEGER
+);
+
+-- The immutable request survives a crash between dispatch and acknowledgment.
+CREATE TABLE IF NOT EXISTS writeback_attempts (
+    inode INTEGER PRIMARY KEY REFERENCES writeback_queue(inode) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    remote_id TEXT,
+    parent_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    etag TEXT,
+    stage TEXT,
+    size INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS writeback_attempt_destination ON writeback_attempts (parent_id, name);
+
+CREATE TABLE IF NOT EXISTS writeback_replacements (
+    target_inode INTEGER PRIMARY KEY REFERENCES writeback_queue(inode) ON DELETE CASCADE,
+    source_inode INTEGER REFERENCES items(inode) ON DELETE SET NULL,
+    etag TEXT
+);
+
+CREATE TABLE IF NOT EXISTS writeback_temporary_names (
+    name TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL
 );

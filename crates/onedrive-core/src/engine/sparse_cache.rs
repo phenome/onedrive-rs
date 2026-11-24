@@ -156,7 +156,9 @@ impl SparseCache {
         if !self.remove_generation(generation) {
             return Err(io::Error::other("could not clear unpublished cache generation").into());
         }
-        for offset in (0..size).step_by(STREAM_BYTES as usize) {
+        // Keep a warm prefix without expanding a large sparse stage on disk
+        // or holding the catalog lock across a full-file copy.
+        for offset in (0..size.min(4 * STREAM_BYTES)).step_by(STREAM_BYTES as usize) {
             let block = Block::Stream(offset);
             let mut bytes = vec![0; (size - offset).min(STREAM_BYTES) as usize];
             source.read_exact_at(&mut bytes, offset)?;

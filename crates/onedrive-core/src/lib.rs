@@ -9,7 +9,7 @@ mod namespace;
 
 pub use cloud::{
     Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem, RemoteThumbnail, SystemClock, UploadTarget,
+    RemoteItem, RemoteThumbnail, SystemClock, UploadSource, UploadTarget,
 };
 pub use engine::{CatalogItem, Engine, EngineError, PinState, SyncState};
 pub use fake_cloud::FakeCloudDrive;

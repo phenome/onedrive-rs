@@ -248,6 +248,11 @@ impl Engine {
                 DeltaCursor::Next(link) => (link, false),
                 DeltaCursor::Complete(link) => (link, true),
             };
+            transaction.execute(
+                "DELETE FROM writeback_recycled WHERE EXISTS (
+                    SELECT 1 FROM delta_checkpoint WHERE singleton = 1 AND full_scan AND link IS NULL
+                )", [],
+            )?;
             advance_checkpoint(transaction, revision, Some(&link))?;
             let full_scan = transaction.query_row(
                 "SELECT full_scan FROM delta_checkpoint WHERE singleton = 1",
@@ -570,13 +575,14 @@ fn apply_change(
         DeltaChange::Upsert(item) => {
             affected.record_item(transaction, &item.item_id)?;
             record_sighting(transaction, &item.item_id, full_scan)?;
-            let recycled = !full_scan
-                && transaction.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM writeback_recycled WHERE item_id = ?1)",
-                    [&item.item_id],
-                    |row| row.get::<_, bool>(0),
-                )?;
-            if !recycled && let Some(name) = &item.name {
+            let suppressed = transaction.query_row(
+                "SELECT EXISTS (SELECT 1 FROM writeback_recycled WHERE item_id = ?1)
+                     OR EXISTS (SELECT 1 FROM writeback_attempts WHERE remote_id IS NULL AND parent_id = ?2 AND name = ?3)
+                     OR EXISTS (SELECT 1 FROM writeback_temporary_names WHERE item_id = ?1 AND name = ?3)",
+                params![item.item_id, item.parent_id, item.name],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !suppressed && let Some(name) = &item.name {
                 affected.insert(item.parent_id.clone(), name.clone());
                 upsert_remote_item(transaction, item, revision, position)?;
             }
@@ -671,9 +677,6 @@ fn reconcile_catalog(
     )?;
     affected.read(&mut mark_missing.query([full_scan])?)?;
     prune_remote_deletions(transaction, affected)?;
-    if full_scan {
-        transaction.execute("DELETE FROM writeback_recycled", [])?;
-    }
     transaction.execute_batch("DELETE FROM delta_deletions; DELETE FROM full_sync_seen;")
 }
 

@@ -18,6 +18,24 @@ pub trait CloudDrive: Send + Sync {
     }
 
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError>;
+
+    async fn list_thumbnails(&self, _folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    async fn download_thumbnail(
+        &self,
+        _thumbnail: &RemoteThumbnail,
+    ) -> Result<Vec<u8>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+}
+
+/// The large rendition of a child item. Its temporary URL carries access.
+#[derive(Clone)]
+pub struct RemoteThumbnail {
+    pub item_id: String,
+    pub url: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -81,6 +99,8 @@ pub enum CloudError {
     Throttled { retry_after: Duration },
     #[error("cloud requires a full metadata resync")]
     ResyncRequired,
+    #[error("cloud operation is unsupported")]
+    Unsupported,
     #[error("cloud unavailable")]
     Unavailable,
 }

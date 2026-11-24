@@ -8,7 +8,7 @@ mod fake_cloud;
 
 pub use cloud::{
     Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem, SystemClock,
+    RemoteItem, RemoteThumbnail, SystemClock,
 };
 pub use engine::{CatalogItem, Engine, EngineError, PinState, SyncState};
 pub use fake_cloud::FakeCloudDrive;

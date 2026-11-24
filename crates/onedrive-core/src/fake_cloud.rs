@@ -6,6 +6,7 @@ use async_trait::async_trait;
 
 use crate::{
     CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, RemoteItem,
+    RemoteThumbnail,
 };
 
 /// A versioned in-memory drive. Changes during enumeration are delivered on
@@ -25,6 +26,9 @@ struct State {
     requests: Vec<DeltaRequest>,
     contents: HashMap<String, Vec<u8>>,
     range_requests: Vec<(String, u64, usize)>,
+    thumbnails: HashMap<String, Vec<u8>>,
+    thumbnail_list_requests: Vec<String>,
+    thumbnail_download_requests: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -58,6 +62,7 @@ impl FakeCloudDrive {
         let mut removed = vec![item_id.to_owned()];
         while let Some(parent) = removed.pop() {
             state.contents.remove(&parent);
+            state.thumbnails.remove(&parent);
             state.items.remove(&parent);
             removed.extend(
                 state
@@ -94,6 +99,30 @@ impl FakeCloudDrive {
         self.state.lock().unwrap().range_requests.clone()
     }
 
+    pub fn set_thumbnail(&self, item_id: &str, bytes: Vec<u8>) {
+        self.state
+            .lock()
+            .unwrap()
+            .thumbnails
+            .insert(item_id.into(), bytes);
+    }
+
+    pub fn remove_thumbnail(&self, item_id: &str) {
+        self.state.lock().unwrap().thumbnails.remove(item_id);
+    }
+
+    pub fn thumbnail_list_requests(&self) -> Vec<String> {
+        self.state.lock().unwrap().thumbnail_list_requests.clone()
+    }
+
+    pub fn thumbnail_download_requests(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .thumbnail_download_requests
+            .clone()
+    }
+
     pub fn requests(&self) -> Vec<DeltaRequest> {
         self.state.lock().unwrap().requests.clone()
     }
@@ -116,6 +145,37 @@ impl CloudDrive for FakeCloudDrive {
             .min(bytes.len());
         let end = start.saturating_add(length).min(bytes.len());
         Ok(bytes[start..end].to_vec())
+    }
+
+    async fn list_thumbnails(&self, folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
+        tokio::task::yield_now().await;
+        let mut state = self.state.lock().unwrap();
+        state.thumbnail_list_requests.push(folder_id.into());
+        Ok(state
+            .items
+            .values()
+            .filter(|item| {
+                item.parent_id.as_deref() == Some(folder_id)
+                    && state.thumbnails.contains_key(&item.item_id)
+            })
+            .map(|item| RemoteThumbnail {
+                item_id: item.item_id.clone(),
+                url: "https://fake-drive.invalid/thumbnail".into(),
+            })
+            .collect())
+    }
+
+    async fn download_thumbnail(&self, thumbnail: &RemoteThumbnail) -> Result<Vec<u8>, CloudError> {
+        tokio::task::yield_now().await;
+        let mut state = self.state.lock().unwrap();
+        state
+            .thumbnail_download_requests
+            .push(thumbnail.item_id.clone());
+        state
+            .thumbnails
+            .get(&thumbnail.item_id)
+            .cloned()
+            .ok_or(CloudError::Unavailable)
     }
 
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {

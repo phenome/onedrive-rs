@@ -14,8 +14,11 @@ use crate::{
 };
 
 mod sparse_cache;
+mod thumbnails;
 
 use sparse_cache::SparseCache;
+use thumbnails::ThumbnailCache;
+pub(crate) use thumbnails::default_thumbnail_root;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -31,6 +34,12 @@ pub enum EngineError {
     IsDirectory,
     #[error("sparse cache I/O error")]
     CacheIo(#[from] io::Error),
+    #[error("thumbnail cache I/O error")]
+    ThumbnailIo(#[source] io::Error),
+    #[error("invalid cloud thumbnail")]
+    InvalidThumbnail(#[from] image::ImageError),
+    #[error("could not encode thumbnail PNG")]
+    ThumbnailEncoding(#[from] png::EncodingError),
     #[error("cloud range did not match the catalog file size")]
     InvalidRange,
     #[error(transparent)]
@@ -92,6 +101,7 @@ impl FromSql for SyncState {
 pub struct Engine {
     db: Mutex<Connection>,
     cache: SparseCache,
+    thumbnails: ThumbnailCache,
     cloud: Arc<dyn CloudDrive>,
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
@@ -132,6 +142,7 @@ impl Engine {
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
         Ok(Self {
             cache,
+            thumbnails: ThumbnailCache::default(),
             db: Mutex::new(db),
             cloud,
             clock,
@@ -289,13 +300,7 @@ impl Engine {
     }
 
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<CatalogItem>, EngineError> {
-        Ok(self
-            .db()
-            .prepare_cached(&format!(
-                "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 ORDER BY name, inode"
-            ))?
-            .query_map([parent_id], catalog_item)?
-            .collect::<Result<_, _>>()?)
+        Ok(list_children(&self.db(), parent_id)?)
     }
 
     pub fn resolve_path(&self, path: impl AsRef<Path>) -> Result<Option<CatalogItem>, EngineError> {
@@ -324,27 +329,38 @@ impl Engine {
     pub fn path_for(&self, item_id: &str) -> Result<Option<PathBuf>, EngineError> {
         let db = self.db();
         let snapshot = db.unchecked_transaction()?;
-        let mut current = item_by_id(&snapshot, item_id)?;
-        let mut seen = HashSet::new();
-        let mut names = Vec::new();
-        while let Some(item) = current {
-            let Some(parent_id) = item.parent_id else {
-                if item.kind != ItemKind::Folder {
-                    return Ok(None);
-                }
-                let mut path = PathBuf::from("/");
-                path.extend(names.into_iter().rev());
-                return Ok(Some(path));
-            };
-            if !seen.insert(item.item_id) {
+        path_for(&snapshot, item_id)
+    }
+}
+
+fn list_children(db: &Connection, parent_id: &str) -> rusqlite::Result<Vec<CatalogItem>> {
+    db.prepare_cached(&format!(
+        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 ORDER BY name, inode"
+    ))?
+    .query_map([parent_id], catalog_item)?
+    .collect()
+}
+
+fn path_for(db: &Connection, item_id: &str) -> Result<Option<PathBuf>, EngineError> {
+    let mut current = item_by_id(db, item_id)?;
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    while let Some(item) = current {
+        let Some(parent_id) = item.parent_id else {
+            if item.kind != ItemKind::Folder {
                 return Ok(None);
             }
-            names.push(item.name);
-            current =
-                item_by_id(&snapshot, &parent_id)?.filter(|parent| parent.kind == ItemKind::Folder);
+            let mut path = PathBuf::from("/");
+            path.extend(names.into_iter().rev());
+            return Ok(Some(path));
+        };
+        if !seen.insert(item.item_id) {
+            return Ok(None);
         }
-        Ok(None)
+        names.push(item.name);
+        current = item_by_id(db, &parent_id)?.filter(|parent| parent.kind == ItemKind::Folder);
     }
+    Ok(None)
 }
 
 fn root(db: &Connection) -> rusqlite::Result<Option<CatalogItem>> {

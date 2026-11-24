@@ -332,7 +332,7 @@ async fn throttling_pauses_concurrent_metadata_mutations_and_cdn_requests() {
         let stopped = Instant::now();
         let operations = async {
             tokio::join!(
-                graph.delete_item("file"),
+                graph.delete_if_match("file", "file-tag"),
                 graph.list_thumbnails("folder"),
                 graph.download_thumbnail(&thumbnail),
             )
@@ -341,6 +341,7 @@ async fn throttling_pauses_concurrent_metadata_mutations_and_cdn_requests() {
             stopped.elapsed() + Duration::from_millis(20) >= Duration::from_secs(1)
         };
         let delete = Mock::given(method("DELETE"))
+            .and(header("if-match", "file-tag"))
             .and(timed)
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
@@ -415,6 +416,7 @@ async fn simple_upload_folder_move_and_recycle_bin_use_personal_drive() {
     Mock::given(method("DELETE"))
         .and(path("/v1.0/me/drive/items/item"))
         .and(header("authorization", "Bearer synthetic-access"))
+        .and(header("if-match", "item-tag"))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -465,7 +467,7 @@ async fn simple_upload_folder_move_and_recycle_bin_use_personal_drive() {
             .as_deref(),
         Some("folder")
     );
-    graph.delete_item("item").await.unwrap();
+    graph.delete_if_match("item", "item-tag").await.unwrap();
     assert_eq!(
         graph.delete_if_match("replacement", r#""base""#).await,
         Err(CloudError::Conflict)
@@ -696,4 +698,42 @@ async fn versioned_range_rejects_bytes_if_the_item_changes_during_download() {
             .await,
         Err(CloudError::Conflict)
     );
+}
+
+#[tokio::test]
+async fn checked_rmdir_uses_the_empty_snapshot_ctag_and_rejects_nonempty_folders() {
+    let server = MockServer::start().await;
+    let graph = mock_graph(&server);
+    for (id, folder, ctag) in [
+        ("empty", json!({"childCount": 0}), Some("empty-content")),
+        ("nonempty", json!({"childCount": 1}), Some("has-content")),
+        ("untagged", json!({"childCount": 0}), None),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1.0/me/drive/items/{id}")))
+            .and(query_param("$select", "id,eTag,cTag,folder"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": id,
+                "eTag": "base",
+                "cTag": ctag,
+                "folder": folder,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/drive/items/empty"))
+        .and(header("if-match", "empty-content"))
+        .respond_with(ResponseTemplate::new(412))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for id in ["empty", "nonempty", "untagged"] {
+        assert_eq!(
+            graph.delete_empty_folder_if_match(id, "base").await,
+            Err(CloudError::Conflict)
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
 }

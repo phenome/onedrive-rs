@@ -151,7 +151,12 @@ pub trait CloudDrive: Send + Sync {
         Err(CloudError::Unsupported)
     }
 
-    async fn delete_item(&self, _item_id: &str) -> Result<(), CloudError> {
+    /// Recycle the directory only if its identity and version match and it is empty.
+    async fn delete_empty_folder_if_match(
+        &self,
+        _item_id: &str,
+        _etag: &str,
+    ) -> Result<(), CloudError> {
         Err(CloudError::Unsupported)
     }
 }

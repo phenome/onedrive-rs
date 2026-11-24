@@ -595,10 +595,45 @@ impl CloudDrive for GraphDrive {
         Ok(())
     }
 
-    async fn delete_item(&self, item_id: &str) -> Result<(), CloudError> {
+    async fn delete_empty_folder_if_match(
+        &self,
+        item_id: &str,
+        etag: &str,
+    ) -> Result<(), CloudError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Folder {
+            child_count: Option<u64>,
+        }
+
+        #[derive(Deserialize)]
+        struct Directory {
+            id: String,
+            #[serde(rename = "eTag")]
+            etag: Option<String>,
+            #[serde(rename = "cTag")]
+            ctag: Option<String>,
+            folder: Option<Folder>,
+        }
+
         let url = self.endpoint(&["items", item_id]);
-        successful(self.graph(self.client.delete(url)).await?)?;
-        Ok(())
+        let request = self
+            .client
+            .get(url)
+            .query(&[("$select", "id,eTag,cTag,folder")]);
+        let directory: Directory = decode(self.graph(request).await?).await?;
+        if directory.id != item_id {
+            return Err(CloudError::InvalidResponse);
+        }
+        if directory.etag.as_deref() != Some(etag)
+            || directory.folder.and_then(|folder| folder.child_count) != Some(0)
+        {
+            return Err(CloudError::Conflict);
+        }
+        // The folder eTag does not cover descendant changes. Use the cTag
+        // from the same snapshot as the child count to close the race.
+        let ctag = directory.ctag.as_deref().ok_or(CloudError::Conflict)?;
+        self.delete_if_match(item_id, ctag).await
     }
 }
 

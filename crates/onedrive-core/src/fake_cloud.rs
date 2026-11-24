@@ -149,11 +149,20 @@ impl FakeCloudDrive {
             .clone()
     }
 
-    fn recycle(&self, item_id: &str, etag: Option<&str>) -> Result<(), CloudError> {
+    fn recycle(&self, item_id: &str, etag: &str, empty_folder: bool) -> Result<(), CloudError> {
         let mut state = self.state.lock().unwrap();
         state.online()?;
         let item = state.items.get(item_id).ok_or(CloudError::NotFound)?;
-        if etag.is_some() && item.etag.as_deref() != etag {
+        if item.etag.as_deref() != Some(etag) {
+            return Err(CloudError::Conflict);
+        }
+        if empty_folder
+            && (item.kind != ItemKind::Folder
+                || state
+                    .items
+                    .values()
+                    .any(|child| child.parent_id.as_deref() == Some(item_id)))
+        {
             return Err(CloudError::Conflict);
         }
         state.remove(item_id);
@@ -364,12 +373,16 @@ impl CloudDrive for FakeCloudDrive {
         self.move_with_condition(item_id, parent_id, name, Some(etag))
     }
 
-    async fn delete_item(&self, item_id: &str) -> Result<(), CloudError> {
-        self.recycle(item_id, None)
+    async fn delete_if_match(&self, item_id: &str, etag: &str) -> Result<(), CloudError> {
+        self.recycle(item_id, etag, false)
     }
 
-    async fn delete_if_match(&self, item_id: &str, etag: &str) -> Result<(), CloudError> {
-        self.recycle(item_id, Some(etag))
+    async fn delete_empty_folder_if_match(
+        &self,
+        item_id: &str,
+        etag: &str,
+    ) -> Result<(), CloudError> {
+        self.recycle(item_id, etag, true)
     }
 
     async fn read_range(

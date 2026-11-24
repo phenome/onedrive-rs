@@ -1010,37 +1010,34 @@ impl Engine {
                         |row| Ok((row.get::<_, Option<u64>>(0)?, row.get::<_, Option<String>>(1)?)),
                     ).optional()?;
                     let unpublished = has_publication(&self.db(), work.item.inode)?;
-                    let result = if unpublished {
-                        // The user removed the local file while its uploaded bytes
-                        // still awaited publication. A peer may now own this version.
-                        match work.item.etag.as_deref() {
-                            Some(etag) => self.cloud.delete_if_match(id, etag).await,
-                            None => Err(CloudError::Conflict),
-                        }
-                    } else {
-                        match &replacement {
-                            Some((_, Some(etag))) => self.cloud.delete_if_match(id, etag).await,
-                            Some((_, None)) => Err(CloudError::Conflict),
-                            None => self.cloud.delete_item(id).await,
-                        }
+                    let etag = match &replacement {
+                        Some((_, etag)) if !unpublished => etag.as_deref(),
+                        _ => work.item.etag.as_deref(),
                     };
+                    let result = self.dispatch_delete(id, work.item.kind, etag).await;
                     match result {
                         Ok(()) | Err(CloudError::NotFound) => {}
                         Err(CloudError::Conflict) if unpublished => {
                             return self.preserve_conflict(work, true).await;
                         }
-                        Err(CloudError::Conflict) if replacement.is_some() => {
+                        Err(CloudError::Conflict) => {
                             if let Some(remote) = self
                                 .cloud
                                 .upload_destination(UploadTarget::Existing { item_id: id })
                                 .await?
                             {
-                                self.preserve_replacement(
+                                let ordinary = replacement.is_none();
+                                self.restore_delete_conflict(
                                     work,
                                     replacement.and_then(|(inode, _)| inode),
                                     remote,
+                                    ordinary,
                                 )?;
-                                return Ok(());
+                                return if ordinary {
+                                    Err(CloudError::Conflict.into())
+                                } else {
+                                    Ok(())
+                                };
                             }
                         }
                         Err(error) => return Err(error.into()),
@@ -1057,6 +1054,19 @@ impl Engine {
             Action::Acknowledge => return self.acknowledge(work, None, false),
         };
         self.acknowledge(work, Some(remote), false)
+    }
+
+    async fn dispatch_delete(
+        &self,
+        item_id: &str,
+        kind: ItemKind,
+        etag: Option<&str>,
+    ) -> Result<(), CloudError> {
+        let etag = etag.ok_or(CloudError::Conflict)?;
+        match kind {
+            ItemKind::File => self.cloud.delete_if_match(item_id, etag).await,
+            ItemKind::Folder => self.cloud.delete_empty_folder_if_match(item_id, etag).await,
+        }
     }
 
     async fn dispatch_move(&self, work: &Work) -> Result<(), EngineError> {
@@ -1295,14 +1305,16 @@ impl Engine {
         Ok(self.cloud.upload_from(target, source, etag).await?)
     }
 
-    fn preserve_replacement(
+    fn restore_delete_conflict(
         &self,
         work: &Work,
         source_inode: Option<u64>,
         remote: RemoteItem,
+        ordinary: bool,
     ) -> Result<(), EngineError> {
         self.update_catalog(|tx| {
             let target = work.item.inode;
+            super::record_sighting(tx, &remote.item_id, false)?;
             let mut affected = crate::namespace::AffectedNames::default();
             affected.record_item(tx, &work.item.item_id)?;
             if let Some(name) = &remote.name {
@@ -1328,13 +1340,20 @@ impl Engine {
             let queued = job(tx, target)?.ok_or(EngineError::NotFound)?;
             if queued.stage.is_some() {
                 tx.execute("UPDATE writeback_queue SET deleted = 0 WHERE inode = ?1", [target])?;
+                if ordinary {
+                    tx.execute("UPDATE items SET sync_state = 3 WHERE inode = ?1", [target])?;
+                }
                 tx.execute("DELETE FROM writeback_replacements WHERE target_inode = ?1", [target])?;
             } else {
                 tx.execute("DELETE FROM writeback_queue WHERE inode = ?1", [target])?;
-                tx.execute("UPDATE items SET sync_state = 0 WHERE inode = ?1", [target])?;
+                tx.execute(
+                    "UPDATE items SET sync_state = ?2 WHERE inode = ?1",
+                    params![target, if ordinary { SyncState::Conflict } else { SyncState::Clean } as i64],
+                )?;
                 let revision = tx.query_row("SELECT revision FROM delta_checkpoint", [], |row| row.get(0))?;
                 super::upsert_remote_item(tx, remote, revision, 0)?;
             }
+            tx.execute("INSERT INTO changed_inodes VALUES (?1, 1)", [target])?;
             tx.execute("INSERT INTO changed_entries VALUES (?1, ?2)", params![work.item.parent_id, work.item.name])?;
             affected.reconcile(tx, false)?;
             Ok(())

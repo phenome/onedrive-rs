@@ -357,6 +357,12 @@ impl CloudDrive for InterruptedDrive {
         self.inner.upload_destination(target).await
     }
 
+    async fn delete_if_match(&self, id: &str, etag: &str) -> Result<(), CloudError> {
+        self.inner.delete_if_match(id, etag).await?;
+        self.after_acceptance().await;
+        Ok(())
+    }
+
     async fn move_if_match(
         &self,
         id: &str,
@@ -1016,5 +1022,114 @@ async fn missing_cold_base_retains_local_extents_without_using_newer_remote_byte
     assert_eq!(
         engine.getattr(inode).unwrap().unwrap().sync_state,
         SyncState::Conflict
+    );
+}
+
+#[tokio::test]
+async fn offline_unlink_and_rmdir_restore_identity_when_remote_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let drive = drive();
+    let folder = drive.create_folder("root", "folder").await.unwrap();
+    let mut file = cloud_file(4);
+    drive.upsert(file.clone());
+    drive.set_content("cold", b"base".to_vec());
+    let open = || Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap();
+    let engine = open();
+    engine.sync().await.unwrap();
+    let file_inode = engine.item("cold").unwrap().unwrap().inode;
+    let folder_inode = engine.item(&folder.item_id).unwrap().unwrap().inode;
+    drive.set_online(false);
+    engine.unlink(1, "cold", ItemKind::File).unwrap();
+    engine.unlink(1, "folder", ItemKind::Folder).unwrap();
+    assert!(engine.list_children("root").unwrap().is_empty());
+    drop(engine);
+
+    drive.set_online(true);
+    file.etag = Some("peer-version".into());
+    file.ctag = Some("peer-content".into());
+    drive.upsert(file);
+    drive.set_content("cold", b"peer".to_vec());
+    // FakeCloudDrive keeps the folder's original eTag when adding its child.
+    let child = drive
+        .upload(
+            UploadTarget::New {
+                parent_id: &folder.item_id,
+                name: "remote-child",
+            },
+            b"keep me",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let engine = open();
+    assert!(matches!(
+        engine.drain_uploads().await,
+        Err(EngineError::Cloud(CloudError::Conflict))
+    ));
+    assert!(drive.recycled_items().is_empty());
+    assert!(engine.pending_uploads().unwrap().is_empty());
+    engine.sync().await.unwrap();
+    let restored_file = engine.resolve_path("/cold").unwrap().unwrap();
+    assert_eq!(
+        (restored_file.inode, restored_file.sync_state),
+        (file_inode, SyncState::Conflict)
+    );
+    assert_eq!(
+        engine.read(restored_file.inode, 0, 4).await.unwrap(),
+        b"peer"
+    );
+    let restored_folder = engine.resolve_path("/folder").unwrap().unwrap();
+    assert_eq!(
+        (restored_folder.inode, restored_folder.sync_state),
+        (folder_inode, SyncState::Conflict)
+    );
+    let restored_child = engine
+        .resolve_path("/folder/remote-child")
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_child.item_id, child.item_id);
+    assert_eq!(
+        engine.read(restored_child.inode, 0, 7).await.unwrap(),
+        b"keep me"
+    );
+}
+
+#[tokio::test]
+async fn accepted_checked_delete_replays_by_id_without_touching_new_path_occupant() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let inner = drive();
+    inner.upsert(cloud_file(4));
+    inner.set_content("cold", b"base".to_vec());
+    let drive = interrupted_drive(inner.clone(), true);
+    let open = || Arc::new(Engine::open(&db, drive.clone(), Arc::new(SystemClock)).unwrap());
+    let engine = open();
+    engine.sync().await.unwrap();
+    engine.unlink(1, "cold", ItemKind::File).unwrap();
+    cancel_after_acceptance(engine.clone(), &drive).await;
+    drop(engine);
+
+    let replacement = inner
+        .upload(
+            UploadTarget::New {
+                parent_id: "root",
+                name: "cold",
+            },
+            b"new item",
+            None,
+        )
+        .await
+        .unwrap();
+    let engine = open();
+    engine.sync().await.unwrap();
+    assert_eq!(engine.drain_uploads().await.unwrap(), 1);
+    assert_eq!(inner.recycled_items(), ["cold"]);
+    let survivor = engine.resolve_path("/cold").unwrap().unwrap();
+    assert_eq!(survivor.item_id, replacement.item_id);
+    assert_eq!(
+        engine.read(survivor.inode, 0, 8).await.unwrap(),
+        b"new item"
     );
 }

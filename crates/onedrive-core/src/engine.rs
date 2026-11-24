@@ -332,6 +332,7 @@ impl Engine {
             let mut affected = AffectedNames::default();
             for (position, change) in page.changes.into_iter().enumerate() {
                 apply_change(
+                    self,
                     transaction,
                     change,
                     full_scan,
@@ -625,6 +626,7 @@ fn advance_checkpoint(
 }
 
 fn apply_change(
+    engine: &Engine,
     transaction: &Transaction<'_>,
     change: DeltaChange,
     full_scan: bool,
@@ -654,7 +656,7 @@ fn apply_change(
                 |row| row.get::<_, bool>(0),
             )?;
             if !suppressed && item.name.is_some() {
-                upsert_remote_item(transaction, item, revision, position, affected)?;
+                upsert_remote_item(engine, transaction, item, revision, position, affected)?;
             }
         }
     }
@@ -662,12 +664,14 @@ fn apply_change(
 }
 
 fn upsert_remote_item(
+    engine: &Engine,
     transaction: &Transaction<'_>,
     mut item: RemoteItem,
     revision: i64,
     position: usize,
     affected: &mut AffectedNames,
 ) -> rusqlite::Result<()> {
+    let displaced = engine.displace_open_revision(transaction, &item)?;
     let inode = reserved_inode(&item);
     let deferred_parent = defer_cyclic_remote_parent(transaction, &mut item)?;
     transaction.prepare_cached(
@@ -702,6 +706,15 @@ fn upsert_remote_item(
             revision,
             position
         ])?;
+    if let Some(old_inode) = displaced {
+        // A peer content change must retain explicitly set local attributes.
+        transaction.execute(
+            "INSERT INTO local_attributes (inode, mode, atime, mtime)
+             SELECT items.inode, old.mode, old.atime, old.mtime
+             FROM items, local_attributes AS old WHERE items.item_id = ?1 AND old.inode = ?2",
+            params![item.item_id, old_inode],
+        )?;
+    }
     if updated != 0 {
         if let Some(name) = item.name {
             affected.insert(item.parent_id, name);

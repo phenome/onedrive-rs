@@ -359,7 +359,7 @@ impl Engine {
                 if offset >= item.size || length == 0 {
                     return Ok(Vec::new());
                 }
-                let stage = self.open_stage(&tx, inode)?;
+                let stage = self.open_stage(&tx, &item)?;
                 let generation = if stage.is_none() {
                     Some(allocate_generation(&tx, inode)?)
                 } else {

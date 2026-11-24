@@ -23,7 +23,7 @@ async fn initial_delta_targets_the_personal_drive() {
     assert!(matches!(&page.changes[..], [DeltaChange::Upsert(item)] if item.item_id == "root"));
 }
 
-fn mock_graph(server: &MockServer) -> GraphDrive {
+pub(super) fn mock_graph(server: &MockServer) -> GraphDrive {
     GraphDrive::with_base(
         Arc::new(Auth::synthetic()),
         Url::parse(&format!("{}/v1.0", server.uri())).unwrap(),
@@ -100,7 +100,7 @@ async fn delta_preserves_opaque_links_and_maps_expired_cursors() {
     }
 }
 
-fn anonymous(request: &wiremock::Request) -> bool {
+pub(super) fn anonymous(request: &wiremock::Request) -> bool {
     !request.headers.contains_key(header::AUTHORIZATION)
 }
 
@@ -168,7 +168,7 @@ async fn ranged_cdn_reads_refresh_expired_urls_and_validate_responses() {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "@microsoft.graph.downloadUrl":format!("{}/content", cdn.uri())
             })))
-            .expect(1)
+            .expect(7)
             .mount(&server)
             .await;
 
@@ -228,6 +228,10 @@ async fn ranged_cdn_reads_refresh_expired_urls_and_validate_responses() {
             );
         }
         assert_eq!(graph.read_range("unused", u64::MAX, 0).await.unwrap(), b"");
+        assert_eq!(
+            graph.read_range("unused", u64::MAX, 2).await,
+            Err(CloudError::InvalidResponse)
+        );
         drop(expired);
     }
 }

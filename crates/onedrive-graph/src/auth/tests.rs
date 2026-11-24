@@ -222,3 +222,135 @@ async fn refresh_outage_and_rejected_grant_have_distinct_graph_errors() {
         );
     }
 }
+
+#[tokio::test]
+async fn production_xdg_open_runs_in_isolated_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let fixture = Fixture(
+        std::env::temp_dir().join(format!("onedrive-xdg-open-{}", random_token().unwrap())),
+    );
+    std::fs::create_dir(&fixture.0).unwrap();
+    let executable = fixture.0.join("xdg-open");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$1\" > \"$ONEDRIVE_XDG_OPEN_ARGS\"\nexit \"$ONEDRIVE_XDG_OPEN_STATUS\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    for (mode, status) in [("callback", "0"), ("failure", "37"), ("timeout", "0")] {
+        let output = timeout(
+            Duration::from_secs(10),
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::tests::xdg_open_fixture_worker",
+                    "--nocapture",
+                ])
+                .env("PATH", &fixture.0)
+                .env("ONEDRIVE_XDG_OPEN_MODE", mode)
+                .env("ONEDRIVE_XDG_OPEN_ARGS", fixture.0.join(mode))
+                .env("ONEDRIVE_XDG_OPEN_STATUS", status)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("fixture subprocess should finish promptly")
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{mode}: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+#[tokio::test]
+async fn xdg_open_fixture_worker() {
+    let Ok(mode) = std::env::var("ONEDRIVE_XDG_OPEN_MODE") else {
+        return;
+    };
+    let args = std::env::var_os("ONEDRIVE_XDG_OPEN_ARGS").unwrap();
+    let server = MockServer::start().await;
+    let store = Arc::new(FakeTokenStore::default());
+    let auth = mock_auth(&server, store.clone());
+    Mock::given(method("POST"))
+        .and(path(TOKEN))
+        .and(|request: &wiremock::Request| form(request)["code"] == "fixture-code")
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":3600
+        })))
+        .expect(u64::from(mode == "callback"))
+        .mount(&server)
+        .await;
+
+    let check_browser = async {
+        let authorize = loop {
+            if let Ok(contents) = std::fs::read_to_string(&args)
+                && let Some((count, url)) = contents.trim_end().split_once('\n')
+            {
+                assert_eq!(count, "1");
+                break Url::parse(url).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(
+            authorize.as_str().split('?').next().unwrap(),
+            format!("{}/consumers/oauth2/v2.0/authorize", server.uri()),
+        );
+        let query: HashMap<_, _> = authorize.query_pairs().into_owned().collect();
+        assert_eq!(query["client_id"], "test-client");
+        assert_eq!(query["scope"], SCOPES);
+        assert_eq!(query["code_challenge_method"], "S256");
+        let mut redirect = Url::parse(&query["redirect_uri"]).unwrap();
+        assert_eq!(redirect.scheme(), "http");
+        assert_eq!(redirect.host_str(), Some("localhost"));
+        let port = redirect.port().unwrap();
+
+        if mode == "callback" {
+            redirect
+                .query_pairs_mut()
+                .append_pair("state", &query["state"])
+                .append_pair("code", "fixture-code");
+            let response = crate::http_client()
+                .unwrap()
+                .get(redirect)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        } else if mode == "timeout" {
+            tokio::time::pause();
+            tokio::time::advance(LOGIN_TIMEOUT + Duration::from_secs(1)).await;
+        }
+        port
+    };
+
+    let (result, port) = tokio::join!(auth.login(), check_browser);
+    match mode.as_str() {
+        "callback" => {
+            result.unwrap();
+            assert_eq!(
+                store.load_refresh_token().await.unwrap().as_deref(),
+                Some("fixture-refresh")
+            );
+        }
+        "failure" => assert!(matches!(result, Err(AuthError::Browser)), "{result:?}"),
+        "timeout" => assert!(matches!(result, Err(AuthError::Timeout)), "{result:?}"),
+        _ => unreachable!(),
+    }
+    assert!(
+        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .is_err()
+    );
+}

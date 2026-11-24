@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -16,7 +15,6 @@ use tokio::time::{Instant, sleep_until};
 use crate::{Auth, AuthError};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
-const DOWNLOAD_URL_LIFETIME: Duration = Duration::from_secs(300);
 const SIMPLE_UPLOAD_LIMIT: usize = 10 * 1024 * 1024;
 const FRAGMENT_ALIGNMENT: usize = 320 * 1024;
 const FRAGMENT_SIZE: usize = 16 * FRAGMENT_ALIGNMENT;
@@ -26,13 +24,6 @@ pub struct GraphDrive {
     base: Url,
     client: Client,
     pause_until: Mutex<Instant>,
-    download_urls: Mutex<HashMap<String, DownloadUrl>>,
-}
-
-#[derive(Clone)]
-struct DownloadUrl {
-    url: Url,
-    expires: Instant,
 }
 
 impl GraphDrive {
@@ -46,7 +37,6 @@ impl GraphDrive {
             base,
             client: crate::http_client().map_err(|_| CloudError::Unavailable)?,
             pause_until: Mutex::new(Instant::now()),
-            download_urls: Mutex::new(HashMap::new()),
         })
     }
 
@@ -117,35 +107,10 @@ impl GraphDrive {
             download_url: String,
         }
 
-        let now = Instant::now();
-        {
-            let mut urls = self.download_urls.lock().unwrap();
-            urls.retain(|_, entry| entry.expires > now);
-            if let Some(entry) = urls.get(item_id) {
-                return Ok(entry.url.clone());
-            }
-        }
-
+        // A signed URL may keep serving an old version after its item changes.
         let url = self.endpoint(&["items", item_id]);
         let metadata: Metadata = decode(self.graph(self.client.get(url)).await?).await?;
-        let url = parse_url(&metadata.download_url)?;
-        self.download_urls.lock().unwrap().insert(
-            item_id.to_owned(),
-            DownloadUrl {
-                url: url.clone(),
-                expires: Instant::now() + DOWNLOAD_URL_LIFETIME,
-            },
-        );
-        Ok(url)
-    }
-
-    fn forget_download_url(&self, item_id: &str, expired: Option<&Url>) {
-        let mut urls = self.download_urls.lock().unwrap();
-        if expired
-            .is_none_or(|expired| urls.get(item_id).is_some_and(|entry| &entry.url == expired))
-        {
-            urls.remove(item_id);
-        }
+        parse_url(&metadata.download_url)
     }
 
     async fn resumable_upload(
@@ -172,9 +137,11 @@ impl GraphDrive {
         let url = parse_url(&session.upload_url)?;
         let mut start = 0;
         let mut recoveries = 0;
+        let mut final_uncertain = false;
 
         loop {
             let end = (start + FRAGMENT_SIZE).min(bytes.len());
+            let final_fragment = end == bytes.len();
             let request = self
                 .client
                 .put(url.clone())
@@ -184,42 +151,143 @@ impl GraphDrive {
                 )
                 .header(header::CONTENT_LENGTH, end - start)
                 .body(bytes[start..end].to_vec());
-            let response = match self.send(request).await {
+            let retry_error = match self.send(request).await {
                 Ok(response)
-                    if !response.status().is_server_error()
-                        && response.status() != StatusCode::RANGE_NOT_SATISFIABLE =>
+                    if final_fragment
+                        && matches!(response.status(), StatusCode::OK | StatusCode::CREATED) =>
                 {
-                    response
+                    if let Ok(item) = decode_upload_item(response, target).await {
+                        return Ok(item);
+                    }
+                    break;
                 }
-                Ok(_) | Err(CloudError::Unavailable | CloudError::Throttled { .. })
-                    if recoveries < 3 =>
-                {
-                    recoveries += 1;
-                    let status = self.send(self.client.get(url.clone())).await?;
-                    start = next_upload_offset(status, bytes.len()).await?;
-                    continue;
-                }
-                Ok(_) => return Err(CloudError::Unavailable),
-                Err(error) => return Err(error),
-            };
-            match response.status() {
-                StatusCode::OK | StatusCode::CREATED if end == bytes.len() => {
-                    return decode_item(response).await;
-                }
-                StatusCode::ACCEPTED => {
-                    let next = next_upload_offset(response, bytes.len()).await?;
+                Ok(response) if response.status() == StatusCode::ACCEPTED => {
+                    let next = match next_upload_offset(response, bytes.len()).await {
+                        Ok(next) => next,
+                        Err(_) if final_fragment || final_uncertain => break,
+                        Err(error) => return Err(error),
+                    };
                     if next != end {
                         recoveries += 1;
                         if recoveries > 3 {
+                            if final_fragment || final_uncertain {
+                                break;
+                            }
                             return Err(CloudError::InvalidResponse);
                         }
                     }
                     start = next;
+                    continue;
                 }
-                status if status.is_success() => return Err(CloudError::InvalidResponse),
-                status => return Err(status_error(status)),
+                Ok(response) if retryable_upload_status(response.status()) => {
+                    CloudError::Unavailable
+                }
+                Err(error @ (CloudError::Unavailable | CloudError::Throttled { .. })) => error,
+                Ok(response) => {
+                    let status = response.status();
+                    if ((final_fragment || final_uncertain)
+                        && (session_disappeared(status) || status.is_success()))
+                        || (final_uncertain && status_error(status) == CloudError::Conflict)
+                    {
+                        break;
+                    }
+                    return Err(if session_disappeared(status) {
+                        CloudError::Unavailable
+                    } else {
+                        status_error(status)
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            final_uncertain |= final_fragment;
+            if recoveries >= 3 {
+                if final_uncertain {
+                    break;
+                }
+                return Err(retry_error);
+            }
+            recoveries += 1;
+            let progress = match self.send(self.client.get(url.clone())).await {
+                Ok(status) => next_upload_offset(status, bytes.len()).await,
+                Err(error) => Err(error),
+            };
+            match progress {
+                Ok(next) => start = next,
+                Err(_) if final_uncertain => break,
+                Err(CloudError::NotFound) => return Err(CloudError::Unavailable),
+                Err(error) => return Err(error),
             }
         }
+
+        self.confirm_upload(target, bytes, if_match).await
+    }
+
+    async fn confirm_upload(
+        &self,
+        target: UploadTarget<'_>,
+        bytes: &[u8],
+        if_match: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        let destination = match target {
+            UploadTarget::Existing { item_id } => self.endpoint(&["items", item_id]),
+            UploadTarget::New { parent_id, name } => {
+                self.endpoint(&["items", &format!("{parent_id}:"), name])
+            }
+        };
+        let item = self.upload_destination(&destination).await?;
+        let tag = item.etag.as_deref().filter(|tag| !tag.is_empty());
+        if !item.matches_destination(target)
+            || tag.is_none()
+            || (if_match != Some("*") && tag == if_match)
+        {
+            return Err(CloudError::Unavailable);
+        }
+        let matches = if item.file.is_some()
+            && item.folder.is_none()
+            && item.size == Some(bytes.len() as u64)
+        {
+            let url = item
+                .download_url
+                .as_deref()
+                .ok_or(CloudError::Unavailable)
+                .and_then(parse_url)?;
+            let request = self
+                .client
+                .get(url)
+                .header(header::ACCEPT_ENCODING, "identity");
+            matches_upload_bytes(self.send(request).await?, bytes).await?
+        } else if item.folder.is_some() || item.size.is_some() {
+            false
+        } else {
+            return Err(CloudError::Unavailable);
+        };
+
+        // Confirm the download and destination lookup refer to the same current version.
+        let current = self.upload_destination(&destination).await?;
+        if !current.matches_destination(target)
+            || current.id != item.id
+            || current.etag != item.etag
+        {
+            return Err(CloudError::Unavailable);
+        }
+        if matches {
+            current.into_remote()
+        } else if matches!(target, UploadTarget::New { .. })
+            || if_match.is_some_and(|tag| tag != "*")
+        {
+            Err(CloudError::Conflict)
+        } else {
+            Err(CloudError::Unavailable)
+        }
+    }
+
+    async fn upload_destination(&self, url: &Url) -> Result<DriveItem, CloudError> {
+        decode(self.graph(self.client.get(url.clone())).await?)
+            .await
+            .map_err(|error| match error {
+                CloudError::NotFound | CloudError::Conflict => CloudError::Unavailable,
+                error => error,
+            })
     }
 
     fn upload_endpoint(&self, target: UploadTarget<'_>, operation: &str) -> Url {
@@ -320,27 +388,26 @@ impl CloudDrive for GraphDrive {
         if length == 0 {
             return Ok(Vec::new());
         }
-        let end = offset
-            .checked_add(length as u64 - 1)
-            .ok_or(CloudError::InvalidResponse)?;
+        let range = ByteRange::new(offset, length)?;
         for attempt in 0..2 {
             let url = self.download_url(item_id).await?;
             let request = self
                 .client
-                .get(url.clone())
-                .header(header::RANGE, format!("bytes={offset}-{end}"))
+                .get(url)
+                .header(
+                    header::RANGE,
+                    format!("bytes={}-{}", range.start, range.end),
+                )
                 .header(header::ACCEPT_ENCODING, "identity");
             let response = self.send(request).await?;
             if matches!(
                 response.status(),
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE
-            ) {
-                self.forget_download_url(item_id, Some(&url));
-                if attempt == 0 {
-                    continue;
-                }
+            ) && attempt == 0
+            {
+                continue;
             }
-            return range_bytes(response, offset, end, length).await;
+            return range_bytes(response, range).await;
         }
         unreachable!("the second download attempt always returns")
     }
@@ -351,23 +418,36 @@ impl CloudDrive for GraphDrive {
         bytes: &[u8],
         if_match: Option<&str>,
     ) -> Result<RemoteItem, CloudError> {
-        let item = if bytes.len() > SIMPLE_UPLOAD_LIMIT {
-            self.resumable_upload(target, bytes, if_match).await?
-        } else {
-            let mut url = self.upload_endpoint(target, "content");
-            if matches!(target, UploadTarget::New { .. }) {
-                url.query_pairs_mut()
-                    .append_pair("@microsoft.graph.conflictBehavior", "fail");
+        if bytes.len() > SIMPLE_UPLOAD_LIMIT {
+            return self.resumable_upload(target, bytes, if_match).await;
+        }
+        let mut url = self.upload_endpoint(target, "content");
+        if matches!(target, UploadTarget::New { .. }) {
+            url.query_pairs_mut()
+                .append_pair("@microsoft.graph.conflictBehavior", "fail");
+        }
+        let request = self
+            .client
+            .put(url)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes.to_vec());
+        match self.graph(conditional(request, if_match)).await {
+            Ok(response) if response.status().is_success() => {
+                match decode_upload_item(response, target).await {
+                    Ok(item) => Ok(item),
+                    Err(_) => self.confirm_upload(target, bytes, if_match).await,
+                }
             }
-            let request = self
-                .client
-                .put(url)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .body(bytes.to_vec());
-            decode_item(self.graph(conditional(request, if_match)).await?).await?
-        };
-        self.forget_download_url(&item.item_id, None);
-        Ok(item)
+            Ok(response)
+                if response.status().is_server_error()
+                    || response.status() == StatusCode::REQUEST_TIMEOUT =>
+            {
+                self.confirm_upload(target, bytes, if_match).await
+            }
+            Err(CloudError::Unavailable) => self.confirm_upload(target, bytes, if_match).await,
+            Ok(response) => Err(status_error(response.status())),
+            Err(error) => Err(error),
+        }
     }
 
     async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteItem, CloudError> {
@@ -390,7 +470,6 @@ impl CloudDrive for GraphDrive {
     async fn delete_item(&self, item_id: &str) -> Result<(), CloudError> {
         let url = self.endpoint(&["items", item_id]);
         successful(self.graph(self.client.delete(url)).await?)?;
-        self.forget_download_url(item_id, None);
         Ok(())
     }
 }
@@ -435,6 +514,52 @@ fn conditional(request: RequestBuilder, if_match: Option<&str>) -> RequestBuilde
     }
 }
 
+fn session_disappeared(status: StatusCode) -> bool {
+    matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE)
+}
+
+fn retryable_upload_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::REQUEST_TIMEOUT
+        )
+}
+
+async fn matches_upload_bytes(mut response: Response, bytes: &[u8]) -> Result<bool, CloudError> {
+    if response.status() != StatusCode::OK
+        || response.headers().contains_key(header::CONTENT_RANGE)
+        || !identity_encoding(&response)
+    {
+        return Err(CloudError::Unavailable);
+    }
+    let mut remaining = bytes;
+    let mut matches = true;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| CloudError::Unavailable)?
+    {
+        let Some((expected, rest)) = remaining.split_at_checked(chunk.len()) else {
+            return Err(CloudError::Unavailable);
+        };
+        matches &= chunk.as_ref() == expected;
+        remaining = rest;
+    }
+    if !remaining.is_empty() {
+        return Err(CloudError::Unavailable);
+    }
+    Ok(matches)
+}
+
+fn identity_encoding(response: &Response) -> bool {
+    response
+        .headers()
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| value == "identity")
+}
+
 async fn next_upload_offset(response: Response, size: usize) -> Result<usize, CloudError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -459,24 +584,31 @@ async fn next_upload_offset(response: Response, size: usize) -> Result<usize, Cl
         .ok_or(CloudError::InvalidResponse)
 }
 
-async fn range_bytes(
-    mut response: Response,
-    offset: u64,
+struct ByteRange {
+    start: u64,
     end: u64,
     length: usize,
-) -> Result<Vec<u8>, CloudError> {
-    let headers = response.headers();
-    if headers
-        .get_all(header::CONTENT_ENCODING)
-        .iter()
-        .any(|value| value != "identity")
-    {
+}
+
+impl ByteRange {
+    fn new(start: u64, length: usize) -> Result<Self, CloudError> {
+        let end = u64::try_from(length)
+            .ok()
+            .and_then(|length| length.checked_sub(1))
+            .and_then(|last| start.checked_add(last))
+            .ok_or(CloudError::InvalidResponse)?;
+        Ok(Self { start, end, length })
+    }
+}
+
+async fn range_bytes(mut response: Response, range: ByteRange) -> Result<Vec<u8>, CloudError> {
+    if !identity_encoding(&response) {
         return Err(CloudError::InvalidResponse);
     }
-    let content_range = headers.get(header::CONTENT_RANGE);
+    let content_range = response.headers().get(header::CONTENT_RANGE);
     let wanted = match response.status() {
-        StatusCode::PARTIAL_CONTENT => checked_range(content_range, offset, end)?,
-        StatusCode::OK if offset == 0 && content_range.is_none() => length,
+        StatusCode::PARTIAL_CONTENT => checked_range(content_range, &range)?,
+        StatusCode::OK if range.start == 0 && content_range.is_none() => range.length,
         StatusCode::OK => return Err(CloudError::InvalidResponse),
         StatusCode::RANGE_NOT_SATISFIABLE => {
             let size = content_range
@@ -484,7 +616,7 @@ async fn range_bytes(
                 .and_then(|value| value.strip_prefix("bytes */"))
                 .and_then(|value| value.parse::<u64>().ok());
             return match size {
-                Some(size) if offset >= size => Ok(Vec::new()),
+                Some(size) if range.start >= size => Ok(Vec::new()),
                 _ => Err(CloudError::InvalidResponse),
             };
         }
@@ -518,11 +650,7 @@ async fn range_bytes(
     Ok(bytes)
 }
 
-fn checked_range(
-    value: Option<&HeaderValue>,
-    offset: u64,
-    requested_end: u64,
-) -> Result<usize, CloudError> {
+fn checked_range(value: Option<&HeaderValue>, requested: &ByteRange) -> Result<usize, CloudError> {
     let (range, total) = value
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("bytes "))
@@ -532,15 +660,17 @@ fn checked_range(
     let start: u64 = start.parse().map_err(|_| CloudError::InvalidResponse)?;
     let end: u64 = end.parse().map_err(|_| CloudError::InvalidResponse)?;
     let expected_end = if total == "*" {
-        requested_end
+        requested.end
     } else {
         let total: u64 = total.parse().map_err(|_| CloudError::InvalidResponse)?;
-        requested_end.min(total.checked_sub(1).ok_or(CloudError::InvalidResponse)?)
+        requested
+            .end
+            .min(total.checked_sub(1).ok_or(CloudError::InvalidResponse)?)
     };
-    if start != offset || end < start || end != expected_end {
+    if start != requested.start || end < start || end != expected_end {
         return Err(CloudError::InvalidResponse);
     }
-    Ok((end - start + 1) as usize)
+    usize::try_from(end - start + 1).map_err(|_| CloudError::InvalidResponse)
 }
 
 fn successful(response: Response) -> Result<Response, CloudError> {
@@ -571,6 +701,17 @@ async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, CloudError
 
 async fn decode_item(response: Response) -> Result<RemoteItem, CloudError> {
     decode::<DriveItem>(response).await?.into_remote()
+}
+
+async fn decode_upload_item(
+    response: Response,
+    target: UploadTarget<'_>,
+) -> Result<RemoteItem, CloudError> {
+    let item: DriveItem = decode(response).await?;
+    if !item.matches_destination(target) || item.folder.is_some() {
+        return Err(CloudError::InvalidResponse);
+    }
+    item.into_remote()
 }
 
 #[derive(Deserialize)]
@@ -616,6 +757,8 @@ struct DriveItem {
     folder: Option<Value>,
     root: Option<Value>,
     deleted: Option<Value>,
+    #[serde(rename = "@microsoft.graph.downloadUrl")]
+    download_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -641,6 +784,23 @@ struct Hashes {
 }
 
 impl DriveItem {
+    fn matches_destination(&self, target: UploadTarget<'_>) -> bool {
+        if self.id.is_empty() || self.deleted.is_some() {
+            return false;
+        }
+        match target {
+            UploadTarget::Existing { item_id } => self.id == item_id,
+            UploadTarget::New { parent_id, name } => {
+                self.name.as_deref() == Some(name)
+                    && self
+                        .parent_reference
+                        .as_ref()
+                        .and_then(|parent| parent.id.as_deref())
+                        == Some(parent_id)
+            }
+        }
+    }
+
     fn into_remote(self) -> Result<RemoteItem, CloudError> {
         let timestamp = self
             .file_system_info
@@ -679,3 +839,6 @@ impl DriveItem {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod regressions;

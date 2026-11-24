@@ -285,11 +285,11 @@ impl Filesystem for FuseAdapter {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _kill_suid_gid: bool,
         reply: ReplyOpen,
     ) {
-        match self.engine.open_file(ino.0) {
+        match self.engine.open_file(ino.0, writable(flags.0)) {
             // Read through the Engine immediately after a catalog commit.
             // mmap uses kernel pages and still needs asynchronous invalidation.
             Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_DIRECT_IO),
@@ -304,7 +304,7 @@ impl Filesystem for FuseAdapter {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _flags: i32,
+        flags: i32,
         _kill_suid_gid: bool,
         _owner: Owner,
         reply: ReplyCreate,
@@ -312,7 +312,12 @@ impl Filesystem for FuseAdapter {
         let result = (|| {
             let item = self
                 .engine
-                .create_and_open(parent.0, file_name(name)?, Some(permissions(mode & !umask)))
+                .create_and_open_with_access(
+                    parent.0,
+                    file_name(name)?,
+                    Some(permissions(mode & !umask)),
+                    writable(flags),
+                )
                 .map_err(errno)?;
             Ok::<_, Errno>(item)
         })();
@@ -360,12 +365,15 @@ impl Filesystem for FuseAdapter {
         _fh: FileHandle,
         offset: u64,
         data: &[u8],
-        _write_flags: WriteFlags,
+        write_flags: WriteFlags,
         flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let append = flags.0 & rustix::fs::OFlags::APPEND.bits() as i32 != 0;
+        // Page-cache writes carry an absolute offset even if Linux selects an
+        // append handle to send them.
+        let append = !write_flags.contains(WriteFlags::FUSE_WRITE_CACHE)
+            && flags.0 & rustix::fs::OFlags::APPEND.bits() as i32 != 0;
         match self.run(self.engine.write(ino.0, offset, data, append)) {
             Ok(()) => reply.written(data.len() as u32),
             Err(error) => reply.error(error),
@@ -498,12 +506,13 @@ impl Filesystem for FuseAdapter {
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.engine.release_file(ino.0);
+        self.engine
+            .release_file_with_access(ino.0, writable(flags.0));
         reply.ok();
     }
 
@@ -576,6 +585,10 @@ impl Filesystem for FuseAdapter {
             Err(error) => reply.error(errno(error)),
         }
     }
+}
+
+fn writable(flags: i32) -> bool {
+    flags & rustix::fs::OFlags::ACCMODE.bits() as i32 != 0
 }
 
 // An empty catalog can mount before the first verified delta page arrives.

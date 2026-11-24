@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS writeback_queue (
     conflict INTEGER NOT NULL DEFAULT 0
 );
 
+-- A remotely replaced revision held by local open descriptors. The queue
+-- hides it from lookup and lets the last close retire the old inode.
+CREATE TABLE IF NOT EXISTS displaced_open_revisions (
+    inode INTEGER PRIMARY KEY REFERENCES writeback_queue(inode) ON DELETE CASCADE,
+    item_id TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS writeback_remote_namespace ON writeback_queue (remote_parent, remote_name);
 
 CREATE INDEX IF NOT EXISTS writeback_queue_priority ON writeback_queue (deleted DESC, sequence);

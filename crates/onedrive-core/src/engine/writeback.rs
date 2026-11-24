@@ -22,7 +22,13 @@ pub(super) struct Writeback {
     root: PathBuf,
     changed: Arc<Notify>,
     uploading: tokio::sync::Mutex<()>,
-    open_files: Mutex<HashMap<u64, usize>>,
+    open_files: Mutex<HashMap<u64, OpenFiles>>,
+}
+
+#[derive(Default)]
+struct OpenFiles {
+    all: usize,
+    writable: usize,
 }
 
 impl Writeback {
@@ -41,6 +47,11 @@ impl Writeback {
         )?
         .sync_all()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Open descriptors do not survive a daemon restart.
+        tx.execute(
+            "DELETE FROM items WHERE inode IN (SELECT inode FROM displaced_open_revisions)",
+            [],
+        )?;
         let referenced = tx
             .prepare("SELECT stage FROM writeback_queue WHERE stage IS NOT NULL UNION SELECT stage FROM writeback_attempts WHERE stage IS NOT NULL")?
             .query_map([], |row| row.get::<_, String>(0))?
@@ -116,6 +127,27 @@ fn copy_sparse(mut old: &File, mut new: &File, size: u64) -> io::Result<()> {
         offset = end;
     }
     Ok(())
+}
+
+fn base_for(db: &Connection, item: &CatalogItem, item_id: String) -> rusqlite::Result<Base> {
+    Ok(Base {
+        item_id,
+        etag: item.etag.clone(),
+        ctag: item.ctag.clone(),
+        cache_generation: super::sparse_cache::generation_for(db, item.inode)?,
+        missing: std::iter::once(0..item.size).collect(),
+    })
+}
+
+fn displaced_base(db: &Connection, item: &CatalogItem) -> rusqlite::Result<Option<Base>> {
+    db.query_row(
+        "SELECT item_id FROM displaced_open_revisions WHERE inode = ?1",
+        [item.inode],
+        |row| row.get(0),
+    )
+    .optional()?
+    .map(|id| base_for(db, item, id))
+    .transpose()
 }
 
 struct Base {
@@ -298,7 +330,7 @@ impl Base {
 }
 
 pub(super) struct Stage {
-    file: File,
+    file: Option<File>,
     base: Option<Base>,
 }
 
@@ -309,7 +341,9 @@ impl Stage {
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), EngineError> {
-        self.file.read_exact_at(output, offset)?;
+        if let Some(file) = &self.file {
+            file.read_exact_at(output, offset)?;
+        }
         if let Some(base) = &self.base {
             base.fill(engine, offset, output).await?;
         }
@@ -417,7 +451,7 @@ impl Engine {
         kind: ItemKind,
         mode: Option<u16>,
     ) -> Result<CatalogItem, EngineError> {
-        self.create_entry(parent, name, kind, mode, false)
+        self.create_entry(parent, name, kind, mode, None)
     }
 
     pub fn create_and_open(
@@ -426,7 +460,17 @@ impl Engine {
         name: &str,
         mode: Option<u16>,
     ) -> Result<CatalogItem, EngineError> {
-        self.create_entry(parent, name, ItemKind::File, mode, true)
+        self.create_and_open_with_access(parent, name, mode, false)
+    }
+
+    pub(crate) fn create_and_open_with_access(
+        &self,
+        parent: u64,
+        name: &str,
+        mode: Option<u16>,
+        writable: bool,
+    ) -> Result<CatalogItem, EngineError> {
+        self.create_entry(parent, name, ItemKind::File, mode, Some(writable))
     }
 
     fn create_entry(
@@ -435,7 +479,7 @@ impl Engine {
         name: &str,
         kind: ItemKind,
         mode: Option<u16>,
-        open: bool,
+        open: Option<bool>,
     ) -> Result<CatalogItem, EngineError> {
         let item = self.update_catalog_after(
             |tx| {
@@ -466,8 +510,8 @@ impl Engine {
                 item_by_inode(tx, inode as u64)?.ok_or(EngineError::NotFound)
             },
             |item| {
-                if open {
-                    self.register_open(item.inode);
+                if let Some(writable) = open {
+                    self.register_open(item.inode, writable);
                 }
             },
         )?;
@@ -543,18 +587,18 @@ impl Engine {
             if size > i64::MAX as u64 {
                 return Err(EngineError::InvalidMutation);
             }
+            let displaced = displaced_base(tx, &current)?;
+            if displaced.is_some() {
+                self.publish_displaced_edit(tx, &current)?;
+            }
             enqueue_existing(tx, &current)?;
             let queued = job(tx, inode)?.ok_or(EngineError::NotFound)?;
             let mut base = if let Some(stage) = &queued.stage {
                 Base::load(tx, stage)?
+            } else if let Some(base) = displaced {
+                Some(base)
             } else if let Some(item_id) = queued.remote_id.filter(|_| current.size != 0) {
-                Some(Base {
-                    item_id,
-                    etag: current.etag,
-                    ctag: current.ctag,
-                    cache_generation: super::sparse_cache::generation_for(tx, inode)?,
-                    missing: std::iter::once(0..current.size).collect(),
-                })
+                Some(base_for(tx, &current, item_id)?)
             } else {
                 None
             };
@@ -596,6 +640,31 @@ impl Engine {
         Ok(current)
     }
 
+    fn publish_displaced_edit(
+        &self,
+        tx: &Transaction<'_>,
+        item: &CatalogItem,
+    ) -> Result<(), EngineError> {
+        let parent = item
+            .parent_id
+            .as_deref()
+            .ok_or(EngineError::InvalidMutation)?;
+        let name = conflict_name(tx, parent, item, self.write_time(), &HashMap::new())?;
+        tx.execute(
+            "UPDATE items SET name = ?2, alias = NULL, sync_state = 3, remote_missing = 0 WHERE inode = ?1",
+            params![item.inode, name],
+        )?;
+        tx.execute(
+            "UPDATE writeback_queue SET deleted = 0, conflict = 1 WHERE inode = ?1",
+            [item.inode],
+        )?;
+        tx.execute(
+            "DELETE FROM displaced_open_revisions WHERE inode = ?1",
+            [item.inode],
+        )?;
+        Ok(())
+    }
+
     fn retire_unused_stage(&self, stage: &str) {
         // Catalog updates have already committed. Reopening retries cleanup
         // without making a caller repeat a successful write.
@@ -625,24 +694,33 @@ impl Engine {
     pub(super) fn open_stage(
         &self,
         db: &Connection,
-        inode: u64,
+        item: &CatalogItem,
     ) -> Result<Option<Stage>, EngineError> {
-        let stage = db
+        let queued = db
             .query_row(
-                "SELECT stage FROM writeback_queue WHERE inode = ?1",
-                [inode],
-                |row| row.get::<_, Option<String>>(0),
+                "SELECT queue.stage, displaced.item_id FROM writeback_queue AS queue
+                 LEFT JOIN displaced_open_revisions AS displaced USING (inode)
+                 WHERE queue.inode = ?1",
+                [item.inode],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
-            .optional()?
-            .flatten();
-        stage
-            .map(|name| {
-                Ok(Stage {
-                    file: File::open(self.writeback.root.join(&name))?,
-                    base: Base::load(db, &name)?,
-                })
-            })
-            .transpose()
+            .optional()?;
+        match queued {
+            Some((Some(name), _)) => Ok(Some(Stage {
+                file: Some(File::open(self.writeback.root.join(&name))?),
+                base: Base::load(db, &name)?,
+            })),
+            Some((None, Some(item_id))) => Ok(Some(Stage {
+                file: None,
+                base: Some(base_for(db, item, item_id)?),
+            })),
+            _ => Ok(None),
+        }
     }
 
     /// Refuse Purge while there is local work queued for this item.
@@ -734,7 +812,7 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn open_file(&self, inode: u64) -> Result<(), EngineError> {
+    pub(crate) fn open_file(&self, inode: u64, writable: bool) -> Result<(), EngineError> {
         let db = self.db();
         let item = item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?;
         if item.kind != ItemKind::File {
@@ -748,7 +826,7 @@ impl Engine {
         db.execute("UPDATE items SET last_accessed_at = max(coalesce(last_accessed_at, 0), ?2)
                     WHERE inode = ?1 AND inode IN (SELECT inode FROM sparse_files WHERE inode = ?1)",
             params![inode, self.access_time()])?;
-        self.register_open(inode);
+        self.register_open(inode, writable);
         Ok(())
     }
 
@@ -760,25 +838,74 @@ impl Engine {
             .contains_key(&inode)
     }
 
-    fn register_open(&self, inode: u64) {
-        *self
-            .writeback
-            .open_files
-            .lock()
-            .unwrap()
-            .entry(inode)
-            .or_default() += 1;
+    fn register_open(&self, inode: u64, writable: bool) {
+        let mut files = self.writeback.open_files.lock().unwrap();
+        let handles = files.entry(inode).or_default();
+        handles.all += 1;
+        handles.writable += usize::from(writable);
     }
 
     pub fn release_file(&self, inode: u64) {
+        self.release_file_with_access(inode, false);
+    }
+
+    pub(crate) fn release_file_with_access(&self, inode: u64, writable: bool) {
         let mut files = self.writeback.open_files.lock().unwrap();
-        if let Some(count) = files.get_mut(&inode) {
-            *count -= 1;
-            if *count == 0 {
+        if let Some(handles) = files.get_mut(&inode) {
+            handles.all -= 1;
+            handles.writable -= usize::from(writable);
+            if handles.all == 0 {
                 files.remove(&inode);
             }
         }
         self.writeback.changed.notify_one();
+    }
+
+    pub(super) fn displace_open_revision(
+        &self,
+        tx: &Transaction<'_>,
+        remote: &RemoteItem,
+    ) -> rusqlite::Result<Option<u64>> {
+        let Some(item) = item_by_id(tx, &remote.item_id)? else {
+            return Ok(None);
+        };
+        if item.kind != ItemKind::File
+            || (item.kind == remote.kind
+                && item.size == remote.size
+                && item.mtime == remote.mtime
+                && item.ctag == remote.ctag
+                && (remote.ctag.is_some() || item.etag == remote.etag))
+            || !self
+                .writeback
+                .open_files
+                .lock()
+                .unwrap()
+                .get(&item.inode)
+                .is_some_and(|handles| handles.writable > 0)
+            || !matches!(item.sync_state, SyncState::Clean | SyncState::Conflict)
+            || job(tx, item.inode)?.is_some()
+        {
+            return Ok(None);
+        }
+
+        // Linux page-cache writeback reports an inode and can pick any writable
+        // handle associated with it. A writable descriptor can acquire a shared
+        // mapping without another FUSE request. Keep that inode on its old
+        // revision, and let the remote revision claim the name with a new inode.
+        tx.execute(
+            "INSERT INTO writeback_queue (inode, deleted) VALUES (?1, 1)",
+            [item.inode],
+        )?;
+        tx.execute(
+            "INSERT INTO displaced_open_revisions VALUES (?1, ?2)",
+            params![item.inode, item.item_id],
+        )?;
+        tx.execute(
+            "UPDATE items SET item_id = 'local:' || lower(hex(randomblob(16))), sync_state = 1 WHERE inode = ?1",
+            [item.inode],
+        )?;
+        tx.execute("INSERT INTO changed_inodes VALUES (?1, 0)", [item.inode])?;
+        Ok(Some(item.inode))
     }
 
     /// Expose queued catalog entries, including deletions hidden from the mount.
@@ -792,7 +919,8 @@ impl Engine {
         let tx = db.unchecked_transaction()?;
         let mut select = tx.prepare_cached(
             "SELECT item_id, sync_state FROM items
-             WHERE inode IN (SELECT inode FROM writeback_queue) OR sync_state = ?1 ORDER BY inode",
+             WHERE (inode IN (SELECT inode FROM writeback_queue) OR sync_state = ?1)
+               AND inode NOT IN (SELECT inode FROM displaced_open_revisions) ORDER BY inode",
         )?;
         select
             .query_map([SyncState::Conflict as i64], |row| {
@@ -1438,7 +1566,7 @@ impl Engine {
                     params![target, if ordinary { SyncState::Conflict } else { SyncState::Clean } as i64],
                 )?;
                 let revision = tx.query_row("SELECT revision FROM delta_checkpoint", [], |row| row.get(0))?;
-                super::upsert_remote_item(tx, remote, revision, 0, &mut affected)?;
+                super::upsert_remote_item(self, tx, remote, revision, 0, &mut affected)?;
             }
             tx.execute("INSERT INTO changed_inodes VALUES (?1, 1)", [target])?;
             tx.execute("INSERT INTO changed_entries VALUES (?1, ?2)", params![work.item.parent_id, work.item.name])?;
@@ -1648,7 +1776,8 @@ impl Engine {
 
 fn queued_items(db: &Connection) -> Result<Vec<CatalogItem>, EngineError> {
     let mut query = db.prepare_cached(&format!(
-        "SELECT {} FROM items WHERE inode IN (SELECT inode FROM writeback_queue) ORDER BY inode",
+        "SELECT {} FROM items WHERE inode IN (SELECT inode FROM writeback_queue)
+         AND inode NOT IN (SELECT inode FROM displaced_open_revisions) ORDER BY inode",
         super::ITEM_COLUMNS,
     ))?;
     Ok(query
@@ -1943,7 +2072,7 @@ impl Engine {
                     affected.insert(original.parent_id.clone(), name.clone());
                 }
                 let revision = tx.query_row("SELECT revision FROM delta_checkpoint", [], |row| row.get(0))?;
-                super::upsert_remote_item(tx, original, revision, 0, &mut affected)?;
+                super::upsert_remote_item(self, tx, original, revision, 0, &mut affected)?;
             }
             affected.reconcile(tx, false)?;
             Ok(())

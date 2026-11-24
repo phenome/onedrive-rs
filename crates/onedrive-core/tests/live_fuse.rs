@@ -92,6 +92,145 @@ fn live_cold_write_restart_and_reconnect() {
     );
 }
 
+#[test]
+fn live_writable_mapping_preserves_peer_revision() {
+    supervise_mount(
+        "live_writable_mapping_preserves_peer_revision",
+        exercise_writable_mapping,
+    );
+}
+
+fn exercise_writable_mapping(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mount = dir.join("mount");
+    let path = mount.join("mapped");
+    let drive = Arc::new(FakeCloudDrive::new(10));
+    let root = RemoteItem {
+        item_id: "root".into(),
+        parent_id: None,
+        name: Some("root".into()),
+        kind: ItemKind::Folder,
+        size: 0,
+        mtime: 100,
+        etag: None,
+        ctag: None,
+        quickxor_hash: None,
+    };
+    let mut item = RemoteItem {
+        item_id: "mapped".into(),
+        parent_id: Some("root".into()),
+        name: Some("mapped".into()),
+        kind: ItemKind::File,
+        size: 8192,
+        etag: Some("first".into()),
+        ..root.clone()
+    };
+    let original = vec![b'a'; item.size as usize];
+    drive.upsert(root);
+    drive.upsert(item.clone());
+    drive.set_content("mapped", original.clone());
+    let engine =
+        Arc::new(Engine::open(dir.join("db"), drive.clone(), Arc::new(SystemClock)).unwrap());
+    runtime.block_on(engine.sync()).unwrap();
+    let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
+        .mount(&mount)
+        .unwrap();
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let old = File::open(&path).unwrap();
+    let inode = old.metadata().unwrap().ino();
+    let mut mapper = command("python3")
+        .args([
+            "-c",
+            "import mmap, sys
+with open(sys.argv[1], 'a+b') as file:
+    data = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_WRITE)
+with data:
+    assert data[:] == b'a' * 8192
+    data[0] = ord('l')
+    sys.stdout.buffer.write(b'r')
+    sys.stdout.buffer.flush()
+    assert sys.stdin.buffer.read(1) == b'f'
+    data[4096] = ord('m')
+    data.flush()",
+        ])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = [0];
+    mapper
+        .stdout
+        .take()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    assert_eq!(&ready, b"r");
+
+    let mut peer = original.clone();
+    peer[1] = b'p';
+    peer[4097] = b'q';
+    item.etag = Some("peer".into());
+    drive.set_content("mapped", peer.clone());
+    drive.upsert(item.clone());
+    runtime.block_on(engine.sync()).unwrap();
+    assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(old.metadata().unwrap().nlink(), 0);
+    assert_eq!(fs::read(&path).unwrap(), peer);
+    assert!(engine.pending_upload_paths().unwrap().is_empty());
+
+    // A normal write through a newly opened descriptor targets the current revision.
+    let current = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    current.write_all_at(b"D", 2).unwrap();
+    peer[2] = b'D';
+
+    mapper.stdin.take().unwrap().write_all(b"f").unwrap();
+    assert!(mapper.wait().unwrap().success());
+    runtime.block_on(engine.drain_uploads()).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), peer);
+    let conflict = engine
+        .list_children("root")
+        .unwrap()
+        .into_iter()
+        .find(|item| item.sync_state == SyncState::Conflict)
+        .unwrap();
+    let mut local = original;
+    local[0] = b'l';
+    local[4096] = b'm';
+    assert_eq!(conflict.inode, inode);
+    assert_eq!(old.metadata().unwrap().ino(), inode);
+    assert_eq!(old.metadata().unwrap().nlink(), 1);
+    let mut through_open_descriptor = Vec::new();
+    (&old).read_to_end(&mut through_open_descriptor).unwrap();
+    assert_eq!(through_open_descriptor, local);
+    assert_eq!(fs::read(mount.join(conflict.name)).unwrap(), local);
+    drop(old);
+
+    // An open writer without a dirty mapping can be displaced without
+    // leaving a Conflict Copy or a queued operation.
+    let replaced = current.metadata().unwrap().ino();
+    item.etag = Some("peer-again".into());
+    let newest = vec![b'n'; peer.len()];
+    drive.set_content("mapped", newest.clone());
+    drive.upsert(item);
+    runtime.block_on(engine.sync()).unwrap();
+    assert_eq!(current.metadata().unwrap().nlink(), 0);
+    assert_eq!(fs::read(&path).unwrap(), newest);
+    assert!(engine.pending_uploads().unwrap().is_empty());
+    drop(current);
+    unmount(&mount, session);
+    drop(engine);
+    let reopened = Engine::open(dir.join("db"), drive, Arc::new(SystemClock)).unwrap();
+    assert!(reopened.getattr(replaced).unwrap().is_none());
+    assert_eq!(reopened.list_children("root").unwrap().len(), 2);
+}
+
 fn exercise_cold_writeback(dir: &Path) {
     use std::fs::OpenOptions;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -376,12 +515,12 @@ fn exercise_mount(dir: &Path) {
         .0
         .store(6 * 86_400, std::sync::atomic::Ordering::Relaxed);
     let reopened = File::open(&path).unwrap();
-    reopened.read_exact_at(&mut sniff, 0).unwrap();
-    assert_eq!(sniff, bytes[..32768]);
     assert_eq!(
         fs::metadata(&path).unwrap().atime(),
         1_800_000_000 + 6 * 86_400
     );
+    reopened.read_exact_at(&mut sniff, 0).unwrap();
+    assert_eq!(sniff, bytes[..32768]);
     clock
         .0
         .store(14 * 86_400, std::sync::atomic::Ordering::Relaxed);
@@ -393,7 +532,7 @@ fn exercise_mount(dir: &Path) {
     assert_eq!(sniff, bytes[32768..HEADER]);
     assert_eq!(drive.range_requests().len(), 1);
     let mut mapping = map_prefix(&path, HEADER);
-    assert_mapped_bytes(&mut mapping, &bytes[..HEADER]);
+    assert_eq!(mapped_bytes(&mut mapping, HEADER), bytes[..HEADER]);
     assert_eq!(drive.range_requests(), [("file".into(), 0, HEADER)]);
     let mut span = [0; 32];
     handle.read_exact_at(&mut span, STREAM as u64 - 16).unwrap();
@@ -423,8 +562,18 @@ fn exercise_mount(dir: &Path) {
     handle.read_exact_at(&mut sniff, 0).unwrap();
     assert_eq!(sniff, new_bytes[..32768]);
     assert_eq!(drive.range_requests().len(), 5);
-    mapping.stdin.take().unwrap().write_all(b"r").unwrap();
-    assert_mapped_bytes(&mut mapping, &new_bytes[..HEADER]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while {
+        mapping.stdin.as_mut().unwrap().write_all(b"r").unwrap();
+        mapped_bytes(&mut mapping, HEADER) != new_bytes[..HEADER]
+    } {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resident mapping stayed stale"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(mapping.stdin.take());
     assert!(mapping.wait().unwrap().success());
     assert_eq!(drive.range_requests().len(), 5);
 
@@ -534,8 +683,9 @@ with open(sys.argv[1], 'rb') as file:
     with mmap.mmap(file.fileno(), int(sys.argv[2]), access=mmap.ACCESS_READ) as data:
         sys.stdout.buffer.write(data[:])
         sys.stdout.buffer.flush()
-        if sys.stdin.buffer.read(1):
-            sys.stdout.buffer.write(data[:])",
+        while sys.stdin.buffer.read(1):
+            sys.stdout.buffer.write(data[:])
+            sys.stdout.buffer.flush()",
         ])
         .arg(path)
         .arg(length.to_string())
@@ -545,15 +695,15 @@ with open(sys.argv[1], 'rb') as file:
         .unwrap()
 }
 
-fn assert_mapped_bytes(mapping: &mut Child, expected: &[u8]) {
-    let mut actual = vec![0; expected.len()];
+fn mapped_bytes(mapping: &mut Child, length: usize) -> Vec<u8> {
+    let mut actual = vec![0; length];
     mapping
         .stdout
         .as_mut()
         .unwrap()
         .read_exact(&mut actual)
         .unwrap();
-    assert!(actual == expected, "mapped bytes did not match");
+    actual
 }
 
 fn assert_xattrs(path: &Path, state: &[u8], pin: &[u8], etag: &[u8]) {

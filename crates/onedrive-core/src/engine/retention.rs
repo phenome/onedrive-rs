@@ -237,6 +237,7 @@ impl Engine {
 
     /// Cached content bytes, excluding sparse holes and counting overlapping ranges once.
     pub fn cache_status(&self) -> Result<CacheStatus, EngineError> {
+        let invalid = self.invalid_cache_inodes()?;
         let space = self.cache_capacity()?;
         let available_disk_bytes = space.f_bavail.saturating_mul(space.f_frsize);
         let hydration_paused_low_disk = self.hydration_paused_low_disk.load(Ordering::Relaxed);
@@ -249,6 +250,9 @@ impl Engine {
                 || available_disk_bytes < self.config.min_free_disk_bytes,
         };
         for entry in cached_files(&self.db(), false)? {
+            if invalid.contains(&entry.inode) {
+                continue;
+            }
             if entry.pinned {
                 status.pinned_bytes += entry.bytes;
             } else {

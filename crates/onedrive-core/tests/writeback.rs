@@ -90,6 +90,14 @@ async fn conditional_upload_preserves_remote_and_local_versions() {
         Some(b"Conflict".to_vec())
     );
     assert_eq!(engine.read(copy.inode, 0, 20).await.unwrap(), b"bEDIT");
+    assert_eq!(engine.pending_upload_count().unwrap(), 0);
+    assert_eq!(
+        engine.pending_upload_paths().unwrap(),
+        vec![(
+            std::path::Path::new("/").join(&copy.name),
+            SyncState::Conflict
+        )]
+    );
     assert_eq!(
         onedrive_core::CloudDrive::read_range(&*drive, &copy.item_id, 0, 20)
             .await

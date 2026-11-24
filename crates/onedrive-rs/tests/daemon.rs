@@ -42,6 +42,10 @@ impl CloudDrive for IsolatedCloud {
         if self.dir.join("offline").exists() {
             return Err(CloudError::Unavailable);
         }
+        if self.dir.join("remote-delete-cached").exists() {
+            fs::remove_file(self.dir.join("remote-delete-cached")).unwrap();
+            self.fake.delete("cached");
+        }
         let page = self.fake.delta(request).await?;
         if let DeltaCursor::Complete(link) = &page.cursor {
             fs::write(self.dir.join("issued-cursor"), link).unwrap();
@@ -356,11 +360,14 @@ fn mounted_daemon_lifecycle() {
             .stdout,
         b"hello"
     );
+    fs::remove_dir_all(sandbox.dir().join("cache/onedrive-rs")).unwrap();
+    let status = sandbox.cli("status");
+    assert_eq!(status["result"]["pinned_cache_bytes"], 0);
+    assert_eq!(status["result"]["unpinned_cache_bytes"], 0);
     sandbox.stop(Signal::INT);
     assert!(!socket.exists());
     assert!(!mounted(&mount));
     fs::remove_file(sandbox.dir().join("resumed-cursor")).unwrap();
-    fs::remove_dir_all(sandbox.dir().join("cache/onedrive-rs")).unwrap();
     sandbox.start(true);
     wait_for(|| sandbox.dir().join("resumed-cursor").exists());
     assert_eq!(
@@ -372,6 +379,41 @@ fn mounted_daemon_lifecycle() {
     assert_eq!(status["result"]["unpinned_cache_bytes"], 0);
     assert_eq!(xattr(&mount.join("content.txt"), "pin"), "pinned");
     assert_eq!(xattr(&mount.join("content.txt"), "state"), "Cloud-only");
+    sandbox.stop(Signal::TERM);
+}
+
+#[test]
+fn mounted_daemon_observes_remote_deletion_on_the_next_poll() {
+    let mut sandbox = Sandbox::new();
+    fs::write(
+        sandbox.dir().join("config/onedrive-rs/config.toml"),
+        "delta_poll_interval_secs = 1",
+    )
+    .unwrap();
+    let legacy = sandbox.dir().join("state/onedrive-rs");
+    fs::create_dir_all(&legacy).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o755)).unwrap();
+    sandbox.start(false);
+    let cached = sandbox.mount.join("cached.txt");
+    wait_for(|| {
+        bounded("test")
+            .arg("-f")
+            .arg(&cached)
+            .status()
+            .unwrap()
+            .success()
+    });
+    fs::write(sandbox.dir().join("remote-delete-cached"), "").unwrap();
+    wait_for(|| {
+        !bounded("test")
+            .arg("-e")
+            .arg(&cached)
+            .status()
+            .unwrap()
+            .success()
+    });
+    assert!(mounted(&sandbox.mount));
     sandbox.stop(Signal::TERM);
 }
 

@@ -166,7 +166,9 @@ fn migrate_legacy_catalog(
     state: &Path,
     data: &Path,
 ) -> Result<Option<File>, Box<dyn std::error::Error>> {
-    if !state.try_exists()? || state.canonicalize()? == data.canonicalize()? {
+    if !Engine::catalog_storage_present(&state.join("catalog.sqlite3"))?
+        || state.canonicalize()? == data.canonicalize()?
+    {
         return Ok(None);
     }
     let legacy_lock = lock_storage(state)?;

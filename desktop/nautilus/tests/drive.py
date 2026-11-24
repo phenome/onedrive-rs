@@ -125,14 +125,15 @@ def perform_action(location, operation, status, emblem):
     def menu_patch():
         return screen_crop(x + 5, y + 4, 225, 220)
 
-    input_event(1, location)
     tile = menu_patch()
     input_event(3, location)
     wait_for(f"visible {operation} menu", lambda: menu_patch() != tile)
     assert ["menu", POSITIVE, [[f"OneDrive::{operation}", True]]] in events()
     # Nautilus 51 places the single extension item just above Properties.
-    input_event(keys=(0xFF52, 0xFF52, 0xFF0D))  # Up, Up, Return
-    wait_for(f"closed {operation} menu", lambda: menu_patch() == tile)
+    for symbol in (0xFF52, 0xFF52, 0xFF0D):  # Up, Up, Return
+        # Let GTK finish opening the popover and move focus between key events.
+        time.sleep(0.15)
+        input_event(keys=(symbol,))
 
     def observed():
         current = events()[previous:]

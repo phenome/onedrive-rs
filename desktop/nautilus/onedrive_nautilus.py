@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+from weakref import ref
 
 import gi
 
@@ -68,7 +69,7 @@ def mount_candidate(file_info, mount):
         return None
     path = Path(location)
     # This cheap check avoids any filesystem lookup for unrelated Nautilus items.
-    if path != mount and path.is_relative_to(mount) and ".." not in path.parts:
+    if path.is_relative_to(mount) and ".." not in path.parts:
         return path
     return None
 
@@ -76,7 +77,7 @@ def mount_candidate(file_info, mount):
 def read_status(path, mount, cancellable, complete):
     """Check each path component without following links, then read item xattrs."""
     relative = path.relative_to(mount)
-    components = iter([*reversed(path.parents[:-1]), path])
+    components = iter(relative.parts)
 
     def query(component):
         parent = component != path
@@ -96,7 +97,7 @@ def read_status(path, mount, cancellable, complete):
             if info.get_file_type() != Gio.FileType.DIRECTORY:
                 complete(None)
                 return
-            query(next(components))
+            query(component / next(components))
             return
         if info.get_file_type() not in {Gio.FileType.REGULAR, Gio.FileType.DIRECTORY}:
             complete(None)
@@ -104,9 +105,9 @@ def read_status(path, mount, cancellable, complete):
         state = info.get_attribute_string(STATE_XATTR)
         pin = info.get_attribute_string(PIN_XATTR)
         status = Status.parse(f"{state}:{pin}")
-        complete(("/" + relative.as_posix(), status) if status else None)
+        complete(("/" + "/".join(relative.parts), status) if status else None)
 
-    query(next(components))
+    query(mount)
 
 
 def request(socket_path, operation, path, complete):
@@ -187,11 +188,43 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
         self.socket_path = runtime / "onedrive-rs" / "daemon.sock"
         self.pending = {}
         self.active_paths = set()
+        self.observed_files = {}
+
+    def observe(self, file_info):
+        key = hash(file_info)
+        if key in self.observed_files:
+            return
+        provider_ref = ref(self)
+
+        def forget():
+            provider = provider_ref()
+            if provider is not None:
+                provider.observed_files.pop(key, None)
+
+        # Keep a GObject weak reference so tracking follows the native object's lifetime.
+        self.observed_files[key] = file_info.weak_ref(forget)
+
+    def invalidate_affected(self, path, selected):
+        affected = {selected}
+        for file_ref in tuple(self.observed_files.values()):
+            file_info = file_ref()
+            if file_info is None:
+                continue
+            observed = mount_candidate(file_info, self.mount)
+            # Descendants can inherit retention changes. Ancestors can show
+            # aggregate state changes even when they were outside the selection.
+            if observed is not None and (
+                observed.is_relative_to(path) or path.is_relative_to(observed)
+            ):
+                affected.add(file_info)
+        for file_info in affected:
+            file_info.invalidate_extension_info()
 
     def update_file_info_full(self, provider, handle, closure, file_info):
         path = mount_candidate(file_info, self.mount)
         if path is None:
             return Nautilus.OperationResult.COMPLETE
+        self.observe(file_info)
         cancellable = Gio.Cancellable()
         self.pending[handle] = cancellable
 
@@ -230,6 +263,7 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
         if status is None:
             return []
 
+        self.observe(file_info)
         items = []
         for operation, (sensitive, tip) in status.actions().items():
             item = Nautilus.MenuItem(
@@ -249,12 +283,14 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
 
         def finish(error):
             self.active_paths.remove(path)
+            if error is None:
+                self.invalidate_affected(path, file_info)
+                return
             file_info.invalidate_extension_info()
-            if error is not None:
-                application = Gtk.Application.get_default()
-                parent = application.get_active_window() if application else None
-                dialog = Gtk.AlertDialog(message="OneDrive action failed", detail=error)
-                dialog.show(parent)
+            application = Gtk.Application.get_default()
+            parent = application.get_active_window() if application else None
+            dialog = Gtk.AlertDialog(message="OneDrive action failed", detail=error)
+            dialog.show(parent)
 
         def checked(result):
             if result is None:

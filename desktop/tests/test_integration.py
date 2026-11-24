@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import gc
 import json
 import os
 from pathlib import Path
@@ -10,34 +11,35 @@ import unittest
 from unittest.mock import Mock, patch
 
 import onedrive_nautilus as extension
-from gi.repository import Gio, GLib, Nautilus
+from gi.repository import Gio, GLib, GObject, Nautilus
 
 
-class FileInfo:
+class FileInfo(GObject.Object, Nautilus.FileInfo):
     """Nautilus file metadata seam used by the production provider methods."""
 
     def __init__(self, location):
+        super().__init__()
         self.location = location
         self.attributes = {}
         self.emblems = []
         self.invalidations = 0
 
-    def get_uri_scheme(self):
+    def do_get_uri_scheme(self):
         return self.location.get_uri_scheme()
 
-    def get_location(self):
+    def do_get_location(self):
         return self.location
 
-    def add_string_attribute(self, name, value):
+    def do_add_string_attribute(self, name, value):
         self.attributes[name] = value
 
-    def get_string_attribute(self, name):
+    def do_get_string_attribute(self, name):
         return self.attributes.get(name)
 
-    def add_emblem(self, name):
+    def do_add_emblem(self, name):
         self.emblems.append(name)
 
-    def invalidate_extension_info(self):
+    def do_invalidate_extension_info(self):
         self.invalidations += 1
         self.attributes.clear()
         self.emblems.clear()
@@ -60,9 +62,10 @@ class ExtensionTests(unittest.TestCase):
             patch.object(Nautilus, "info_provider_update_complete_invoke")
         )
 
-    def set_status(self, state, pin):
-        os.setxattr(self.path, "user.onedrive.state", state.encode())
-        os.setxattr(self.path, "user.onedrive.pin", pin.encode())
+    def set_status(self, state, pin, path=None):
+        path = self.path if path is None else path
+        os.setxattr(path, "user.onedrive.state", state.encode())
+        os.setxattr(path, "user.onedrive.pin", pin.encode())
 
     def drain_until(self, condition):
         deadline = time.monotonic() + 3
@@ -72,17 +75,28 @@ class ExtensionTests(unittest.TestCase):
             time.sleep(0.001)
         self.assertTrue(condition(), "Nautilus callback was not delivered")
 
-    def update(self):
+    def update(self, info=None):
+        info = self.info if info is None else info
         self.complete.reset_mock()
         handle, closure = object(), object()
         self.assertEqual(
-            self.provider.update_file_info_full(self.provider, handle, closure, self.info),
+            self.provider.update_file_info_full(self.provider, handle, closure, info),
             Nautilus.OperationResult.IN_PROGRESS,
         )
         self.drain_until(lambda: self.complete.called)
         self.complete.assert_called_once_with(
             closure, self.provider, handle, Nautilus.OperationResult.COMPLETE
         )
+
+    def record_queries(self):
+        paths = []
+        query_info_async = Gio.File.query_info_async
+
+        def record(file, *args):
+            paths.append(Path(file.get_path()))
+            return query_info_async(file, *args)
+
+        return patch.object(Gio.File, "query_info_async", record), paths
 
     def test_emblems_and_menus_for_each_domain_state(self):
         cases = [
@@ -121,11 +135,10 @@ class ExtensionTests(unittest.TestCase):
                 self.assertEqual(self.provider.get_file_items([info]), [])
                 read_status.assert_not_called()
         self.info = FileInfo(Gio.File.new_for_path(str(link / outside.name)))
-        with patch.object(Gio.File, "new_for_path", wraps=Gio.File.new_for_path) as query_path:
+        record, queried = self.record_queries()
+        with record:
             self.update()
-            queried = [Path(args[0]) for args, _ in query_path.call_args_list]
-            self.assertIn(link, queried)
-            self.assertNotIn(link / outside.name, queried)
+        self.assertEqual(queried, [self.mount, link])
         self.assertEqual(self.info.emblems, [])
         self.assertEqual(self.provider.get_file_items([self.info]), [])
 
@@ -153,19 +166,22 @@ class ExtensionTests(unittest.TestCase):
         self.assertEqual(self.info.emblems, [])
         self.assertEqual(self.provider.get_file_items([self.info]), [])
 
-    def serve(self, listener, response, next_status=None):
+    def serve(self, listener, response, statuses=()):
         with listener.accept()[0] as conn, conn.makefile("rb") as stream:
             conn.settimeout(3)
             line = stream.readline()
             self.assertTrue(line.endswith(b"\n"))
-            if next_status is not None:
-                self.set_status(*next_status)
+            for status in statuses:
+                self.set_status(*status)
             conn.sendall(response)
             return json.loads(line)
 
     def test_menu_activation_talks_to_socket_and_refreshes_emblem(self):
         self.set_status("Cloud-only", "none")
-        self.update()
+        record, queried = self.record_queries()
+        with record:
+            self.update()
+        self.assertEqual(queried, [self.mount, self.path.parent, self.path])
         with ThreadPoolExecutor() as server, socket.socket(socket.AF_UNIX) as listener:
             listener.bind(str(self.provider.socket_path))
             listener.listen()
@@ -176,12 +192,15 @@ class ExtensionTests(unittest.TestCase):
             ):
                 with self.subTest(operation=operation):
                     received = server.submit(
-                        self.serve, listener, b'{"ok":true,"result":null}\n', next_status
+                        self.serve, listener, b'{"ok":true,"result":null}\n', [next_status]
                     )
                     previous = self.info.invalidations
                     [item] = self.provider.get_file_items([self.info])
-                    item.emit("activate")
-                    self.drain_until(lambda: self.info.invalidations > previous)
+                    record, queried = self.record_queries()
+                    with record:
+                        item.emit("activate")
+                        self.drain_until(lambda: self.info.invalidations > previous)
+                    self.assertEqual(queried, [self.mount, self.path.parent, self.path])
                     self.assertEqual(
                         received.result(timeout=3),
                         {"op": operation, "path": "/folder/café #1.txt"},
@@ -189,6 +208,129 @@ class ExtensionTests(unittest.TestCase):
                     self.update()
                     expected = "starred-symbolic" if operation == "pin" else "folder-remote-symbolic"
                     self.assertEqual(self.info.emblems, [expected])
+
+    def test_sticky_actions_refresh_observed_subtree_and_ancestors(self):
+        ancestor = self.path.parent
+        selected = ancestor / "selected"
+        selected.mkdir()
+        left = selected / "left"
+        right = selected / "right"
+        left.mkdir()
+        right.mkdir()
+        first = left / "first.txt"
+        second = right / "second.txt"
+        first.touch()
+        second.touch()
+        affected_paths = [self.mount, ancestor, selected, left, right, first, second]
+        sibling = self.path
+        similar_name = ancestor / "selected-other"
+        similar_name.touch()
+        observed = {}
+        for path in [*affected_paths, sibling, similar_name]:
+            self.set_status("Cloud-only", "none", path)
+            # Separate Nautilus FileInfo objects for the same path model two windows.
+            observed[path] = [FileInfo(Gio.File.new_for_path(str(path))) for _ in range(2)]
+            for info in observed[path]:
+                self.update(info)
+
+        with ThreadPoolExecutor() as server, socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(self.provider.socket_path))
+            listener.listen()
+            listener.settimeout(3)
+            for count, operation in enumerate(("pin", "purge"), start=1):
+                pinned = operation == "pin"
+                state = "Hydrated" if pinned else "Cloud-only"
+                statuses = [
+                    (state, "pinned" if pinned and path.is_relative_to(selected) else "none", path)
+                    for path in affected_paths
+                ]
+                received = server.submit(self.serve, listener, b'{"ok":true,"result":null}\n', statuses)
+                [item] = self.provider.get_file_items([observed[selected][0]])
+                self.assertEqual(item.props.label, operation.capitalize())
+                record, queried = self.record_queries()
+                with record:
+                    item.emit("activate")
+                    self.drain_until(lambda: not self.provider.active_paths)
+                self.assertEqual(queried, [self.mount, ancestor, selected])
+                self.assertEqual(received.result(timeout=3), {"op": operation, "path": "/folder/selected"})
+                emblems = {
+                    ("Cloud-only", "none"): "folder-remote-symbolic",
+                    ("Hydrated", "none"): "object-select-symbolic",
+                    ("Hydrated", "pinned"): "starred-symbolic",
+                }
+                expected = {path: emblems[state, pin] for state, pin, path in statuses}
+                for path, pair in observed.items():
+                    for info in pair:
+                        with self.subTest(operation=operation, path=path):
+                            if path in expected:
+                                self.assertEqual(info.invalidations, count)
+                                self.update(info)
+                                self.assertEqual(info.emblems, [expected[path]])
+                            else:
+                                self.assertEqual(info.invalidations, 0)
+                                self.assertEqual(info.emblems, ["folder-remote-symbolic"])
+
+    def test_mount_root_status_and_whole_drive_actions(self):
+        root_info = FileInfo(Gio.File.new_for_path(str(self.mount)))
+        self.set_status("Cloud-only", "none", self.mount)
+        self.set_status("Cloud-only", "none")
+        self.update()
+        record, queried = self.record_queries()
+        with record:
+            self.update(root_info)
+        self.assertEqual(queried, [self.mount])
+        self.assertEqual(root_info.emblems, ["folder-remote-symbolic"])
+        with ThreadPoolExecutor() as server, socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(self.provider.socket_path))
+            listener.listen()
+            listener.settimeout(3)
+            for count, (operation, status, emblem) in enumerate((
+                ("pin", ("Hydrated", "pinned"), "starred-symbolic"),
+                ("purge", ("Cloud-only", "none"), "folder-remote-symbolic"),
+            ), start=1):
+                received = server.submit(
+                    self.serve, listener, b'{"ok":true,"result":null}\n',
+                    [(*status, self.mount), (*status, self.path)],
+                )
+                [item] = self.provider.get_file_items([root_info])
+                self.assertEqual(item.props.label, operation.capitalize())
+                record, queried = self.record_queries()
+                with record:
+                    item.emit("activate")
+                    self.drain_until(lambda: not self.provider.active_paths)
+                self.assertEqual(queried, [self.mount])
+                self.assertEqual(received.result(timeout=3), {"op": operation, "path": "/"})
+                for info in (root_info, self.info):
+                    self.assertEqual(info.invalidations, count)
+                    self.update(info)
+                    self.assertEqual(info.emblems, [emblem])
+
+    def test_observation_does_not_keep_file_info_alive(self):
+        info = FileInfo(self.info.location)
+        key = hash(info)
+        file_ref = info.weak_ref()
+        self.set_status("Hydrated", "none")
+        self.update(info)
+        self.assertIn(key, self.provider.observed_files)
+        del info
+        gc.collect()
+        self.assertIsNone(file_ref())
+        self.assertNotIn(key, self.provider.observed_files)
+
+    def test_activation_stops_at_replaced_symlink_component(self):
+        self.set_status("Cloud-only", "none")
+        self.update()
+        [pin] = self.provider.get_file_items([self.info])
+        outside = self.root / "outside"
+        self.path.parent.rename(outside)
+        self.path.parent.symlink_to(outside, target_is_directory=True)
+        record, queried = self.record_queries()
+        with record, patch.object(extension, "request") as send, patch.object(extension.Gtk, "AlertDialog") as alert:
+            pin.emit("activate")
+            self.drain_until(lambda: alert.called)
+            send.assert_not_called()
+        self.assertEqual(queried, [self.mount, self.path.parent])
+        self.assertFalse(self.provider.active_paths)
 
     def test_purge_rechecks_dirty_state_before_sending(self):
         self.set_status("Hydrated", "none")
@@ -217,6 +359,11 @@ class ExtensionTests(unittest.TestCase):
                 self.assertFalse(self.provider.active_paths)
 
     def test_purge_failure_shows_daemon_error_and_invalidates(self):
+        descendant = self.info
+        self.set_status("Dirty", "none")
+        self.update(descendant)
+        self.path = self.path.parent
+        self.info = FileInfo(Gio.File.new_for_path(str(self.path)))
         self.set_status("Hydrated", "none")
         self.update()
         failure = b'{"ok":false,"error":"a descendant has a pending upload"}\n'
@@ -234,6 +381,8 @@ class ExtensionTests(unittest.TestCase):
                     message="OneDrive action failed", detail="a descendant has a pending upload"
                 )
                 self.assertEqual(self.info.invalidations, 1)
+                self.assertEqual(descendant.invalidations, 0)
+                self.assertFalse(self.provider.active_paths)
             self.assertEqual(received.result(timeout=3)["op"], "purge")
 
 

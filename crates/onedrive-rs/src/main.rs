@@ -23,6 +23,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(flatten)]
+    Local(LocalCommand),
     /// Show sync, cache, and upload status
     Status,
     /// Pin a file or folder
@@ -39,6 +41,27 @@ enum Command {
     Pause,
     /// Resume background sync
     Resume,
+}
+
+#[derive(Subcommand)]
+enum LocalCommand {
+    /// Manage Microsoft OneDrive authentication
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+    /// Run the OneDrive daemon in the foreground
+    Daemon,
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Sign in to OneDrive
+    Login,
+    /// Show the authentication status
+    Status,
+    /// Sign out of OneDrive
+    Logout,
 }
 
 fn main() -> ExitCode {
@@ -71,6 +94,9 @@ fn main() -> ExitCode {
 
 impl Cli {
     fn execute(&self) -> Result<String, String> {
+        if let Command::Local(command) = &self.command {
+            return self.run_local_command(command);
+        }
         let runtime_dir = runtime_dir()?;
         let mount = self
             .mount_path
@@ -86,12 +112,21 @@ impl Cli {
             Command::Uploads => Request::Uploads,
             Command::Pause => Request::Pause,
             Command::Resume => Request::Resume,
+            Command::Local(_) => unreachable!("local commands are handled before IPC"),
         };
         let result = daemon_request(&runtime_dir, &request)?;
         if self.json {
             return Ok(Response::Success(result).into_json().to_string());
         }
         render_reply(request, result)
+    }
+
+    fn run_local_command(&self, command: &LocalCommand) -> Result<String, String> {
+        let message = match command {
+            LocalCommand::Auth { .. } => "Authentication is not available in this build",
+            LocalCommand::Daemon => "The daemon runtime is not available in this build",
+        };
+        Err(message.into())
     }
 }
 

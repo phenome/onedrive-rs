@@ -195,3 +195,65 @@ fn rejects_paths_outside_the_mount_and_parent_components_before_connecting() {
         );
     }
 }
+
+#[test]
+fn local_commands_parse_and_report_unavailable_runtime_in_both_formats() {
+    let runtime = tempfile::tempdir().unwrap();
+    let commands: &[(&[&str], &str)] = &[
+        (
+            &["auth", "login"],
+            "Authentication is not available in this build",
+        ),
+        (
+            &["auth", "status"],
+            "Authentication is not available in this build",
+        ),
+        (
+            &["auth", "logout"],
+            "Authentication is not available in this build",
+        ),
+        (
+            &["daemon"],
+            "The daemon runtime is not available in this build",
+        ),
+    ];
+    for (args, message) in commands {
+        let human = cli(runtime.path(), args);
+        assert_eq!(human.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8(human.stderr).unwrap().trim_end(),
+            *message
+        );
+        let output = cli(runtime.path(), &[&["--json"], *args].concat());
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            json!({"ok":false,"error":message})
+        );
+    }
+    assert!(!runtime.path().join("onedrive-rs").exists());
+}
+
+#[test]
+fn argument_and_transport_failures_produce_structured_errors() {
+    let runtime = tempfile::tempdir().unwrap();
+    for (args, exit_code, message) in [
+        (&["pin", "--json"][..], 2, "<PATH>"),
+        (&["auth", "invalid", "--json"], 2, "unrecognized subcommand"),
+        (
+            &["status", "--json"],
+            1,
+            "Cannot communicate with the OneDrive daemon",
+        ),
+    ] {
+        let output = cli(runtime.path(), args);
+        assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let response = serde_json::from_slice::<Value>(&output.stdout).unwrap();
+        assert_eq!(response["ok"], false);
+        assert!(
+            response["error"].as_str().unwrap().contains(message),
+            "{response}"
+        );
+    }
+}

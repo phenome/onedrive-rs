@@ -32,8 +32,17 @@ fn mount_type(path: &Path) -> Option<String> {
 
 #[test]
 fn live_read_only_mount() {
+    run_live("live_read_only_mount", exercise_mount);
+}
+
+#[test]
+fn live_offline_save_restart_and_recycle() {
+    run_live("live_offline_save_restart_and_recycle", exercise_writeback);
+}
+
+fn run_live(test: &str, exercise: fn(&Path)) {
     if let Some(dir) = std::env::var_os(WORKER_DIR) {
-        exercise_mount(Path::new(&dir));
+        exercise(Path::new(&dir));
         return;
     }
 
@@ -51,7 +60,7 @@ fn live_read_only_mount() {
     let result = worker
         .args(["-k", "3s", "45s"])
         .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "live_read_only_mount", "--nocapture"])
+        .args(["--exact", test, "--nocapture"])
         .env(WORKER_DIR, temp.path())
         .status();
 
@@ -241,4 +250,130 @@ fn assert_xattrs(path: &Path, state: &[u8], pin: &[u8], etag: &[u8]) {
         );
     }
     assert_eq!(xattr::get(path, "user.onedrive.missing").unwrap(), None);
+}
+
+fn exercise_writeback(dir: &Path) {
+    use onedrive_core::{EngineError, SyncState};
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mount = dir.join("mount");
+    let drive = Arc::new(FakeCloudDrive::new(100));
+    drive.upsert(RemoteItem {
+        item_id: "root".into(),
+        parent_id: None,
+        name: Some("root".into()),
+        kind: ItemKind::Folder,
+        size: 0,
+        mtime: 100,
+        etag: None,
+        ctag: None,
+        quickxor_hash: None,
+    });
+    let open =
+        || Arc::new(Engine::open(dir.join("db"), drive.clone(), Arc::new(SystemClock)).unwrap());
+    let engine = open();
+    runtime.block_on(engine.sync()).unwrap();
+    drive.set_online(false);
+    let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
+        .mount(&mount)
+        .unwrap();
+
+    let draft = mount.join("document");
+    fs::write(&draft, b"first").unwrap();
+    let editor = OpenOptions::new().write(true).open(&draft).unwrap();
+    editor.write_all_at(b"X", 1).unwrap();
+    editor.set_len(7).unwrap();
+    editor.sync_all().unwrap();
+    let mut append = OpenOptions::new().append(true).open(&draft).unwrap();
+    append.write_all(b"!").unwrap();
+    assert_eq!(fs::read(&draft).unwrap(), b"fXrst\0\0!");
+    drop(append);
+    drop(editor);
+
+    fs::create_dir(mount.join("work")).unwrap();
+    fs::write(mount.join("work/final"), b"previous").unwrap();
+    let old_handle = File::open(mount.join("work/final")).unwrap();
+    fs::rename(&draft, mount.join("work/final")).unwrap();
+    assert!(!draft.exists());
+    let mut previous = Vec::new();
+    (&old_handle).read_to_end(&mut previous).unwrap();
+    assert_eq!(previous, b"previous");
+    drop(old_handle);
+
+    let file = engine.resolve_path("/work/final").unwrap().unwrap();
+    assert_xattrs(&mount.join("work/final"), b"Dirty", b"none", b"");
+    assert!(matches!(
+        engine.check_purge(&file.item_id),
+        Err(EngineError::Dirty)
+    ));
+    assert_eq!(
+        engine.resolve_path("/work").unwrap().unwrap().sync_state,
+        SyncState::Dirty
+    );
+    assert!(fs::create_dir(mount.join(".Trash-1000")).is_err());
+
+    unmount(&mount, session);
+    drop(engine);
+
+    let engine = open();
+    let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
+        .mount(&mount)
+        .unwrap();
+    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fXrst\0\0!");
+    assert_xattrs(&mount.join("work/final"), b"Dirty", b"none", b"");
+    drive.set_online(true);
+    let deadline = Instant::now() + Duration::from_secs(7);
+    let uploaded = loop {
+        let item = engine.resolve_path("/work/final").unwrap().unwrap();
+        if item.sync_state == SyncState::Clean {
+            break item;
+        }
+        assert!(Instant::now() < deadline, "offline bytes did not upload");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(uploaded.inode, file.inode);
+    assert_ne!(uploaded.item_id, file.item_id);
+    assert!(uploaded.etag.is_some() && uploaded.ctag.is_some());
+    engine.check_purge(&uploaded.item_id).unwrap();
+    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fXrst\0\0!");
+    assert_ne!(
+        xattr::get(mount.join("work/final"), "user.onedrive.state")
+            .unwrap()
+            .unwrap(),
+        b"Dirty"
+    );
+
+    let folder = engine.resolve_path("/work").unwrap().unwrap();
+    fs::remove_file(mount.join("work/final")).unwrap();
+    fs::remove_dir(mount.join("work")).unwrap();
+    assert!(engine.resolve_path("/work").unwrap().is_none());
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while !drive.recycled_items().contains(&folder.item_id) {
+        assert!(
+            Instant::now() < deadline,
+            "deletes did not reach the recycle bin"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(drive.recycled_items(), [uploaded.item_id, folder.item_id]);
+    unmount(&mount, session);
+}
+
+fn unmount(path: &Path, session: fuser::BackgroundSession) {
+    assert!(
+        command("fusermount3")
+            .arg("-u")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(mount_type(path).is_none());
+    session.join().unwrap();
 }

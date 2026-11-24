@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, Owner, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use tokio::runtime::Handle;
 
@@ -40,13 +41,17 @@ impl FuseAdapter {
         config.mount_options = vec![
             MountOption::FSName("onedrive-rs".into()),
             MountOption::Subtype("onedrive-rs".into()),
-            MountOption::RO,
+            MountOption::RW,
             MountOption::DefaultPermissions,
             MountOption::NoDev,
             MountOption::NoSuid,
         ];
         config.n_threads = Some(4);
-        fuser::spawn_mount(self, mountpoint, &config)
+        let engine = Arc::downgrade(&self.engine);
+        let runtime = self.runtime.clone();
+        let session = fuser::spawn_mount(self, mountpoint, &config)?;
+        runtime.spawn(Engine::run_upload_worker(engine));
+        Ok(session)
     }
 
     fn item(&self, ino: INodeNo) -> Result<CatalogItem, Errno> {
@@ -167,19 +172,210 @@ impl Filesystem for FuseAdapter {
         &self,
         _req: &Request,
         ino: INodeNo,
-        flags: OpenFlags,
+        _flags: OpenFlags,
         _kill_suid_gid: bool,
         reply: ReplyOpen,
     ) {
-        if flags.acc_mode() != OpenAccMode::O_RDONLY {
-            return reply.error(Errno::EROFS);
+        match self.engine.open_file(ino.0) {
+            Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_DIRECT_IO),
+            Err(error) => reply.error(errno(error)),
         }
-        match self.item(ino) {
-            Ok(item) if item.kind == ItemKind::Folder => reply.error(Errno::EISDIR),
-            // Preserve the application's read sizes and let the Engine own content freshness.
-            Ok(_) => reply.opened(FileHandle(0), FopenFlags::FOPEN_DIRECT_IO),
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        _kill_suid_gid: bool,
+        _owner: Owner,
+        reply: ReplyCreate,
+    ) {
+        let result = (|| {
+            let item = self
+                .engine
+                .create(parent.0, file_name(name)?, ItemKind::File)
+                .map_err(errno)?;
+            self.engine.open_file(item.inode).map_err(errno)?;
+            Ok::<_, Errno>(item)
+        })();
+        match result {
+            Ok(item) => reply.created(
+                &Duration::ZERO,
+                &attributes(&item),
+                Generation(0),
+                FileHandle(item.inode),
+                FopenFlags::FOPEN_DIRECT_IO,
+            ),
             Err(error) => reply.error(error),
         }
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _owner: Owner,
+        reply: ReplyEntry,
+    ) {
+        match file_name(name).and_then(|name| {
+            self.engine
+                .create(parent.0, name, ItemKind::Folder)
+                .map_err(errno)
+        }) {
+            Ok(item) => reply.entry(&Duration::ZERO, &attributes(&item), Generation(0)),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let append = flags.0 & rustix::fs::OFlags::APPEND.bits() as i32 != 0;
+        match self
+            .runtime
+            .block_on(self.engine.write(ino.0, offset, data, append))
+        {
+            Ok(()) => reply.written(data.len() as u32),
+            Err(error) => reply.error(errno(error)),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        _kill_suid_gid: bool,
+        reply: ReplyAttr,
+    ) {
+        if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
+            return reply.error(Errno::EOPNOTSUPP);
+        }
+        let result = match size {
+            Some(size) => self
+                .runtime
+                .block_on(self.engine.truncate(ino.0, size))
+                .map_err(errno),
+            None => self.item(ino),
+        };
+        match result {
+            Ok(item) => reply.attr(&Duration::ZERO, &attributes(&item)),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        send_empty(
+            reply,
+            file_name(name).and_then(|name| {
+                self.engine
+                    .unlink(parent.0, name, ItemKind::File)
+                    .map_err(errno)
+            }),
+        );
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        send_empty(
+            reply,
+            file_name(name).and_then(|name| {
+                self.engine
+                    .unlink(parent.0, name, ItemKind::Folder)
+                    .map_err(errno)
+            }),
+        );
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        new_parent: INodeNo,
+        new_name: &OsStr,
+        flags: RenameFlags,
+        _owner: Option<Owner>,
+        reply: ReplyEmpty,
+    ) {
+        let result = (|| {
+            if !flags.difference(RenameFlags::RENAME_NOREPLACE).is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            self.engine
+                .rename(
+                    parent.0,
+                    file_name(name)?,
+                    new_parent.0,
+                    file_name(new_name)?,
+                    flags.contains(RenameFlags::RENAME_NOREPLACE),
+                )
+                .map_err(errno)
+        })();
+        send_empty(reply, result);
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Engine acknowledges writes only after staging and catalog persistence.
+        reply.ok();
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.engine.release_file(ino.0);
+        reply.ok();
     }
 
     fn read(
@@ -256,7 +452,7 @@ fn attributes(item: &CatalogItem) -> FileAttr {
         ctime: mtime,
         crtime: UNIX_EPOCH,
         kind: file_type(item.kind),
-        perm: if directory { 0o555 } else { 0o444 },
+        perm: if directory { 0o755 } else { 0o644 },
         nlink: if directory { 2 } else { 1 },
         uid: rustix::process::geteuid().as_raw(),
         gid: rustix::process::getegid().as_raw(),
@@ -292,10 +488,26 @@ fn send_xattr(reply: ReplyXattr, size: u32, bytes: &[u8]) {
     }
 }
 
+fn file_name(name: &OsStr) -> Result<&str, Errno> {
+    name.to_str().ok_or(Errno::EINVAL)
+}
+
+fn send_empty(reply: ReplyEmpty, result: Result<(), Errno>) {
+    match result {
+        Ok(()) => reply.ok(),
+        Err(error) => reply.error(error),
+    }
+}
+
 fn errno(error: EngineError) -> Errno {
     match error {
         EngineError::NotFound => Errno::ENOENT,
         EngineError::IsDirectory => Errno::EISDIR,
+        EngineError::NotDirectory => Errno::ENOTDIR,
+        EngineError::NotEmpty => Errno::ENOTEMPTY,
+        EngineError::AlreadyExists => Errno::EEXIST,
+        EngineError::InvalidMutation => Errno::EINVAL,
+        EngineError::TrashProhibited => Errno::EACCES,
         EngineError::CacheIo(error) => {
             Errno::from_i32(error.raw_os_error().unwrap_or(Errno::EIO.code()))
         }

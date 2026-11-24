@@ -59,3 +59,53 @@ fn status_round_trips_over_a_private_socket_removed_on_drop() {
     assert!(!path.exists());
     drop(IpcServer::bind(&path).unwrap());
 }
+
+#[test]
+fn pin_accepts_only_canonical_paths_rooted_in_the_mount() {
+    use std::net::Shutdown;
+
+    let runtime = tempfile::tempdir().unwrap();
+    let path = socket_path(runtime.path());
+    let server = IpcServer::bind(&path).unwrap();
+
+    let exchange = |request: &[u8]| {
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream.write_all(request).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+
+        server
+            .serve_one(|request| {
+                assert_eq!(
+                    serde_json::to_value(request).unwrap(),
+                    json!({"op": "pin", "path": "/folder/été photo.png"})
+                );
+                Ok(Value::Null)
+            })
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+
+    let reply = exchange("{\"op\":\"pin\",\"path\":\"/folder/été photo.png\"}\n".as_bytes());
+    assert_eq!(reply, json!({"ok": true, "result": null}));
+
+    for invalid in [
+        &b"{\"op\":\"pin\",\"path\":\"folder/file\"}\n"[..],
+        b"{\"op\":\"purge\",\"path\":\"/folder/../file\"}\n",
+        b"{\"op\":\"unpin\",\"path\":\"/folder//file\"}\n",
+        b"{\"op\":\"pin\",\"path\":\"/file/\"}\n",
+        b"{\"op\":\"pin\",\"path\":\"/./file\"}\n",
+        b"{\"op\":\"pin\",\"path\":\"/file\\u0000\"}\n",
+        b"{\"op\":\"pin\"}\n",
+        b"{\"op\":\"rename\"}\n",
+        b"{\"op\":\"status\"}",
+    ] {
+        let reply = exchange(invalid);
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("invalid request"));
+    }
+}

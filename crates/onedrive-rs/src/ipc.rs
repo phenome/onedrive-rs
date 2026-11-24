@@ -19,6 +19,38 @@ pub fn socket_path(runtime_dir: &Path) -> PathBuf {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Status,
+    Pin { path: MountPath },
+    Unpin { path: MountPath },
+    Purge { path: MountPath },
+}
+
+/// A canonical UTF-8 path in the OneDrive namespace. "/" is the drive root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct MountPath(String);
+
+impl MountPath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for MountPath {
+    type Error = &'static str;
+
+    fn try_from(path: String) -> Result<Self, Self::Error> {
+        if path == "/"
+            || path.strip_prefix('/').is_some_and(|relative| {
+                !relative.contains('\0')
+                    && relative
+                        .split('/')
+                        .all(|part| !matches!(part, "" | "." | ".."))
+            })
+        {
+            return Ok(Self(path));
+        }
+        Err("expected a canonical path starting at the mount root")
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

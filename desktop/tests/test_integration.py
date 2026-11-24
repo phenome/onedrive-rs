@@ -203,7 +203,7 @@ class ExtensionTests(unittest.TestCase):
                     self.assertEqual(queried, [self.mount, self.path.parent, self.path])
                     self.assertEqual(
                         received.result(timeout=3),
-                        {"op": operation, "path": "/folder/café #1.txt"},
+                        {"op": operation, "mount": str(self.mount), "path": "/folder/café #1.txt"},
                     )
                     self.update()
                     expected = "starred-symbolic" if operation == "pin" else "folder-remote-symbolic"
@@ -252,7 +252,7 @@ class ExtensionTests(unittest.TestCase):
                     item.emit("activate")
                     self.drain_until(lambda: not self.provider.active_paths)
                 self.assertEqual(queried, [self.mount, ancestor, selected])
-                self.assertEqual(received.result(timeout=3), {"op": operation, "path": "/folder/selected"})
+                self.assertEqual(received.result(timeout=3), {"op": operation, "mount": str(self.mount), "path": "/folder/selected"})
                 emblems = {
                     ("Cloud-only", "none"): "folder-remote-symbolic",
                     ("Hydrated", "none"): "object-select-symbolic",
@@ -299,7 +299,7 @@ class ExtensionTests(unittest.TestCase):
                     item.emit("activate")
                     self.drain_until(lambda: not self.provider.active_paths)
                 self.assertEqual(queried, [self.mount])
-                self.assertEqual(received.result(timeout=3), {"op": operation, "path": "/"})
+                self.assertEqual(received.result(timeout=3), {"op": operation, "mount": str(self.mount), "path": "/"})
                 for info in (root_info, self.info):
                     self.assertEqual(info.invalidations, count)
                     self.update(info)
@@ -414,6 +414,26 @@ class ExtensionTests(unittest.TestCase):
                 self.assertEqual(descendant.invalidations, 0)
                 self.assertFalse(self.provider.active_paths)
             self.assertEqual(received.result(timeout=3)["op"], "purge")
+
+    def test_mount_mismatch_shows_daemon_error(self):
+        self.set_status("Cloud-only", "none")
+        self.update()
+        error = f"OneDrive mount does not match this daemon: requested {self.mount}, running at /old"
+        with ThreadPoolExecutor() as server, socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(self.provider.socket_path))
+            listener.listen()
+            listener.settimeout(3)
+            response = json.dumps({"ok": False, "error": error}).encode() + b"\n"
+            received = server.submit(self.serve, listener, response)
+            alert = Mock()
+            with patch.object(extension.Gtk, "AlertDialog", alert):
+                [pin] = self.provider.get_file_items([self.info])
+                pin.emit("activate")
+                self.drain_until(lambda: alert.called)
+                alert.assert_called_once_with(message="OneDrive action failed", detail=error)
+            self.assertEqual(received.result(timeout=3), {
+                "op": "pin", "mount": str(self.mount), "path": "/folder/café #1.txt",
+            })
 
 
 class BookmarkTests(unittest.TestCase):

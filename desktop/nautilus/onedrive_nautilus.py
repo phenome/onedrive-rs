@@ -114,9 +114,9 @@ def read_status(path, mount, cancellable, complete):
     query(mount)
 
 
-def request(socket_path, operation, path, complete):
+def request(socket_path, operation, mount, path, complete):
     # A folder Pin can wait for recursive hydration.
-    exchange(socket_path, {"op": operation, "path": path}, 300, None,
+    exchange(socket_path, {"op": operation, "mount": os.fspath(mount), "path": path}, 300, None,
              lambda _result, error: complete(error))
 
 
@@ -444,6 +444,6 @@ class OneDriveExtension(GObject.Object, Nautilus.InfoProvider, Nautilus.MenuProv
             if not allowed:
                 finish(tip)
                 return
-            request(self.socket_path, operation, daemon_path, finish)
+            request(self.socket_path, operation, self.mount, daemon_path, finish)
 
         read_status(path, self.mount, None, checked)

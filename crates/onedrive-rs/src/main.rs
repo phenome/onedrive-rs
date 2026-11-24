@@ -109,16 +109,24 @@ impl Cli {
             Command::Control(command) => command,
         };
         let runtime_dir = runtime_dir()?;
-        let path = |input: &Path| {
-            let config = Config::load().map_err(|error| error.to_string())?;
-            let mount = mount_path(&runtime_dir, &config, self.mount_path.as_deref())?;
-            mount_relative_path(&mount, input)
-        };
         let request = match command {
             ControlCommand::Status => Request::Status {},
-            ControlCommand::Pin { path: input } => Request::Pin { path: path(input)? },
-            ControlCommand::Unpin { path: input } => Request::Unpin { path: path(input)? },
-            ControlCommand::Purge { path: input } => Request::Purge { path: path(input)? },
+            ControlCommand::Pin { path }
+            | ControlCommand::Unpin { path }
+            | ControlCommand::Purge { path } => {
+                let config = Config::load().map_err(|error| error.to_string())?;
+                let mount = mount_path(&runtime_dir, &config, self.mount_path.as_deref())?;
+                if mount.to_str().is_none() {
+                    return Err("The OneDrive mount path must be UTF-8".into());
+                }
+                let path = mount_relative_path(&mount, path)?;
+                match command {
+                    ControlCommand::Pin { .. } => Request::Pin { mount, path },
+                    ControlCommand::Unpin { .. } => Request::Unpin { mount, path },
+                    ControlCommand::Purge { .. } => Request::Purge { mount, path },
+                    _ => unreachable!(),
+                }
+            }
             ControlCommand::Sync => Request::Sync {},
             ControlCommand::Uploads => Request::Uploads {},
             ControlCommand::Pause => Request::Pause {},
@@ -223,9 +231,9 @@ fn render_reply(request: Request, result: Value) -> Result<String, String> {
     let output = match request {
         Request::Status {} => return render_status(result),
         Request::Uploads {} => return render_uploads(result),
-        Request::Pin { path } => format!("Pin completed for {:?}", path.as_str()),
-        Request::Unpin { path } => format!("Unpin completed for {:?}", path.as_str()),
-        Request::Purge { path } => format!("Purge completed for {:?}", path.as_str()),
+        Request::Pin { path, .. } => format!("Pin completed for {:?}", path.as_str()),
+        Request::Unpin { path, .. } => format!("Unpin completed for {:?}", path.as_str()),
+        Request::Purge { path, .. } => format!("Purge completed for {:?}", path.as_str()),
         Request::Sync {} => "Sync completed".into(),
         Request::Pause {} => "Paused background sync".into(),
         Request::Resume {} => "Resumed background sync".into(),

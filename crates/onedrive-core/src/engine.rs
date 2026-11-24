@@ -14,6 +14,7 @@ use crate::{
 };
 
 mod sparse_cache;
+mod writeback;
 
 use sparse_cache::SparseCache;
 
@@ -29,7 +30,19 @@ pub enum EngineError {
     NotFound,
     #[error("cannot read a directory as a file")]
     IsDirectory,
-    #[error("sparse cache I/O error")]
+    #[error("item is Dirty and cannot be purged")]
+    Dirty,
+    #[error("item is not a directory")]
+    NotDirectory,
+    #[error("directory is not empty")]
+    NotEmpty,
+    #[error("name already exists")]
+    AlreadyExists,
+    #[error("invalid file name or operation")]
+    InvalidMutation,
+    #[error("top-level .Trash directories are prohibited")]
+    TrashProhibited,
+    #[error("local file I/O error")]
     CacheIo(#[from] io::Error),
     #[error("cloud range did not match the catalog file size")]
     InvalidRange,
@@ -95,6 +108,7 @@ pub struct Engine {
     cloud: Arc<dyn CloudDrive>,
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
+    writeback: writeback::Writeback,
 }
 
 const ITEM_COLUMNS: &str =
@@ -119,7 +133,7 @@ impl Engine {
         cloud: Arc<dyn CloudDrive>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, EngineError> {
-        let mut db = Connection::open(database)?;
+        let mut db = Connection::open(database.as_ref())?;
         db.pragma_update(None, "foreign_keys", true)?;
         let journal: String = db.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         if !journal.eq_ignore_ascii_case("wal") {
@@ -130,8 +144,10 @@ impl Engine {
         transaction.execute_batch(include_str!("schema.sql"))?;
         transaction.commit()?;
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
+        let writeback = writeback::Writeback::open(database.as_ref(), &mut db)?;
         Ok(Self {
             cache,
+            writeback,
             db: Mutex::new(db),
             cloud,
             clock,
@@ -292,7 +308,7 @@ impl Engine {
         Ok(self
             .db()
             .prepare_cached(&format!(
-                "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 ORDER BY name, inode"
+                "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted) ORDER BY name, inode"
             ))?
             .query_map([parent_id], catalog_item)?
             .collect::<Result<_, _>>()?)
@@ -357,7 +373,8 @@ fn root(db: &Connection) -> rusqlite::Result<Option<CatalogItem>> {
 
 fn lookup(db: &Connection, parent_id: &str, name: &str) -> rusqlite::Result<Option<CatalogItem>> {
     db.prepare_cached(&format!(
-        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND name = ?2 ORDER BY inode"
+        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND name = ?2
+         AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted) ORDER BY inode"
     ))?
     .query_row(params![parent_id, name], catalog_item)
     .optional()
@@ -449,7 +466,8 @@ fn upsert_remote_item(transaction: &Transaction<'_>, item: RemoteItem) -> rusqli
              parent_id = excluded.parent_id, name = excluded.name, kind = excluded.kind,
              size = excluded.size, mtime = excluded.mtime, etag = excluded.etag,
              ctag = excluded.ctag, quickxor_hash = excluded.quickxor_hash
-         WHERE items.sync_state = 0",
+         WHERE items.sync_state IN (0, 3)
+           AND items.inode NOT IN (SELECT inode FROM writeback_queue)",
         params![
             reserved_inode(&item), item.item_id, item.parent_id, item.name,
             item.kind == ItemKind::Folder, item.size, item.mtime, item.etag, item.ctag,

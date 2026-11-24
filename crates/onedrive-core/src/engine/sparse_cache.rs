@@ -119,6 +119,14 @@ impl Engine {
                 if offset >= item.size || length == 0 {
                     return Ok(Vec::new());
                 }
+                if item.sync_state != super::SyncState::Clean {
+                    let end = offset.saturating_add(length as u64).min(item.size);
+                    if self.has_staged(&tx, inode)? {
+                        let mut output = vec![0; (end - offset) as usize];
+                        self.read_staged(&tx, inode, offset, &mut output)?;
+                        return Ok(output);
+                    }
+                }
                 tx.execute(
                     "INSERT INTO sparse_files (inode) VALUES (?1) ON CONFLICT(inode) DO NOTHING",
                     [inode],

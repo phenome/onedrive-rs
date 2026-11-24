@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::{
-    CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, RemoteItem,
+    CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
+    RemoteItem, UploadTarget,
 };
 
 /// A versioned in-memory drive. Changes during enumeration are delivered on
@@ -25,6 +26,9 @@ struct State {
     requests: Vec<DeltaRequest>,
     contents: HashMap<String, Vec<u8>>,
     range_requests: Vec<(String, u64, usize)>,
+    offline: bool,
+    next_version: u64,
+    recycled: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -55,19 +59,15 @@ impl FakeCloudDrive {
 
     pub fn delete(&self, item_id: &str) {
         let mut state = self.state.lock().unwrap();
-        let mut removed = vec![item_id.to_owned()];
-        while let Some(parent) = removed.pop() {
-            state.contents.remove(&parent);
-            state.items.remove(&parent);
-            removed.extend(
-                state
-                    .items
-                    .values()
-                    .filter(|item| item.parent_id.as_deref() == Some(&parent))
-                    .map(|item| item.item_id.clone()),
-            );
-        }
-        state.changes.push(DeltaChange::Delete(item_id.into()));
+        state.remove(item_id);
+    }
+
+    pub fn set_online(&self, online: bool) {
+        self.state.lock().unwrap().offline = !online;
+    }
+
+    pub fn recycled_items(&self) -> Vec<String> {
+        self.state.lock().unwrap().recycled.clone()
     }
 
     pub fn expire_tokens(&self) {
@@ -99,8 +99,157 @@ impl FakeCloudDrive {
     }
 }
 
+impl State {
+    fn remove(&mut self, item_id: &str) {
+        let mut removed = vec![item_id.to_owned()];
+        while let Some(parent) = removed.pop() {
+            self.contents.remove(&parent);
+            self.items.remove(&parent);
+            removed.extend(
+                self.items
+                    .values()
+                    .filter(|item| item.parent_id.as_deref() == Some(&parent))
+                    .map(|item| item.item_id.clone()),
+            );
+        }
+        self.changes.push(DeltaChange::Delete(item_id.into()));
+    }
+
+    fn online(&self) -> Result<(), CloudError> {
+        if self.offline {
+            return Err(CloudError::Unavailable);
+        }
+        Ok(())
+    }
+
+    fn require_destination(
+        &self,
+        parent: &str,
+        name: &str,
+        except: Option<&str>,
+    ) -> Result<(), CloudError> {
+        if !self
+            .items
+            .get(parent)
+            .is_some_and(|item| item.kind == ItemKind::Folder)
+        {
+            return Err(CloudError::NotFound);
+        }
+        if self.items.values().any(|item| {
+            Some(item.item_id.as_str()) != except
+                && item.parent_id.as_deref() == Some(parent)
+                && item.name.as_deref() == Some(name)
+        }) {
+            return Err(CloudError::Conflict);
+        }
+        Ok(())
+    }
+
+    fn create(
+        &mut self,
+        parent: &str,
+        name: &str,
+        kind: ItemKind,
+    ) -> Result<RemoteItem, CloudError> {
+        self.require_destination(parent, name, None)?;
+        let item_id = loop {
+            self.next_version += 1;
+            let id = format!("fake-upload-{}", self.next_version);
+            if !self.items.contains_key(&id) {
+                break id;
+            }
+        };
+        Ok(RemoteItem {
+            item_id,
+            parent_id: Some(parent.into()),
+            name: Some(name.into()),
+            kind,
+            size: 0,
+            mtime: 1_700_000_000,
+            etag: None,
+            ctag: None,
+            quickxor_hash: None,
+        })
+    }
+
+    fn commit(&mut self, mut item: RemoteItem, bytes: Option<&[u8]>) -> RemoteItem {
+        self.next_version += 1;
+        let version = self.next_version;
+        item.etag = Some(format!("\"fake-{version}\""));
+        item.mtime += 1;
+        if let Some(bytes) = bytes {
+            item.size = bytes.len() as u64;
+            item.ctag = Some(format!("fake-content-{version}"));
+            self.contents.insert(item.item_id.clone(), bytes.to_vec());
+        }
+        self.items.insert(item.item_id.clone(), item.clone());
+        self.changes.push(DeltaChange::Upsert(item.clone()));
+        item
+    }
+}
+
 #[async_trait]
 impl CloudDrive for FakeCloudDrive {
+    async fn upload(
+        &self,
+        target: UploadTarget<'_>,
+        bytes: &[u8],
+        if_match: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        let mut state = self.state.lock().unwrap();
+        state.online()?;
+        let item = match target {
+            UploadTarget::New { parent_id, name } => {
+                state.create(parent_id, name, ItemKind::File)?
+            }
+            UploadTarget::Existing { item_id } => {
+                let item = state.items.get(item_id).ok_or(CloudError::NotFound)?;
+                if if_match.is_some() && if_match != item.etag.as_deref() {
+                    return Err(CloudError::Conflict);
+                }
+                item.clone()
+            }
+        };
+        Ok(state.commit(item, Some(bytes)))
+    }
+
+    async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteItem, CloudError> {
+        let mut state = self.state.lock().unwrap();
+        state.online()?;
+        let item = state.create(parent_id, name, ItemKind::Folder)?;
+        Ok(state.commit(item, None))
+    }
+
+    async fn move_item(
+        &self,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+    ) -> Result<RemoteItem, CloudError> {
+        let mut state = self.state.lock().unwrap();
+        state.online()?;
+        state.require_destination(parent_id, name, Some(item_id))?;
+        let mut item = state
+            .items
+            .get(item_id)
+            .cloned()
+            .ok_or(CloudError::NotFound)?;
+        item.parent_id = Some(parent_id.into());
+        item.name = Some(name.into());
+        Ok(state.commit(item, None))
+    }
+
+    async fn delete_item(&self, item_id: &str) -> Result<(), CloudError> {
+        let mut state = self.state.lock().unwrap();
+        state.online()?;
+        if !state.items.contains_key(item_id) {
+            return Err(CloudError::NotFound);
+        }
+        state.remove(item_id);
+        state.recycled.push(item_id.into());
+        Ok(())
+    }
+
     async fn read_range(
         &self,
         item_id: &str,
@@ -109,6 +258,7 @@ impl CloudDrive for FakeCloudDrive {
     ) -> Result<Vec<u8>, CloudError> {
         tokio::task::yield_now().await;
         let mut state = self.state.lock().unwrap();
+        state.online()?;
         state.range_requests.push((item_id.into(), offset, length));
         let bytes = state.contents.get(item_id).ok_or(CloudError::Unavailable)?;
         let start = usize::try_from(offset)
@@ -120,6 +270,7 @@ impl CloudDrive for FakeCloudDrive {
 
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
         let mut state = self.state.lock().unwrap();
+        state.online()?;
         state.requests.push(request.clone());
         if let Some((remaining, _)) = state.failures.front_mut() {
             if *remaining == 0 {

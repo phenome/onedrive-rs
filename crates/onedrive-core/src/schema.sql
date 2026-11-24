@@ -71,3 +71,17 @@ AFTER DELETE ON sparse_files
 BEGIN
     INSERT INTO sparse_retired VALUES (OLD.generation);
 END;
+
+-- A row records the last acknowledged cloud identity and the desired local
+-- version. A NULL cloud ID means the item has yet to be created remotely.
+CREATE TABLE IF NOT EXISTS writeback_queue (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    inode INTEGER NOT NULL UNIQUE REFERENCES items(inode) ON DELETE CASCADE,
+    generation INTEGER NOT NULL DEFAULT 1,
+    remote_id TEXT,
+    remote_parent TEXT,
+    remote_name TEXT,
+    stage TEXT,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    conflict INTEGER NOT NULL DEFAULT 0
+);

@@ -862,9 +862,10 @@ pub(super) fn retire_stale_etag_ranges(db: &Connection) -> rusqlite::Result<()> 
         // Early catalogs kept ranges through eTag-only content changes.
         db.execute(
             "DELETE FROM sparse_files AS f WHERE EXISTS (
-                SELECT 1 FROM items i JOIN sparse_range_versions v ON v.generation = f.generation
+                SELECT 1 FROM items i JOIN sparse_ranges r ON r.generation = f.generation
+                LEFT JOIN sparse_range_versions v USING (generation, block)
                 WHERE i.inode = f.inode AND i.ctag IS NULL AND v.ctag IS NULL
-                    AND v.etag IS NOT NULL AND v.etag IS NOT i.etag
+                    AND v.etag IS NOT i.etag
             )",
             [],
         )?;

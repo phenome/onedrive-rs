@@ -638,31 +638,38 @@ async fn nonregular_cache_block_is_refetched() {
 
 #[tokio::test]
 async fn upgrade_retires_stale_etag_only_ranges() {
-    let (temp, drive, engine, inode, original) = setup(8192).await;
-    let mut item = fixture_file(original.len());
-    item.ctag = None;
-    drive.upsert(item.clone());
-    engine.sync().await.unwrap();
-    engine.read(inode, 0, original.len()).await.unwrap();
-    drop(engine);
+    for recorded_version in [true, false] {
+        let (temp, drive, engine, inode, original) = setup(8192).await;
+        let mut item = fixture_file(original.len());
+        item.ctag = None;
+        drive.upsert(item.clone());
+        engine.sync().await.unwrap();
+        engine.read(inode, 0, original.len()).await.unwrap();
+        drop(engine);
 
-    item.etag = Some("replacement".into());
-    let db = rusqlite::Connection::open(temp.path().join("metadata.db")).unwrap();
-    db.execute_batch("PRAGMA user_version = 0; DROP TRIGGER sparse_invalidate_on_content_change;")
+        item.etag = Some("replacement".into());
+        let db = rusqlite::Connection::open(temp.path().join("metadata.db")).unwrap();
+        db.execute_batch(
+            "PRAGMA user_version = 0; DROP TRIGGER sparse_invalidate_on_content_change;",
+        )
         .unwrap();
-    db.execute(
-        "UPDATE items SET etag = ?1 WHERE inode = ?2",
-        rusqlite::params![item.etag, inode],
-    )
-    .unwrap();
-    drop(db);
-    drive.upsert(item);
-    let replacement = vec![42; original.len()];
-    drive.set_content("file", replacement.clone());
-    let engine = open(&temp, &drive);
-    assert_eq!(
-        engine.read(inode, 0, original.len()).await.unwrap(),
-        replacement
-    );
-    assert_eq!(drive.range_requests().len(), 2);
+        db.execute(
+            "UPDATE items SET etag = ?1 WHERE inode = ?2",
+            rusqlite::params![item.etag, inode],
+        )
+        .unwrap();
+        if !recorded_version {
+            db.execute("DELETE FROM sparse_range_versions", []).unwrap();
+        }
+        drop(db);
+        drive.upsert(item);
+        let replacement = vec![42; original.len()];
+        drive.set_content("file", replacement.clone());
+        let engine = open(&temp, &drive);
+        assert_eq!(
+            engine.read(inode, 0, original.len()).await.unwrap(),
+            replacement
+        );
+        assert_eq!(drive.range_requests().len(), 2);
+    }
 }

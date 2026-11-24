@@ -105,12 +105,10 @@ fn anonymous(request: &wiremock::Request) -> bool {
 }
 
 #[tokio::test]
-async fn folder_thumbnails_follow_pages_and_download_over_http2_without_bearer() {
+async fn folder_thumbnails_follow_pages_and_download_without_bearer() {
     let server = MockServer::start().await;
     let cdn = MockServer::start().await;
-    let mut graph = mock_graph(&server);
-    // Wiremock runs over cleartext. Production negotiates HTTP/2 via TLS ALPN.
-    graph.client = Client::builder().http2_prior_knowledge().build().unwrap();
+    let graph = mock_graph(&server);
     let thumbnail = format!("{}/image.jpg?sig=temporary", cdn.uri());
     Mock::given(method("GET"))
         .and(path("/v1.0/me/drive/items/folder/children"))
@@ -469,4 +467,63 @@ async fn upload_session_resumes_from_server_offset_and_maps_conflict() {
             .as_deref(),
         Some("updated")
     );
+}
+
+#[tokio::test]
+async fn thumbnail_download_negotiates_tls_http2_without_bearer() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio_rustls::rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certificate = cert.cert.der().clone();
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], key.into())
+        .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let stream = tokio_rustls::TlsAcceptor::from(Arc::new(config))
+            .accept(stream)
+            .await
+            .unwrap();
+        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(
+                    |request: hyper::Request<hyper::body::Incoming>| async move {
+                        assert_eq!(request.version(), hyper::Version::HTTP_2);
+                        assert!(!request.headers().contains_key(hyper::header::AUTHORIZATION));
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                            Bytes::from_static(b"image"),
+                        )))
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+    });
+    let mock = MockServer::start().await;
+    let mut graph = mock_graph(&mock);
+    graph.client = crate::http_client_builder()
+        .add_root_certificate(reqwest::Certificate::from_der(certificate.as_ref()).unwrap())
+        .build()
+        .unwrap();
+    let thumbnail = RemoteThumbnail {
+        item_id: "photo".into(),
+        url: format!("https://localhost:{port}/image"),
+    };
+    assert_eq!(
+        graph.download_thumbnail(&thumbnail).await.unwrap(),
+        b"image"
+    );
+    drop(graph);
+    server.await.unwrap();
 }

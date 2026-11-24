@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use onedrive_core::{
     CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem, RemoteThumbnail, UploadSource, UploadTarget,
+    RemoteItem, RemoteThumbnail, UploadOutcome, UploadSource, UploadTarget,
 };
 use reqwest::header::{self, HeaderValue};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
@@ -307,7 +307,7 @@ impl GraphDrive {
         target: UploadTarget<'_>,
         source: UploadSource<'_>,
         if_match: Option<&str>,
-    ) -> Result<RemoteItem, CloudError> {
+    ) -> Result<UploadOutcome, CloudError> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Session {
@@ -346,7 +346,7 @@ impl GraphDrive {
                         && matches!(response.status(), StatusCode::OK | StatusCode::CREATED) =>
                 {
                     if let Ok(item) = decode_upload_item(response, target).await {
-                        return Ok(item);
+                        return Ok(UploadOutcome::Acknowledged(item));
                     }
                     break;
                 }
@@ -410,6 +410,7 @@ impl GraphDrive {
 
         self.confirm_upload(target, source, if_match)
             .await?
+            .map(UploadOutcome::Observed)
             .ok_or(CloudError::Unavailable)
     }
 
@@ -632,6 +633,17 @@ impl CloudDrive for GraphDrive {
         source: UploadSource<'_>,
         if_match: Option<&str>,
     ) -> Result<RemoteItem, CloudError> {
+        self.upload_with_outcome(target, source, if_match)
+            .await
+            .map(UploadOutcome::into_item)
+    }
+
+    async fn upload_with_outcome(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<UploadOutcome, CloudError> {
         if source.len() > SIMPLE_UPLOAD_LIMIT {
             return self.resumable_upload(target, source, if_match).await;
         }
@@ -648,10 +660,11 @@ impl CloudDrive for GraphDrive {
         match self.graph(conditional(request, if_match)).await {
             Ok(response) if response.status().is_success() => {
                 match decode_upload_item(response, target).await {
-                    Ok(item) => Ok(item),
+                    Ok(item) => Ok(UploadOutcome::Acknowledged(item)),
                     Err(_) => self
                         .confirm_upload(target, source, if_match)
                         .await?
+                        .map(UploadOutcome::Observed)
                         .ok_or(CloudError::Unavailable),
                 }
             }
@@ -661,11 +674,13 @@ impl CloudDrive for GraphDrive {
             {
                 self.confirm_upload(target, source, if_match)
                     .await?
+                    .map(UploadOutcome::Observed)
                     .ok_or(CloudError::Unavailable)
             }
             Err(CloudError::Unavailable) => self
                 .confirm_upload(target, source, if_match)
                 .await?
+                .map(UploadOutcome::Observed)
                 .ok_or(CloudError::Unavailable),
             Ok(response) => Err(status_error(response.status())),
             Err(error) => Err(error),

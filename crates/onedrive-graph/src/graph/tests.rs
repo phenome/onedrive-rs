@@ -561,15 +561,55 @@ async fn upload_session_resumes_from_server_offset_and_maps_conflict() {
         graph.upload_from(target, source, Some("old")).await,
         Err(CloudError::Conflict)
     );
-    assert_eq!(
-        graph
-            .upload_from(target, source, Some("fresh"))
-            .await
-            .unwrap()
-            .etag
-            .as_deref(),
-        Some("updated")
-    );
+    let outcome = graph
+        .upload_with_outcome(target, source, Some("fresh"))
+        .await
+        .unwrap();
+    let UploadOutcome::Acknowledged(item) = outcome else {
+        panic!("the final fragment returned the mutation result");
+    };
+    assert_eq!(item.etag.as_deref(), Some("updated"));
+}
+
+#[tokio::test]
+async fn upload_recovered_by_readback_reports_an_observation() {
+    let server = MockServer::start().await;
+    let graph = mock_graph(&server);
+    Mock::given(method("PUT"))
+        .and(path("/v1.0/me/drive/items/file/content"))
+        .and(header("if-match", "base"))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/drive/items/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "file", "eTag": "current", "cTag": "content", "size": 4, "file": {},
+            "parentReference": {"id": "root"}, "name": "file",
+            "@microsoft.graph.downloadUrl": format!("{}/content", server.uri())
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/content"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"edit"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let outcome = graph
+        .upload_with_outcome(
+            UploadTarget::Existing { item_id: "file" },
+            UploadSource::Bytes(b"edit"),
+            Some("base"),
+        )
+        .await
+        .unwrap();
+    let UploadOutcome::Observed(item) = outcome else {
+        panic!("a readback cannot attribute the current eTag to this upload");
+    };
+    assert_eq!(item.etag.as_deref(), Some("current"));
 }
 
 #[tokio::test]

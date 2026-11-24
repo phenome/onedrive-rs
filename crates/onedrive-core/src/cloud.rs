@@ -69,6 +69,18 @@ pub trait CloudDrive: Send + Sync {
             .await
     }
 
+    /// Report whether the upload returned a mutation response or was confirmed by observation.
+    async fn upload_with_outcome(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<UploadOutcome, CloudError> {
+        self.upload_from(target, source, if_match)
+            .await
+            .map(UploadOutcome::Observed)
+    }
+
     /// Resolve the current upload destination. Absence is represented by None.
     async fn upload_destination(
         &self,
@@ -170,6 +182,21 @@ pub trait CloudDrive: Send + Sync {
 pub struct RemoteThumbnail {
     pub item_id: String,
     pub url: String,
+}
+
+/// A mutation response can advance a queued delete. A destination observation
+/// can confirm uploaded bytes but may include a peer's later metadata change.
+pub enum UploadOutcome {
+    Acknowledged(RemoteItem),
+    Observed(RemoteItem),
+}
+
+impl UploadOutcome {
+    pub fn into_item(self) -> RemoteItem {
+        match self {
+            Self::Acknowledged(item) | Self::Observed(item) => item,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

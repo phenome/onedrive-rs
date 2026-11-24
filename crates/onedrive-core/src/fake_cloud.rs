@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use crate::{
     CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
-    RemoteItem, RemoteThumbnail, UploadSource, UploadTarget,
+    RemoteItem, RemoteThumbnail, UploadOutcome, UploadSource, UploadTarget,
 };
 
 /// A versioned in-memory drive. Changes during enumeration are delivered on
@@ -310,10 +310,16 @@ impl CloudDrive for FakeCloudDrive {
     ) -> Result<RemoteItem, CloudError> {
         let bytes = match source {
             UploadSource::Bytes(bytes) => Content::Bytes(bytes.to_vec()),
-            UploadSource::File { file, size } => Content::File {
-                file: file.try_clone().map_err(|_| CloudError::Unavailable)?,
-                size,
-            },
+            UploadSource::File { file, size } => {
+                let metadata = file.metadata().map_err(|_| CloudError::Unavailable)?;
+                if !metadata.is_file() || metadata.len() < size as u64 {
+                    return Err(CloudError::Unavailable);
+                }
+                Content::File {
+                    file: file.try_clone().map_err(|_| CloudError::Unavailable)?,
+                    size,
+                }
+            }
         };
         let mut state = self.state.lock().unwrap();
         state.online()?;
@@ -330,6 +336,17 @@ impl CloudDrive for FakeCloudDrive {
             }
         };
         Ok(state.commit(item, Some(bytes)))
+    }
+
+    async fn upload_with_outcome(
+        &self,
+        target: UploadTarget<'_>,
+        source: UploadSource<'_>,
+        if_match: Option<&str>,
+    ) -> Result<UploadOutcome, CloudError> {
+        self.upload_from(target, source, if_match)
+            .await
+            .map(UploadOutcome::Acknowledged)
     }
 
     async fn upload_destination(

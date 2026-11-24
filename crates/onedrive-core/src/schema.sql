@@ -114,6 +114,14 @@ CREATE TABLE IF NOT EXISTS writeback_queue (
 
 CREATE INDEX IF NOT EXISTS writeback_remote_namespace ON writeback_queue (remote_parent, remote_name);
 
+CREATE INDEX IF NOT EXISTS writeback_queue_priority ON writeback_queue (deleted DESC, sequence);
+
+-- A delete authorizes only the remote revision visible when it was queued.
+CREATE TABLE IF NOT EXISTS writeback_deletes (
+    inode INTEGER PRIMARY KEY REFERENCES writeback_queue(inode) ON DELETE CASCADE,
+    etag TEXT
+);
+
 CREATE TABLE IF NOT EXISTS writeback_recycled (
     item_id TEXT PRIMARY KEY
 );
@@ -140,8 +148,7 @@ CREATE INDEX IF NOT EXISTS writeback_attempt_destination ON writeback_attempts (
 
 CREATE TABLE IF NOT EXISTS writeback_replacements (
     target_inode INTEGER PRIMARY KEY REFERENCES writeback_queue(inode) ON DELETE CASCADE,
-    source_inode INTEGER REFERENCES items(inode) ON DELETE SET NULL,
-    etag TEXT
+    source_inode INTEGER REFERENCES items(inode) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS writeback_temporary_names (

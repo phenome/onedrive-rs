@@ -1,0 +1,12 @@
+[Unit]
+Description=OneDrive cloud filesystem
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/onedrive-rs daemon
+RuntimeDirectory=onedrive onedrive-rs
+RuntimeDirectoryMode=0700
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

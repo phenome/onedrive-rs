@@ -141,12 +141,12 @@ impl Cli {
             LocalCommand::Daemon => {
                 let config = Config::load().map_err(|error| error.to_string())?;
                 let auth = Arc::new(Auth::new(&config).map_err(|error| error.to_string())?);
-                let cloud = Arc::new(GraphDrive::new(auth).map_err(|error| error.to_string())?);
+                let cloud = GraphDrive::new(auth).map_err(|error| error.to_string())?;
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
                     .map_err(|error| format!("Cannot initialize the OneDrive daemon ({error})"))?
-                    .block_on(daemon::run(config, self.mount_path.as_deref(), cloud))?;
+                    .block_on(daemon::run_graph(config, self.mount_path.as_deref(), cloud))?;
                 Ok(if self.json {
                     Response::Success(Value::Null).into_json().to_string()
                 } else {

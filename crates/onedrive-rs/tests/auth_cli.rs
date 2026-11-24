@@ -68,6 +68,7 @@ fn auth_session_fixture() {
     };
 
     assert_signed_in(cli("status"), false);
+    assert_signed_out_mount();
     let login = cli("login");
     assert_eq!(login.status.code(), Some(1), "{login:?}");
     assert_eq!(
@@ -125,6 +126,45 @@ fn auth_session_fixture() {
             Some("synthetic-other-refresh")
         );
     });
+}
+
+fn assert_signed_out_mount() {
+    let output = Command::new("bash")
+        .args([
+            "-euc",
+            r#"
+mount="$XDG_RUNTIME_DIR/onedrive"
+timeout --preserve-status 10 "$1" daemon &
+daemon_pid=$!
+cleanup() {
+    kill -TERM "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    timeout 2 fusermount3 -u "$mount" 2>/dev/null || true
+}
+trap cleanup EXIT
+for attempt in {1..80}; do
+    if timeout 1 mountpoint -q "$mount"; then break; fi
+    sleep .05
+done
+timeout 1 mountpoint -q "$mount"
+entries=$(timeout 2 ls -A "$mount")
+test -z "$entries"
+timeout 2 "$1" --json status
+kill -TERM "$daemon_pid"
+wait "$daemon_pid"
+! timeout 1 mountpoint -q "$mount"
+"#,
+            "fixture",
+            env!("CARGO_BIN_EXE_onedrive-rs"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_signed_in(output: Output, signed_in: bool) {

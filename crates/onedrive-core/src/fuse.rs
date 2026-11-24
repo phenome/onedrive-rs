@@ -141,34 +141,40 @@ impl FuseAdapter {
         &self,
         ino: INodeNo,
     ) -> Result<impl Iterator<Item = DirectoryEntry>, Errno> {
-        let directory = self.directory(ino)?;
-        let parent = match directory.parent_id {
-            Some(id) => {
-                self.engine
-                    .item(&id)
-                    .map_err(errno)?
-                    .ok_or(Errno::ENOENT)?
-                    .inode
+        let (parent, entries) = match self.directory(ino) {
+            Err(Errno::ENOENT) if ino == INodeNo::ROOT => (ino.0, Vec::new()),
+            Err(error) => return Err(error),
+            Ok(directory) => {
+                let parent = match directory.parent_id {
+                    Some(id) => {
+                        self.engine
+                            .item(&id)
+                            .map_err(errno)?
+                            .ok_or(Errno::ENOENT)?
+                            .inode
+                    }
+                    None => ino.0,
+                };
+                let entries = match &self.paths {
+                    Some(paths) => self
+                        .run(self.engine.readdir(
+                            &directory.item_id,
+                            &paths.mountpoint,
+                            &paths.thumbnail_root,
+                        ))
+                        .map(|entries| {
+                            entries
+                                .into_iter()
+                                .map(|entry| (entry.inode, entry.kind, entry.name))
+                                .collect()
+                        })?,
+                    None => self
+                        .engine
+                        .list_directory_entries(&directory.item_id)
+                        .map_err(errno)?,
+                };
+                (parent, entries)
             }
-            None => ino.0,
-        };
-        let entries = match &self.paths {
-            Some(paths) => self
-                .run(self.engine.readdir(
-                    &directory.item_id,
-                    &paths.mountpoint,
-                    &paths.thumbnail_root,
-                ))
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .map(|entry| (entry.inode, entry.kind, entry.name))
-                        .collect()
-                })?,
-            None => self
-                .engine
-                .list_directory_entries(&directory.item_id)
-                .map_err(errno)?,
         };
         Ok([
             (ino, FileType::Directory, ".".into()),
@@ -210,13 +216,18 @@ impl Filesystem for FuseAdapter {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.item(ino) {
             Ok(item) => reply.attr(&Duration::ZERO, &attributes(&item)),
+            Err(Errno::ENOENT) if ino == INodeNo::ROOT => {
+                reply.attr(&Duration::ZERO, &empty_root_attributes());
+            }
             Err(error) => reply.error(error),
         }
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        if let Err(error) = self.directory(ino) {
-            return reply.error(error);
+        match self.directory(ino) {
+            Ok(_) => {}
+            Err(Errno::ENOENT) if ino == INodeNo::ROOT => {}
+            Err(error) => return reply.error(error),
         }
         let handle = self.next_directory.fetch_add(1, Ordering::Relaxed);
         self.directories
@@ -564,6 +575,27 @@ impl Filesystem for FuseAdapter {
             }
             Err(error) => reply.error(errno(error)),
         }
+    }
+}
+
+// An empty catalog can mount before the first verified delta page arrives.
+fn empty_root_attributes() -> FileAttr {
+    FileAttr {
+        ino: INodeNo::ROOT,
+        size: 0,
+        blocks: 0,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::Directory,
+        perm: 0o755,
+        nlink: 2,
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
+        rdev: 0,
+        blksize: 4096,
+        flags: 0,
     }
 }
 

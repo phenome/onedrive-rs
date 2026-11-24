@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 
 use super::{Engine, writeback::Writeback};
@@ -27,6 +28,17 @@ impl Engine {
             || entry_present(&sqlite_companion(database, "-wal"))?
             || entry_present(&sqlite_companion(database, "-shm"))?
             || entry_present(&Writeback::staging_directory(database))?)
+    }
+
+    /// Inspect an offline catalog without opening its cache or staging directory.
+    pub fn stored_root_id(database: &Path) -> rusqlite::Result<Option<String>> {
+        let db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.query_row(
+            "SELECT item_id FROM items WHERE inode = 1 AND parent_id IS NULL AND kind = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
     }
 
     /// Relocate an offline catalog on the same filesystem. The caller owns

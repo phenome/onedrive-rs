@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 use futures_util::{StreamExt, stream};
 use image::{ImageReader, RgbaImage};
 use rusqlite::Connection;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{CatalogItem, Engine, EngineError, list_children, path_for};
@@ -157,7 +157,13 @@ impl Engine {
             let mut writer = encoder.write_header()?;
             writer.write_image_data(pixels.as_raw())?;
             writer.finish()?;
-            Ok(PreparedThumbnail { file, path, other })
+            // Close the staging file while other renditions finish, so large folders
+            // keep descriptors bounded by the number of active workers.
+            Ok(PreparedThumbnail {
+                staged: file.into_temp_path(),
+                path,
+                other,
+            })
         })
         .await
         .map_err(|error| EngineError::ThumbnailIo(io::Error::other(error)))?
@@ -165,14 +171,14 @@ impl Engine {
 }
 
 struct PreparedThumbnail {
-    file: NamedTempFile,
+    staged: TempPath,
     path: PathBuf,
     other: PathBuf,
 }
 
 impl PreparedThumbnail {
     fn publish(self) -> Result<(), EngineError> {
-        self.file
+        self.staged
             .persist(self.path)
             .map_err(|failure| EngineError::ThumbnailIo(failure.error))?;
         // A stale success file can hide a fresh fail marker in GIO.

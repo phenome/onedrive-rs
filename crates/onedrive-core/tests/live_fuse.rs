@@ -1,10 +1,20 @@
 //! Exercise the mounted filesystem in a bounded subprocess.
+//!
+//! Run `cargo test -p onedrive-core --test live_fuse live_thumbnail_validation -- --nocapture`
+//! on a host with FUSE3, GIO, and Python GI with GnomeDesktop 4.0.
+//! The worker uses an isolated XDG cache under /tmp. The supervisor unmounts
+//! on failure and reports the retained mount path if cleanup itself fails.
+//! To recover that directory, run `timeout -k 2s 10s fusermount3 -u <reported-mount-path>`
+//! before removing its temporary parent directory.
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Cursor, Read};
+use std::mem::MaybeUninit;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+
+use rustix::fs::inotify;
 
 use onedrive_core::{
     Engine, FakeCloudDrive, FuseAdapter, ItemKind, PinState, RemoteItem, SystemClock,
@@ -32,8 +42,17 @@ fn mount_type(path: &Path) -> Option<String> {
 
 #[test]
 fn live_read_only_mount() {
+    supervise_mount("live_read_only_mount", exercise_mount);
+}
+
+#[test]
+fn live_thumbnail_validation() {
+    supervise_mount("live_thumbnail_validation", exercise_thumbnail_validation);
+}
+
+fn supervise_mount(test: &str, exercise: fn(&Path)) {
     if let Some(dir) = std::env::var_os(WORKER_DIR) {
-        exercise_mount(Path::new(&dir));
+        exercise(Path::new(&dir));
         return;
     }
 
@@ -51,7 +70,11 @@ fn live_read_only_mount() {
     let result = worker
         .args(["-k", "3s", "45s"])
         .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "live_read_only_mount", "--nocapture"])
+        .args(["--exact", test, "--nocapture"])
+        .env("XDG_CACHE_HOME", temp.path().join("xdg-cache"))
+        .env("GIO_USE_VFS", "local")
+        .env("GSETTINGS_BACKEND", "memory")
+        .env("LC_ALL", "C")
         .env(WORKER_DIR, temp.path())
         .status();
 
@@ -241,4 +264,147 @@ fn assert_xattrs(path: &Path, state: &[u8], pin: &[u8], etag: &[u8]) {
         );
     }
     assert_eq!(xattr::get(path, "user.onedrive.missing").unwrap(), None);
+}
+
+fn exercise_thumbnail_validation(dir: &Path) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mount = dir.join("mount");
+    let drive = Arc::new(FakeCloudDrive::new(100));
+    let root = RemoteItem {
+        item_id: "root".into(),
+        parent_id: None,
+        name: Some("root".into()),
+        kind: ItemKind::Folder,
+        size: 0,
+        mtime: 1_700_000_000,
+        etag: None,
+        ctag: None,
+        quickxor_hash: None,
+    };
+    drive.upsert(root.clone());
+    let seeded = mount.join("café; #%.png");
+    let failed = mount.join("failed.png");
+    let mut rendition = Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(800, 400, image::Rgb([0, 100, 200]))
+        .write_to(&mut rendition, image::ImageFormat::Png)
+        .unwrap();
+    let rendition = rendition.into_inner();
+    let mut original = rendition.clone();
+    original.resize(12 * 1024 * 1024, 0);
+    for path in [&seeded, &failed] {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        drive.upsert(RemoteItem {
+            item_id: name.into(),
+            parent_id: Some("root".into()),
+            name: Some(name.into()),
+            kind: ItemKind::File,
+            size: original.len() as u64,
+            ..root.clone()
+        });
+        drive.set_content(name, original.clone());
+    }
+    drive.set_thumbnail(seeded.file_name().unwrap().to_str().unwrap(), rendition);
+    let engine =
+        Arc::new(Engine::open(dir.join("db"), drive.clone(), Arc::new(SystemClock)).unwrap());
+    runtime.block_on(engine.sync()).unwrap();
+    let mounted = FuseAdapter::new(engine, runtime.handle().clone())
+        .mount(&mount)
+        .unwrap();
+
+    let watch =
+        inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+    for path in [&seeded, &failed] {
+        inotify::add_watch(
+            &watch,
+            path,
+            inotify::WatchFlags::OPEN | inotify::WatchFlags::ACCESS,
+        )
+        .unwrap();
+    }
+    let mut buffer = [MaybeUninit::uninit(); 512];
+    let mut events = inotify::Reader::new(watch, &mut buffer);
+
+    let directory = fs::read_dir(&mount).unwrap();
+    assert!(drive.thumbnail_list_requests().is_empty());
+    assert_eq!(directory.collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+
+    for path in [&seeded, &failed] {
+        let gio = command("gio")
+            .args(["info", "-a", "thumbnail::*,time::*"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(gio.status.success(), "{gio:?}");
+        let info = String::from_utf8(gio.stdout).unwrap();
+        assert!(info.contains("thumbnail::is-valid: TRUE"), "{info}");
+        assert!(info.contains("time::modified: 1700000000"), "{info}");
+        if path == &seeded {
+            assert!(
+                info.contains("thumbnail::path: ") && info.contains("/x-large/"),
+                "{info}"
+            );
+        } else {
+            assert!(info.contains("thumbnail::failed: TRUE"), "{info}");
+        }
+    }
+
+    let gnome = command("python")
+        .args([
+            "-c",
+            r#"
+import sys
+import gi
+gi.require_version("GnomeDesktop", "4.0")
+from gi.repository import Gio, GnomeDesktop
+
+seeded, failed = (Gio.File.new_for_path(path).get_uri() for path in sys.argv[1:])
+factory = GnomeDesktop.DesktopThumbnailFactory.new(GnomeDesktop.DesktopThumbnailSize.XLARGE)
+assert factory.lookup(seeded, 1700000000)
+assert factory.has_valid_failed_thumbnail(failed, 1700000000)
+assert not factory.can_thumbnail(failed, "image/png", 1700000000)
+"#,
+        ])
+        .arg(&seeded)
+        .arg(&failed)
+        .output()
+        .unwrap();
+    assert!(
+        gnome.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gnome.stderr)
+    );
+
+    assert_eq!(events.next().unwrap_err(), rustix::io::Errno::AGAIN);
+    assert!(drive.range_requests().is_empty());
+
+    // Verify the observers detect a deliberate source open and read.
+    let mut byte = [0];
+    File::open(&seeded).unwrap().read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [0x89]);
+    assert!(
+        events
+            .next()
+            .unwrap()
+            .events()
+            .contains(inotify::ReadFlags::OPEN)
+    );
+    assert!(
+        events
+            .next()
+            .unwrap()
+            .events()
+            .contains(inotify::ReadFlags::ACCESS)
+    );
+    assert_eq!(drive.range_requests(), [("café; #%.png".into(), 0, HEADER)]);
+
+    assert!(
+        command("fusermount3")
+            .arg("-u")
+            .arg(&mount)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(mount_type(&mount).is_none());
+    mounted.join().unwrap();
 }

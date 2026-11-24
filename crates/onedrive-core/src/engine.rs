@@ -116,11 +116,10 @@ impl Engine {
 
     pub async fn sync(&self) -> Result<(), EngineError> {
         let _sync = self.syncing.lock().await;
-        let mut restarted = false;
         loop {
             let (link, revision) = self.ready_checkpoint().await?;
             let request = link.map_or(DeltaRequest::Initial, DeltaRequest::Link);
-            let can_resync = !restarted && request != DeltaRequest::Initial;
+            let can_resync = request != DeltaRequest::Initial;
             let page = match self.cloud.delta(request).await {
                 Ok(page) => page,
                 Err(CloudError::Throttled { retry_after }) => {
@@ -130,7 +129,6 @@ impl Engine {
                 }
                 Err(CloudError::ResyncRequired) if can_resync => {
                     self.restart_full_sync(revision)?;
-                    restarted = true;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -468,6 +466,7 @@ fn reconcile_catalog(transaction: &Transaction<'_>, full_scan: bool) -> rusqlite
         [full_scan],
     )?;
     prune_remote_deletions(transaction)?;
+    resolve_local_name_collisions(transaction)?;
     transaction.execute_batch("DELETE FROM delta_deletions; DELETE FROM full_sync_seen;")
 }
 
@@ -485,4 +484,77 @@ fn prune_remote_deletions(transaction: &Transaction<'_>) -> rusqlite::Result<()>
         [],
     )?;
     Ok(())
+}
+
+fn resolve_local_name_collisions(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    // Reconcile final names after moves and deletions have settled. Live remote
+    // entries take precedence, then live local changes, then retained entries.
+    let mut collisions = transaction.prepare(
+        "SELECT local.item_id, local.parent_id, local.name, local.kind
+         FROM items AS local
+         WHERE (local.remote_missing = 1 OR local.sync_state <> 0)
+           AND EXISTS (
+               SELECT 1 FROM items AS sibling
+               WHERE sibling.parent_id = local.parent_id AND sibling.name = local.name
+                 AND (sibling.remote_missing, sibling.sync_state <> 0, sibling.inode)
+                   < (local.remote_missing, local.sync_state <> 0, local.inode)
+           )
+         ORDER BY local.inode",
+    )?;
+    let displaced = collisions
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (item_id, parent_id, name, folder) in displaced {
+        let kind = if folder {
+            ItemKind::Folder
+        } else {
+            ItemKind::File
+        };
+        let name = choose_conflict_name(transaction, &parent_id, &name, kind, "conflict")?;
+        transaction.execute(
+            "UPDATE items SET name = ?2 WHERE item_id = ?1",
+            params![item_id, name],
+        )?;
+    }
+    Ok(())
+}
+
+fn choose_conflict_name(
+    db: &Connection,
+    parent_id: &str,
+    name: &str,
+    kind: ItemKind,
+    label: &str,
+) -> rusqlite::Result<String> {
+    let (stem, extension) = match kind {
+        ItemKind::File => Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map_or((name, ""), |extension| {
+                name.split_at(name.len() - extension.len() - 1)
+            }),
+        ItemKind::Folder => (name, ""),
+    };
+    let mut exists = db
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM items WHERE parent_id = ?1 AND name = ?2)")?;
+    let mut number = 1;
+    loop {
+        let candidate = if number == 1 {
+            format!("{stem} ({label}){extension}")
+        } else {
+            format!("{stem} ({label} {number}){extension}")
+        };
+        if !exists.query_row(params![parent_id, candidate], |row| row.get::<_, bool>(0))? {
+            return Ok(candidate);
+        }
+        number += 1;
+    }
 }

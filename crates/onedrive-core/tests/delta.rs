@@ -353,3 +353,241 @@ async fn nameless_sighting_restores_a_folder_retained_for_a_dirty_child() {
         assert!(engine.item("child").unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn expired_continuation_after_resync_progress_recovers_in_the_same_sync() {
+    let temp = TempDir::new().unwrap();
+    let drive = drive(1);
+    let engine = open(&temp, &drive);
+    engine.sync().await.unwrap();
+
+    drive.upsert(item("a", Some("root"), "a.txt", ItemKind::File));
+    drive.expire_tokens();
+    drive.fail_after(2, CloudError::ResyncRequired);
+    engine.sync().await.unwrap();
+
+    assert_eq!(
+        engine.lookup("root", "a.txt").unwrap().unwrap().item_id,
+        "a"
+    );
+}
+
+#[tokio::test]
+async fn expired_initial_request_returns_the_error_without_restarting() {
+    use onedrive_core::EngineError;
+
+    let temp = TempDir::new().unwrap();
+    let drive = drive(1);
+    drive.fail_after(0, CloudError::ResyncRequired);
+    let engine = open(&temp, &drive);
+
+    assert!(matches!(
+        engine.sync().await,
+        Err(EngineError::Cloud(CloudError::ResyncRequired))
+    ));
+    assert_eq!(drive.requests(), [DeltaRequest::Initial]);
+}
+
+#[tokio::test]
+async fn replacement_keeps_dirty_file_and_remote_file_reachable_in_either_delta_order() {
+    use onedrive_core::{PinState, SyncState};
+
+    for deletion_first in [true, false] {
+        let temp = TempDir::new().unwrap();
+        let drive = drive(1);
+        let mut old = item("old", Some("root"), "report.txt", ItemKind::File);
+        old.size = 123;
+        old.etag = Some("base-version".into());
+        drive.upsert(old);
+        drive.upsert(item(
+            "sibling",
+            Some("root"),
+            "report (conflict).txt",
+            ItemKind::File,
+        ));
+        let engine = open(&temp, &drive);
+        engine.sync().await.unwrap();
+        engine.set_sync_state("old", SyncState::Dirty).unwrap();
+        engine.set_pin_state("old", PinState::Pinned).unwrap();
+        let mut retained = engine.item("old").unwrap().unwrap();
+
+        if deletion_first {
+            drive.delete("old");
+        }
+        drive.upsert(item("new", Some("root"), "report.txt", ItemKind::File));
+        if !deletion_first {
+            drive.delete("old");
+        }
+        drive.fail_after(1, CloudError::Unavailable);
+        assert!(engine.sync().await.is_err());
+        drop(engine);
+
+        let engine = open(&temp, &drive);
+        engine.sync().await.unwrap();
+        assert_eq!(
+            engine.resolve_path("/report.txt").unwrap().unwrap().item_id,
+            "new"
+        );
+        retained.name = "report (conflict 2).txt".into();
+        assert_eq!(
+            engine.resolve_path("/report (conflict 2).txt").unwrap(),
+            Some(retained.clone())
+        );
+        assert_eq!(
+            engine
+                .resolve_path("/report (conflict).txt")
+                .unwrap()
+                .unwrap()
+                .item_id,
+            "sibling"
+        );
+
+        drop(engine);
+        drive.expire_tokens();
+        let engine = open(&temp, &drive);
+        engine.sync().await.unwrap();
+        assert_eq!(engine.getattr(retained.inode).unwrap(), Some(retained));
+        assert_eq!(engine.list_children("root").unwrap().len(), 3);
+
+        drive.upsert(item(
+            "newer",
+            Some("root"),
+            "report (conflict 2).txt",
+            ItemKind::File,
+        ));
+        engine.sync().await.unwrap();
+        assert_eq!(
+            engine
+                .resolve_path("/report (conflict 2).txt")
+                .unwrap()
+                .unwrap()
+                .item_id,
+            "newer"
+        );
+        let old_path = engine.path_for("old").unwrap().unwrap();
+        assert_eq!(
+            engine.resolve_path(old_path).unwrap().unwrap().item_id,
+            "old"
+        );
+        assert_eq!(engine.list_children("root").unwrap().len(), 4);
+    }
+}
+
+#[tokio::test]
+async fn full_resync_replacement_preserves_nested_dirty_paths_and_pins() {
+    use onedrive_core::{PinState, SyncState};
+
+    let temp = TempDir::new().unwrap();
+    let drive = drive(1);
+    drive.upsert(item("old", Some("root"), "Folder.v1", ItemKind::Folder));
+    drive.upsert(item("nested", Some("old"), "Nested", ItemKind::Folder));
+    drive.upsert(item("dirty", Some("nested"), "edit.txt", ItemKind::File));
+    let engine = open(&temp, &drive);
+    engine.sync().await.unwrap();
+    engine.set_sync_state("dirty", SyncState::Dirty).unwrap();
+    engine.set_pin_state("old", PinState::Pinned).unwrap();
+    engine
+        .set_pin_state("dirty", PinState::UnpinOverride)
+        .unwrap();
+    let mut old = engine.item("old").unwrap().unwrap();
+    let nested = engine.item("nested").unwrap().unwrap();
+    let dirty = engine.item("dirty").unwrap().unwrap();
+
+    drive.delete("old");
+    drive.upsert(item("new", Some("root"), "Folder.v1", ItemKind::Folder));
+    drive.upsert(item("new-nested", Some("new"), "Nested", ItemKind::Folder));
+    drive.upsert(item(
+        "new-file",
+        Some("new-nested"),
+        "edit.txt",
+        ItemKind::File,
+    ));
+    drive.expire_tokens();
+    engine.sync().await.unwrap();
+    drop(engine);
+
+    let engine = open(&temp, &drive);
+    engine.sync().await.unwrap();
+    assert_eq!(
+        engine
+            .resolve_path("/Folder.v1/Nested/edit.txt")
+            .unwrap()
+            .unwrap()
+            .item_id,
+        "new-file"
+    );
+    old.name = "Folder.v1 (conflict)".into();
+    assert_eq!(
+        engine.resolve_path("/Folder.v1 (conflict)").unwrap(),
+        Some(old)
+    );
+    assert_eq!(
+        engine.resolve_path("/Folder.v1 (conflict)/Nested").unwrap(),
+        Some(nested)
+    );
+    assert_eq!(
+        engine
+            .resolve_path("/Folder.v1 (conflict)/Nested/edit.txt")
+            .unwrap(),
+        Some(dirty)
+    );
+}
+
+#[tokio::test]
+async fn remote_rename_across_pages_releases_a_name_before_displacing_a_dirty_item() {
+    use onedrive_core::SyncState;
+
+    let temp = TempDir::new().unwrap();
+    let drive = drive(1);
+    drive.upsert(item("local", Some("root"), "a.txt", ItemKind::File));
+    drive.upsert(item("remote", Some("root"), "b.txt", ItemKind::File));
+    let engine = open(&temp, &drive);
+    engine.sync().await.unwrap();
+    engine.set_sync_state("local", SyncState::Dirty).unwrap();
+    let local = engine.item("local").unwrap().unwrap();
+
+    drive.upsert(item("remote", Some("root"), "a.txt", ItemKind::File));
+    drive.upsert(item("remote", Some("root"), "c.txt", ItemKind::File));
+    engine.sync().await.unwrap();
+
+    assert_eq!(engine.resolve_path("/a.txt").unwrap(), Some(local));
+    assert_eq!(
+        engine.resolve_path("/c.txt").unwrap().unwrap().item_id,
+        "remote"
+    );
+    assert_eq!(engine.list_children("root").unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn replacement_gives_each_retained_dirty_version_its_own_sibling_name() {
+    use onedrive_core::SyncState;
+
+    let temp = TempDir::new().unwrap();
+    let drive = drive(1);
+    drive.upsert(item("first", Some("root"), "edit.txt", ItemKind::File));
+    let engine = open(&temp, &drive);
+    engine.sync().await.unwrap();
+    engine.set_sync_state("first", SyncState::Dirty).unwrap();
+
+    drive.upsert(item("second", Some("root"), "edit.txt", ItemKind::File));
+    drive.delete("first");
+    drive.fail_after(1, CloudError::Unavailable);
+    assert!(engine.sync().await.is_err());
+    assert!(engine.set_sync_state("second", SyncState::Dirty).unwrap());
+
+    drive.delete("second");
+    drive.upsert(item("current", Some("root"), "edit.txt", ItemKind::File));
+    drive.expire_tokens();
+    engine.sync().await.unwrap();
+
+    for (name, item_id, state) in [
+        ("edit.txt", "current", SyncState::Clean),
+        ("edit (conflict).txt", "first", SyncState::Dirty),
+        ("edit (conflict 2).txt", "second", SyncState::Dirty),
+    ] {
+        let entry = engine.lookup("root", name).unwrap().unwrap();
+        assert_eq!(entry.item_id, item_id);
+        assert_eq!(entry.sync_state, state);
+    }
+    assert_eq!(engine.list_children("root").unwrap().len(), 3);
+}

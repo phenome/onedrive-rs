@@ -320,7 +320,16 @@ impl Auth {
             .send()
             .await
             .map_err(|_| AuthError::Transport)?;
-        if !response.status().is_success() {
+        let status = response.status();
+        if status.is_server_error()
+            || matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+            )
+        {
+            return Err(AuthError::Transport);
+        }
+        if !status.is_success() {
             return Err(AuthError::GrantRejected);
         }
         response.json().await.map_err(|_| AuthError::InvalidToken)

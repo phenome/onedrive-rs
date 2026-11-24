@@ -13,7 +13,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep_until};
 
-use crate::Auth;
+use crate::{Auth, AuthError};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const DOWNLOAD_URL_LIFETIME: Duration = Duration::from_secs(300);
@@ -79,11 +79,14 @@ impl GraphDrive {
 
     async fn graph(&self, request: RequestBuilder) -> Result<Response, CloudError> {
         self.wait_until_allowed().await;
-        let bearer = self
-            .auth
-            .bearer()
-            .await
-            .map_err(|_| CloudError::Authentication)?;
+        let bearer = self.auth.bearer().await.map_err(|error| match error {
+            AuthError::LoginRequired
+            | AuthError::GrantRejected
+            | AuthError::Denied
+            | AuthError::MissingClientId => CloudError::Authentication,
+            AuthError::InvalidToken => CloudError::InvalidResponse,
+            _ => CloudError::Unavailable,
+        })?;
         self.send(request.bearer_auth(bearer)).await
     }
 

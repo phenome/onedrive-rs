@@ -197,3 +197,28 @@ async fn secret_service_replaces_synthetic_refresh_token_across_store_instances(
         Some("rotated-synthetic-secret")
     );
 }
+
+#[tokio::test]
+async fn refresh_outage_and_rejected_grant_have_distinct_graph_errors() {
+    use onedrive_core::{CloudDrive, CloudError, DeltaRequest};
+
+    for (status, expected) in [
+        (503, CloudError::Unavailable),
+        (429, CloudError::Unavailable),
+        (400, CloudError::Authentication),
+    ] {
+        let server = MockServer::start().await;
+        let store = Arc::new(FakeTokenStore::default());
+        store.replace_refresh_token("refresh").await.unwrap();
+        Mock::given(path(TOKEN))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let graph = crate::GraphDrive::new(Arc::new(mock_auth(&server, store))).unwrap();
+        assert_eq!(
+            graph.delta(DeltaRequest::Initial).await.err(),
+            Some(expected)
+        );
+    }
+}

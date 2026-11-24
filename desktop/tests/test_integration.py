@@ -312,10 +312,40 @@ class ExtensionTests(unittest.TestCase):
         self.set_status("Hydrated", "none")
         self.update(info)
         self.assertIn(key, self.provider.observed_files)
+        del self.info
+        observation = self.provider.observation
         del info
         gc.collect()
         self.assertIsNone(file_ref())
         self.assertNotIn(key, self.provider.observed_files)
+        self.assertTrue(observation.is_cancelled())
+        self.assertEqual(self.provider.observation_timer, 0)
+
+    def test_external_changes_recheck_only_affected_items_and_refresh_once(self):
+        unrelated = self.mount / "other.txt"
+        unrelated.touch()
+        unrelated_info = FileInfo(Gio.File.new_for_path(str(unrelated)))
+        self.set_status("Cloud-only", "none", unrelated)
+        self.set_status("Cloud-only", "none")
+        self.update(unrelated_info)
+        self.update()
+        ancestor = self.path.parent.stat().st_ino
+        self.set_status("Hydrated", "pinned")
+        record, queried = self.record_queries()
+        with record:
+            for revision in (1, 2):
+                self.provider.accept_changes({
+                    "epoch": "daemon", "revision": revision, "inodes": [[ancestor, True]],
+                })
+                self.drain_until(lambda: not self.provider.checking)
+            self.provider.accept_changes({"epoch": "daemon", "revision": 2, "inodes": []})
+        self.assertEqual(queried, [self.mount, self.path.parent, self.path] * 2)
+        self.assertEqual(self.info.invalidations, 1)
+        self.assertEqual(unrelated_info.invalidations, 0)
+        self.update()
+        self.assertEqual(self.info.emblems, ["starred-symbolic"])
+        self.assertEqual([item.props.label for item in self.provider.get_file_items([self.info])],
+                         ["Purge"])
 
     def test_activation_stops_at_replaced_symlink_component(self):
         self.set_status("Cloud-only", "none")

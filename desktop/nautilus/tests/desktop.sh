@@ -40,5 +40,5 @@ else
 fi
 unset DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE WAYLAND_DISPLAY
 ulimit -c 0
-timeout -k 2s 25s dbus-run-session --config-file="$root/desktop-bus.conf" -- \
+timeout -k 2s 40s dbus-run-session --config-file="$root/desktop-bus.conf" -- \
     xvfb-run -a -s '-screen 0 1024x768x24' python "$test_dir/drive.py" "$mode"

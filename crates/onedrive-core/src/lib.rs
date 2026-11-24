@@ -11,7 +11,9 @@ pub use cloud::{
     Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
     RemoteItem, RemoteThumbnail, SystemClock, UploadSource, UploadTarget,
 };
-pub use engine::{CacheStatus, CatalogItem, Engine, EngineError, PinState, SyncState};
+pub use engine::{
+    CacheStatus, CatalogItem, DesktopChanges, Engine, EngineError, PinState, SyncState,
+};
 pub use fake_cloud::FakeCloudDrive;
 
 mod fuse;

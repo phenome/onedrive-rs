@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Pass the compiled daemon fixture test binary as the only argument.
+# Pass the compiled daemon fixture test binary and CLI binary.
 set -euo pipefail
 
 test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 worker=$(realpath -- "$1")
+export ONEDRIVE_DESKTOP_CLI=$(realpath -- "$2")
 root=$(mktemp -d -p /tmp onedrive-nautilus-XXXXXX)
 export ONEDRIVE_DESKTOP_TEST="$root"
 export HOME="$root/home" XDG_CONFIG_HOME="$root/config" XDG_CACHE_HOME="$root/cache"

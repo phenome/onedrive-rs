@@ -18,6 +18,7 @@ from gi.repository import Gio
 
 ROOT = Path(os.environ["ONEDRIVE_DESKTOP_TEST"])
 MOUNT = Path(os.environ["ONEDRIVE_RS_MOUNT"])
+VIEW = MOUNT / "media" if sys.argv[1] == "retention" else MOUNT
 POSITIVE = "café; #%.png"
 NEGATIVE = "failed.png"
 PREVIEW_COLOR = bytes((0, 100, 200))
@@ -67,7 +68,7 @@ def screen_crop(x, y, width, height):
 
 
 def thumbnail_size(name, subdirectory):
-    uri = Gio.File.new_for_path(str(MOUNT / name)).get_uri()
+    uri = Gio.File.new_for_path(str(VIEW / name)).get_uri()
     filename = hashlib.md5(uri.encode()).hexdigest() + ".png"
     data = (Path(os.environ["XDG_CACHE_HOME"]) / "thumbnails" / subdirectory / filename).read_bytes()
     assert data[:16] == b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
@@ -75,7 +76,7 @@ def thumbnail_size(name, subdirectory):
 
 
 def thumbnail_attributes(name):
-    file = Gio.File.new_for_path(str(MOUNT / name))
+    file = Gio.File.new_for_path(str(VIEW / name))
     return file.query_info("thumbnail::*", Gio.FileQueryInfoFlags.NONE, None)
 
 
@@ -100,14 +101,18 @@ def input_event(button=None, point=None, keys=()):
         x11.XCloseDisplay(display)
 
 
-def daemon_status():
+def daemon_request(request):
     path = Path(os.environ["XDG_RUNTIME_DIR"]) / "onedrive-rs/daemon.sock"
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(2)
         connection.connect(str(path))
-        connection.sendall(b'{"op":"status"}\n')
+        connection.sendall(json.dumps(request).encode() + b"\n")
         with connection.makefile("rb") as replies:
-            response = json.loads(replies.readline(65536))
+            return json.loads(replies.readline(65536))
+
+
+def daemon_status():
+    response = daemon_request({"op": "status"})
     assert response["ok"] is True, response
     return response["result"]
 
@@ -146,15 +151,59 @@ def perform_action(location, operation, status, emblem):
         f"{operation} socket reply",
         lambda: next(
             (event for event in events()[previous:]
-             if event[:3] == ["reply", operation, f"/{POSITIVE}"]),
+             if event[:3] == ["reply", operation, f"/media/{POSITIVE}"]),
             None,
         ),
     )
     assert reply[3] is None, reply
     wait_for(f"{operation} status and emblem refresh", observed)
     state, pin = status.split(":")
-    assert os.getxattr(MOUNT / POSITIVE, "user.onedrive.state") == state.encode()
-    assert os.getxattr(MOUNT / POSITIVE, "user.onedrive.pin") == pin.encode()
+    assert os.getxattr(VIEW / POSITIVE, "user.onedrive.state") == state.encode()
+    assert os.getxattr(VIEW / POSITIVE, "user.onedrive.pin") == pin.encode()
+
+
+def verify_external_changes(location, cloud_only):
+    def check_refresh(change, status, emblem, menu, previous_pixels):
+        previous = len(events())
+        change()
+        wait_for(f"{status} on the existing tile", lambda: (
+            ["status", POSITIVE, status] in events()[previous:]
+            and ["emblem", POSITIVE, emblem] in events()[previous:]
+        ))
+        wait_for(f"{status} rendered", lambda: emblem_pixels(location) != previous_pixels)
+        rendered = emblem_pixels(location)
+        x, y = location
+        def menu_patch():
+            return screen_crop(x + 5, y + 4, 225, 220)
+
+        closed = menu_patch()
+        input_event(3, location)
+        wait_for(f"visible {status} menu", lambda: menu_patch() != closed)
+        wait_for(f"{status} context actions", lambda: (
+            ["menu", POSITIVE, [[f"OneDrive::{action}", True] for action in menu]]
+            in events()[previous:]
+        ))
+        input_event(keys=(0xFF1B,))  # Escape closes the popover without leaving the folder.
+        wait_for("context menu closed", lambda: menu_patch() == closed)
+        return rendered
+
+    def cli(operation, path):
+        subprocess.run(
+            [os.environ["ONEDRIVE_DESKTOP_CLI"], operation, os.fspath(path)],
+            check=True, capture_output=True, timeout=5,
+        )
+
+    pinned = check_refresh(lambda: cli("pin", VIEW),
+                           "Hydrated:pinned", "starred-symbolic", ["purge"], cloud_only)
+    hydrated = check_refresh(lambda: cli("unpin", VIEW),
+                             "Hydrated:none", "object-select-symbolic", ["pin", "purge"], pinned)
+    purged = check_refresh(lambda: cli("purge", VIEW / POSITIVE),
+                           "Cloud-only:none", "folder-remote-symbolic", ["pin"], hydrated)
+    assert purged == cloud_only
+    check_refresh(lambda: subprocess.run(
+        ["cat", os.fspath(VIEW / POSITIVE)], stdout=subprocess.DEVNULL, check=True, timeout=5,
+    ), "Hydrated:none", "object-select-symbolic", ["pin", "purge"], purged)
+    print("CLI Sticky Pin, Unpin, Purge and read hydration refreshed the same tile and context actions.")
 
 
 def verify(mode):
@@ -171,7 +220,11 @@ def verify(mode):
         assert version.stdout.strip().startswith("GNOME nautilus 51."), version.stdout
         if mode == "retention":
             wait_for("fixture sync", lambda: daemon_status()["sync_state"] == "idle")
-        desktop = subprocess.Popen([*nautilus, "--new-window", str(MOUNT)], stdout=log, stderr=log, start_new_session=True)
+            wrong_mount = daemon_request({
+                "op": "desktop_changes", "mount": str(VIEW), "epoch": None, "since": None,
+            })
+            assert wrong_mount["ok"] is False, wrong_mount
+        desktop = subprocess.Popen([*nautilus, "--new-window", str(VIEW)], stdout=log, stderr=log, start_new_session=True)
         try:
             for name in (POSITIVE, NEGATIVE):
                 wait_for(name, lambda: ["status", name, "Cloud-only:none"] in events())
@@ -209,6 +262,7 @@ def verify(mode):
                 assert daemon_status()["pinned_cache_bytes"] == 0
                 wait_for("visible Cloud-only emblem", lambda: emblem_pixels(location) == cloud_only)
                 print("Nautilus Pin and Purge updated the daemon cache and refreshed emblems.")
+                verify_external_changes(location, cloud_only)
             else:
                 input_event(1, location)
                 input_event(3, location)

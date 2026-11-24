@@ -96,7 +96,7 @@ pub async fn run(
         .mount(&mount)
         .map_err(|error| format!("Cannot mount OneDrive at {mount:?} ({error})"))?;
 
-    let delta = Arc::new(DeltaSync::new(engine));
+    let delta = Arc::new(DeltaSync::new(engine, mount.clone()));
     let mut clients = JoinSet::new();
     let result = tokio::select! {
         _ = interrupt.recv() => Ok(()),
@@ -218,12 +218,14 @@ struct DeltaSync {
     poll_state: watch::Sender<PollState>,
     last_result: Mutex<SyncState>,
     long_jobs: Semaphore,
+    mount: PathBuf,
 }
 
 impl DeltaSync {
-    fn new(engine: Arc<Engine>) -> Self {
+    fn new(engine: Arc<Engine>, mount: PathBuf) -> Self {
         Self {
             engine,
+            mount,
             poll_state: watch::channel(PollState::default()).0,
             last_result: Mutex::new(SyncState::Starting),
             long_jobs: Semaphore::new(MAX_LONG_JOBS),
@@ -396,6 +398,24 @@ impl DeltaSync {
                 Ok(Value::Null)
             }
             Request::Uploads {} => self.uploads(),
+            Request::DesktopChanges {
+                mount,
+                epoch,
+                since,
+            } => {
+                if mount != self.mount {
+                    return Err("OneDrive mount does not match this daemon".into());
+                }
+                let changes = self
+                    .engine
+                    .desktop_changes(epoch.as_deref(), since)
+                    .map_err(|error| error.to_string())?;
+                Ok(serde_json::json!({
+                    "epoch": changes.epoch,
+                    "revision": changes.revision,
+                    "inodes": changes.inodes,
+                }))
+            }
         }
     }
 }
@@ -458,7 +478,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let sync = Arc::new(DeltaSync::new(engine.clone()));
+        let sync = Arc::new(DeltaSync::new(engine.clone(), dir.path().join("mount")));
         let poller = tokio::spawn({
             let sync = sync.clone();
             async move {

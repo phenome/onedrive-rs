@@ -31,13 +31,24 @@ pub fn socket_path(runtime_dir: &Path) -> PathBuf {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Status {},
-    Pin { path: MountPath },
-    Unpin { path: MountPath },
-    Purge { path: MountPath },
+    Pin {
+        path: MountPath,
+    },
+    Unpin {
+        path: MountPath,
+    },
+    Purge {
+        path: MountPath,
+    },
     Sync {},
     Uploads {},
     Pause {},
     Resume {},
+    DesktopChanges {
+        mount: PathBuf,
+        epoch: Option<String>,
+        since: Option<i64>,
+    },
 }
 
 impl Request {

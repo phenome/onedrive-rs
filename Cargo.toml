@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/onedrive-core", "crates/onedrive-graph"]
+members = ["crates/onedrive-core", "crates/onedrive-rs", "crates/onedrive-graph"]
 resolver = "3"
 
 [workspace.package]

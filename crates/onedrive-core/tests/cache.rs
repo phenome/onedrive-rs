@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 
 use onedrive_core::{
-    CloudDrive, CloudError, DeltaPage, DeltaRequest, Engine, FakeCloudDrive, ItemKind, RemoteItem,
-    SystemClock,
+    CloudDrive, CloudError, Config, DeltaPage, DeltaRequest, Engine, FakeCloudDrive, ItemKind,
+    RemoteItem, SystemClock,
 };
 use tempfile::TempDir;
 
@@ -140,6 +140,29 @@ struct InFlightRange {
     resume: Notify,
 }
 
+impl InFlightRange {
+    fn open(temp: &TempDir, fake: Arc<FakeCloudDrive>) -> (Arc<Self>, Engine) {
+        let cloud = Arc::new(Self {
+            fake,
+            pause_once: AtomicBool::new(true),
+            captured: Notify::new(),
+            resume: Notify::new(),
+        });
+        let engine = Engine::open_with_config(
+            temp.path().join("metadata.db"),
+            temp.path().join("cache"),
+            cloud.clone(),
+            Arc::new(SystemClock),
+            Config {
+                min_free_disk_bytes: 0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        (cloud, engine)
+    }
+}
+
 #[async_trait]
 impl CloudDrive for InFlightRange {
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError> {
@@ -165,19 +188,7 @@ impl CloudDrive for InFlightRange {
 async fn in_flight_range_retries_after_delta_retires_its_generation() {
     let (temp, fake, engine, inode, original) = setup(STREAM + 200).await;
     drop(engine);
-    let cloud = Arc::new(InFlightRange {
-        fake: fake.clone(),
-        pause_once: AtomicBool::new(true),
-        captured: Notify::new(),
-        resume: Notify::new(),
-    });
-    let engine = Engine::open_with_cache(
-        temp.path().join("metadata.db"),
-        temp.path().join("cache"),
-        cloud.clone(),
-        Arc::new(SystemClock),
-    )
-    .unwrap();
+    let (cloud, engine) = InFlightRange::open(&temp, fake.clone());
     let fresh = vec![193; original.len()];
     let apply_delta = async {
         cloud.captured.notified().await;
@@ -201,6 +212,75 @@ async fn in_flight_range_retries_after_delta_retires_its_generation() {
             ("file".into(), 0, STREAM),
             ("file".into(), STREAM as u64, STREAM),
         ]
+    );
+}
+
+#[tokio::test]
+async fn an_in_flight_pin_cannot_restore_a_purged_generation() {
+    let (temp, fake, engine, inode, _) = setup(STREAM + 200).await;
+    drop(engine);
+    let (cloud, engine) = InFlightRange::open(&temp, fake);
+    let purge = async {
+        cloud.captured.notified().await;
+        engine.purge("file").unwrap();
+        cloud.resume.notify_one();
+    };
+    let (pin, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(engine.pin("file"), purge)
+    })
+    .await
+    .unwrap();
+    pin.unwrap();
+    assert_eq!(
+        engine.pin_state("file").unwrap(),
+        onedrive_core::PinState::None
+    );
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Cloud-only"
+    );
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 0);
+}
+
+#[tokio::test]
+async fn cache_status_counts_sparse_holes_and_overlapping_headers_correctly() {
+    let (_temp, _fake, engine, inode, _) = setup(3 * STREAM + 17).await;
+    engine.read(inode, 0, 1).await.unwrap();
+    engine.read(inode, 3 * STREAM as u64, 1).await.unwrap();
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 65536 + 17);
+
+    engine.read(inode, HEADER as u64, 1).await.unwrap();
+    assert_eq!(engine.cache_status().unwrap().unpinned_bytes, 2097152 + 17);
+}
+
+#[tokio::test]
+async fn pin_drops_an_in_flight_download_when_a_local_upload_becomes_pending() {
+    use onedrive_core::{EngineError, SyncState};
+
+    let (temp, fake, engine, inode, _) = setup(STREAM + 200).await;
+    engine.read(inode, 0, 1).await.unwrap();
+    drop(engine);
+
+    let (cloud, engine) = InFlightRange::open(&temp, fake);
+    let begin_writeback = async {
+        cloud.captured.notified().await;
+        engine.set_sync_state("file", SyncState::Dirty).unwrap();
+        assert!(matches!(
+            engine.purge("file"),
+            Err(EngineError::PendingUpload { .. })
+        ));
+        cloud.resume.notify_one();
+    };
+    let (pin, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(engine.pin("file"), begin_writeback)
+    })
+    .await
+    .unwrap();
+    pin.unwrap();
+    assert_eq!(engine.cache_status().unwrap().pinned_bytes, 65536);
+    assert_eq!(
+        engine.xattr(inode, "user.onedrive.state").unwrap().unwrap(),
+        b"Dirty"
     );
 }
 
@@ -350,5 +430,43 @@ async fn restart_reclaims_an_installed_range_without_published_coverage() {
         engine.read(inode, STREAM as u64, 200).await.unwrap(),
         bytes[STREAM..]
     );
+    assert_eq!(drive.range_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn sync_recovers_damaged_content_for_an_existing_pin() {
+    let (temp, drive, engine, inode, bytes) = setup(8192).await;
+    engine
+        .set_pin_state("file", onedrive_core::PinState::Pinned)
+        .unwrap();
+    // Fill through a read so this test does not depend on the host's free-disk floor.
+    engine.read(inode, 0, bytes.len()).await.unwrap();
+
+    let generation = std::fs::read_dir(cache_namespace(&temp))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(generation.join("-1")).unwrap();
+    let engine = Engine::open_with_config(
+        temp.path().join("metadata.db"),
+        temp.path().join("cache"),
+        drive.clone(),
+        Arc::new(SystemClock),
+        onedrive_core::Config {
+            min_free_disk_bytes: 0,
+            ..onedrive_core::Config::default()
+        },
+    )
+    .unwrap();
+    engine.sync().await.unwrap();
+
+    assert!(!generation.exists());
+    assert_eq!(
+        engine.cache_status().unwrap().pinned_bytes,
+        bytes.len() as u64
+    );
+    assert_eq!(engine.read(inode, 0, bytes.len()).await.unwrap(), bytes);
     assert_eq!(drive.range_requests().len(), 2);
 }

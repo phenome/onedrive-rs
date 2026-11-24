@@ -12,12 +12,21 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::{CatalogItem, Engine, EngineError, ItemKind};
 
-const HEADER_BYTES: u64 = 64 * 1024;
-const STREAM_BYTES: u64 = 2 * 1024 * 1024;
-const STATE: &str = "user.onedrive.state";
-const PIN: &str = "user.onedrive.pin";
-const ETAG: &str = "user.onedrive.etag";
-const XATTR_NAMES: [&str; 3] = [STATE, PIN, ETAG];
+pub(super) const HEADER_BYTES: u64 = 64 * 1024;
+pub(super) const STREAM_BYTES: u64 = 2 * 1024 * 1024;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadKind {
+    Header,
+    Stream,
+    Pin,
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) enum ReadOutcome {
+    Retired,
+    Cached,
+    Downloaded,
+}
 
 #[derive(Clone, Copy)]
 enum Block {
@@ -208,40 +217,6 @@ impl SparseCache {
 }
 
 impl Engine {
-    pub fn list_xattrs(&self, inode: u64) -> Result<&'static [&'static str], EngineError> {
-        self.getattr(inode)?.ok_or(EngineError::NotFound)?;
-        Ok(&XATTR_NAMES)
-    }
-
-    pub fn xattr(&self, inode: u64, name: &str) -> Result<Option<Vec<u8>>, EngineError> {
-        let (item, generation) = {
-            let db = self.db();
-            let item = super::item_by_inode(&db, inode)?.ok_or(EngineError::NotFound)?;
-            let generation = if name == STATE {
-                generation_for(&db, inode)?
-            } else {
-                None
-            };
-            (item, generation)
-        };
-        let value = match name {
-            STATE => match item.sync_state {
-                super::SyncState::Conflict => "Conflict",
-                super::SyncState::Dirty | super::SyncState::Uploading => "Dirty",
-                super::SyncState::Clean if self.is_hydrated(&item, generation)? => "Hydrated",
-                super::SyncState::Clean => "Cloud-only",
-            },
-            PIN => match item.pin_state {
-                super::PinState::None => "none",
-                super::PinState::Pinned => "pinned",
-                super::PinState::UnpinOverride => "unpin_override",
-            },
-            ETAG => item.etag.as_deref().unwrap_or_default(),
-            _ => return Ok(None),
-        };
-        Ok(Some(value.as_bytes().to_vec()))
-    }
-
     pub fn cache_capacity(&self) -> Result<rustix::fs::StatVfs, EngineError> {
         rustix::fs::statvfs(&self.cache.root).map_err(|err| io::Error::from(err).into())
     }
@@ -286,36 +261,46 @@ impl Engine {
                 if offset >= item.size || length == 0 {
                     return Ok(Vec::new());
                 }
-                tx.execute(
-                    "INSERT INTO sparse_files (inode) VALUES (?1) ON CONFLICT(inode) DO NOTHING",
-                    [inode],
-                )?;
-                let generation =
-                    generation_for(&tx, inode)?.expect("cache generation was allocated");
+                let generation = allocate_generation(&tx, inode)?;
                 tx.commit()?;
                 (item, generation)
             };
 
             let end = offset.saturating_add(length as u64).min(item.size);
             let mut result = vec![0; (end - offset) as usize];
-            let header_sniff = offset == 0 && length as u64 <= HEADER_BYTES;
-            if self
-                .read_generation(&item, generation, offset, header_sniff, &mut result)
-                .await?
+            let kind = if offset == 0 && length as u64 <= HEADER_BYTES {
+                ReadKind::Header
+            } else {
+                ReadKind::Stream
+            };
+            match self
+                .read_generation(&item, generation, offset, &mut result, kind)
+                .await
             {
-                return Ok(result);
+                Ok(ReadOutcome::Retired) => continue,
+                Ok(ReadOutcome::Cached) => return Ok(result),
+                Ok(ReadOutcome::Downloaded) => {
+                    self.evict()?;
+                    return Ok(result);
+                }
+                Err(error) => {
+                    // Reclaim eligible hydrated files while preserving the read error.
+                    let _ = self.evict_after_failed_read();
+                    return Err(error);
+                }
             }
         }
     }
 
-    async fn read_generation(
+    pub(super) async fn read_generation(
         &self,
         item: &CatalogItem,
         generation: i64,
         start: u64,
-        header_sniff: bool,
         output: &mut [u8],
-    ) -> Result<bool, EngineError> {
+        kind: ReadKind,
+    ) -> Result<ReadOutcome, EngineError> {
+        let mut downloaded = false;
         let end = start + output.len() as u64;
         let mut offset = start;
         while offset < end {
@@ -326,8 +311,8 @@ impl Engine {
             let stream = Block::Stream(stream_offset);
             let cached = {
                 let db = self.db();
-                if generation_for(&db, item.inode)? != Some(generation) {
-                    return Ok(false);
+                if !generation_is_current(&db, item, generation, kind)? {
+                    return Ok(ReadOutcome::Retired);
                 }
                 let mut cached = block_stamp(&db, generation, stream)?.map(|stamp| (stream, stamp));
                 if cached.is_none() && offset < HEADER_BYTES {
@@ -351,19 +336,40 @@ impl Engine {
                     }
                 }
                 self.retire_sparse_generation(generation)?;
-                return Ok(false);
+                return Ok(ReadOutcome::Retired);
             }
 
-            let block = if header_sniff { Block::Header } else { stream };
+            let block = if kind == ReadKind::Header
+                || (kind == ReadKind::Pin && item.size <= HEADER_BYTES)
+            {
+                Block::Header
+            } else {
+                stream
+            };
+            if kind == ReadKind::Pin {
+                self.check_hydration_space(block.capacity().min(item.size - block.offset()))?;
+            }
             let bytes = self
                 .cloud
                 .read_range(&item.item_id, block.offset(), block.capacity() as usize)
                 .await;
-            if !self.publish_block(item, generation, block, bytes)? {
-                return Ok(false);
+            match self.publish_block(item, generation, block, kind, bytes)? {
+                ReadOutcome::Retired => return Ok(ReadOutcome::Retired),
+                ReadOutcome::Downloaded => downloaded = true,
+                ReadOutcome::Cached => (),
             }
         }
-        Ok(generation_for(&self.db(), item.inode)? == Some(generation))
+        let db = self.db();
+        if !generation_is_current(&db, item, generation, kind)?
+            || !self.touch_generation(&db, generation)?
+        {
+            return Ok(ReadOutcome::Retired);
+        }
+        Ok(if downloaded {
+            ReadOutcome::Downloaded
+        } else {
+            ReadOutcome::Cached
+        })
     }
 
     fn publish_block(
@@ -371,20 +377,24 @@ impl Engine {
         item: &CatalogItem,
         generation: i64,
         block: Block,
+        kind: ReadKind,
         bytes: Result<Vec<u8>, crate::CloudError>,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<ReadOutcome, EngineError> {
         let directory = self.cache.lock_disk()?;
         let bytes = {
             let mut db = self.db();
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if generation_for(&tx, item.inode)? != Some(generation) {
-                return Ok(false);
+            if !generation_is_current(&tx, item, generation, kind)? {
+                return Ok(ReadOutcome::Retired);
             }
             if block_stamp(&tx, generation, block)?.is_some() {
-                return Ok(true);
+                return Ok(ReadOutcome::Cached);
             }
             let bytes = bytes?;
             let expected = block.capacity().min(item.size - block.offset()) as usize;
+            if kind == ReadKind::Pin {
+                self.check_hydration_space(expected as u64)?;
+            }
             if bytes.len() != expected {
                 return Err(EngineError::InvalidRange);
             }
@@ -404,8 +414,8 @@ impl Engine {
                 .write_block(&directory, generation, block, &bytes)?;
             let mut db = self.db();
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if generation_for(&tx, item.inode)? != Some(generation) {
-                return Ok(false);
+            if !generation_is_current(&tx, item, generation, kind)? {
+                return Ok(ReadOutcome::Retired);
             }
             tx.execute(
                 "INSERT INTO sparse_ranges VALUES (?1, ?2)",
@@ -415,30 +425,37 @@ impl Engine {
                 "INSERT INTO sparse_range_files VALUES (?1, ?2, ?3)",
                 params![generation, block.key(), stamp],
             )?;
+            self.touch_generation(&tx, generation)?;
             forget_pending(&tx, generation, block)?;
             tx.commit()?;
-            Ok(true)
+            Ok(ReadOutcome::Downloaded)
         })();
-        if !matches!(result, Ok(true)) && self.cache.remove_pending(generation, block).is_ok() {
+        if !matches!(result, Ok(ReadOutcome::Downloaded))
+            && self.cache.remove_pending(generation, block).is_ok()
+        {
             forget_pending(&self.db(), generation, block)?;
         }
         result
     }
 
-    fn is_hydrated(
-        &self,
-        item: &CatalogItem,
-        generation: Option<i64>,
-    ) -> Result<bool, EngineError> {
-        if item.kind != ItemKind::File {
-            return Ok(false);
-        }
-        if item.size == 0 {
-            return Ok(true);
-        }
-        let Some(generation) = generation else {
-            return Ok(false);
+    pub(super) fn recover_cached_generations(&self) -> Result<(), EngineError> {
+        let generations = {
+            let db = self.db();
+            db.prepare("SELECT inode, generation FROM sparse_files")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        for (inode, generation) in generations {
+            self.validate_cached_generation(inode, generation)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_cached_generation(
+        &self,
+        inode: u64,
+        generation: i64,
+    ) -> Result<bool, EngineError> {
         let ranges = {
             let db = self.db();
             let mut select = db.prepare_cached(
@@ -450,20 +467,25 @@ impl Engine {
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let mut streams = 0;
-        let mut full_header = false;
         for (block, stamp) in ranges {
             if self.cache.open_block(generation, block, &stamp)?.is_none() {
                 self.retire_sparse_generation(generation)?;
                 return Ok(false);
             }
-            match block {
-                Block::Stream(_) => streams += 1,
-                Block::Header => full_header = item.size <= HEADER_BYTES,
-            }
         }
-        Ok((full_header || streams == item.size.div_ceil(STREAM_BYTES))
-            && generation_for(&self.db(), item.inode)? == Some(generation))
+        Ok(generation_for(&self.db(), inode)? == Some(generation))
+    }
+
+    pub(super) fn touch_generation(
+        &self,
+        db: &Connection,
+        generation: i64,
+    ) -> rusqlite::Result<bool> {
+        Ok(db.execute(
+            "UPDATE items SET last_accessed_at = max(coalesce(last_accessed_at, 0), ?2)
+             WHERE inode = (SELECT inode FROM sparse_files WHERE generation = ?1)",
+            params![generation, self.access_time()],
+        )? != 0)
     }
 }
 
@@ -487,7 +509,7 @@ fn matches_stamp(file: &File, stamp: &[u8]) -> io::Result<bool> {
     Ok(metadata.is_file() && file_stamp(&metadata) == stamp)
 }
 
-fn generation_for(db: &Connection, inode: u64) -> rusqlite::Result<Option<i64>> {
+pub(super) fn generation_for(db: &Connection, inode: u64) -> rusqlite::Result<Option<i64>> {
     db.query_row(
         "SELECT generation FROM sparse_files WHERE inode = ?1",
         [inode],
@@ -507,6 +529,58 @@ fn block_stamp(
         |row| row.get(0),
     )
     .optional()
+}
+
+// Uses the current item's row as i. A generation with no chunks is complete
+// only for an empty file that has explicitly been hydrated.
+pub(super) const HAS_COMPLETE_CONTENT: &str = "EXISTS (
+    SELECT 1 FROM sparse_files f WHERE f.inode = i.inode AND (
+        (i.size <= ?2 AND EXISTS (
+            SELECT 1 FROM sparse_ranges WHERE generation = f.generation AND block = -1
+        ))
+        OR (SELECT count(*) FROM sparse_ranges WHERE generation = f.generation AND block >= 0)
+            = (i.size / ?3) + (i.size % ?3 <> 0)
+    )
+)";
+
+pub(super) fn is_hydrated(db: &Connection, item: &CatalogItem) -> rusqlite::Result<bool> {
+    db.prepare_cached(&format!(
+        "SELECT {HAS_COMPLETE_CONTENT} FROM items i WHERE inode = ?1 AND kind = 0",
+    ))?
+    .query_row(params![item.inode, HEADER_BYTES, STREAM_BYTES], |row| {
+        row.get(0)
+    })
+}
+
+pub(super) fn allocate_generation(db: &Connection, inode: u64) -> rusqlite::Result<i64> {
+    db.execute(
+        "INSERT INTO sparse_files (inode) VALUES (?1) ON CONFLICT(inode) DO NOTHING",
+        [inode],
+    )?;
+    Ok(generation_for(db, inode)?.expect("cache generation was allocated"))
+}
+
+fn generation_is_current(
+    db: &Connection,
+    item: &CatalogItem,
+    generation: i64,
+    kind: ReadKind,
+) -> rusqlite::Result<bool> {
+    if generation_for(db, item.inode)? != Some(generation) {
+        return Ok(false);
+    }
+    if kind != ReadKind::Pin {
+        return Ok(true);
+    }
+    let clean = db
+        .query_row(
+            "SELECT sync_state = 0 AND remote_missing = 0 FROM items WHERE inode = ?1",
+            [item.inode],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    Ok(clean && super::retention::effective_pin(db, &item.item_id)? == super::PinState::Pinned)
 }
 
 fn forget_pending(db: &Connection, generation: i64, block: Block) -> rusqlite::Result<()> {
@@ -540,6 +614,70 @@ mod tests {
     use crate::{FakeCloudDrive, RemoteItem, SystemClock};
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pin_rechecks_writeback_state_after_flushing() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let drive = Arc::new(FakeCloudDrive::new(100));
+        let root = RemoteItem {
+            item_id: "root".into(),
+            parent_id: None,
+            name: Some("root".into()),
+            kind: ItemKind::Folder,
+            size: 0,
+            mtime: 1,
+            etag: None,
+            ctag: None,
+            quickxor_hash: None,
+        };
+        drive.upsert(root.clone());
+        drive.upsert(RemoteItem {
+            item_id: "file".into(),
+            parent_id: Some("root".into()),
+            name: Some("file".into()),
+            kind: ItemKind::File,
+            size: 4096,
+            ..root
+        });
+        drive.set_content("file", vec![13; 4096]);
+        let engine = Arc::new(
+            Engine::open_with_config(
+                temp.path().join("db"),
+                temp.path().join("cache"),
+                drive,
+                Arc::new(SystemClock),
+                crate::Config {
+                    min_free_disk_bytes: 0,
+                    ..crate::Config::default()
+                },
+            )
+            .unwrap(),
+        );
+        engine.sync().await.unwrap();
+
+        let weak = Arc::downgrade(&engine);
+        *engine.cache.before_flush.lock().unwrap() = Some(Box::new(move || {
+            weak.upgrade()
+                .unwrap()
+                .set_sync_state("file", crate::SyncState::Dirty)
+                .unwrap();
+        }));
+
+        engine.pin("file").await.unwrap();
+        let item = engine.item("file").unwrap().unwrap();
+        assert_eq!(item.sync_state, crate::SyncState::Dirty);
+        assert_eq!(item.last_accessed_at, None);
+        assert_eq!(engine.cache_status().unwrap().pinned_bytes, 0);
+        let db = engine.db();
+        for table in ["sparse_ranges", "sparse_pending"] {
+            let rows: i64 = db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn directory_reads_and_delta_commit_while_a_block_flush_is_suspended() {

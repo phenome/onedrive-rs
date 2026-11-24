@@ -13,6 +13,7 @@ pub struct Config {
     pub max_idle_age_days: u64,
     pub min_free_disk_bytes: u64,
     pub delta_poll_interval_secs: u64,
+    pub mount_path: Option<PathBuf>,
     pub client_id: Option<String>,
 }
 
@@ -23,6 +24,7 @@ impl Default for Config {
             max_idle_age_days: 7,
             min_free_disk_bytes: 5 * 1024 * 1024 * 1024,
             delta_poll_interval_secs: 60,
+            mount_path: None,
             client_id: None,
         }
     }

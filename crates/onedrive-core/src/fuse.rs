@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +14,7 @@ use fuser::{
     Session,
 };
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 
 use crate::engine::{CatalogInvalidation, CatalogObserver};
 use crate::{CatalogItem, CloudError, Engine, EngineError, ItemKind};
@@ -28,6 +30,7 @@ struct MountPaths {
 pub struct FuseAdapter {
     engine: Arc<Engine>,
     runtime: Handle,
+    shutdown: Option<watch::Receiver<()>>,
     directories: Mutex<HashMap<u64, DirectorySnapshot>>,
     paths: Option<MountPaths>,
     next_directory: AtomicU64,
@@ -40,11 +43,32 @@ impl FuseAdapter {
         Self {
             engine,
             runtime,
+            shutdown: None,
             directories: Mutex::default(),
             paths: None,
             next_directory: AtomicU64::new(1),
             observer: Arc::default(),
         }
+    }
+
+    /// Closing the sender releases FUSE callbacks waiting on asynchronous work.
+    pub fn with_shutdown(mut self, shutdown: watch::Receiver<()>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    fn run<T>(&self, work: impl Future<Output = Result<T, EngineError>>) -> Result<T, Errno> {
+        self.runtime.block_on(async {
+            if let Some(mut shutdown) = self.shutdown.clone() {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => Err(Errno::EINTR),
+                    result = work => result.map_err(errno),
+                }
+            } else {
+                work.await.map_err(errno)
+            }
+        })
     }
 
     pub fn mount(mut self, mountpoint: impl AsRef<Path>) -> io::Result<BackgroundSession> {
@@ -122,8 +146,7 @@ impl FuseAdapter {
         };
         let entries = match &self.paths {
             Some(paths) => self
-                .runtime
-                .block_on(self.engine.readdir(
+                .run(self.engine.readdir(
                     &directory.item_id,
                     &paths.mountpoint,
                     &paths.thumbnail_root,
@@ -133,10 +156,12 @@ impl FuseAdapter {
                         .into_iter()
                         .map(|entry| (entry.inode, entry.kind, entry.name))
                         .collect()
-                }),
-            None => self.engine.list_directory_entries(&directory.item_id),
-        }
-        .map_err(errno)?;
+                })?,
+            None => self
+                .engine
+                .list_directory_entries(&directory.item_id)
+                .map_err(errno)?,
+        };
         Ok([
             (ino, FileType::Directory, ".".into()),
             (INodeNo(parent), FileType::Directory, "..".into()),
@@ -263,12 +288,9 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self
-            .runtime
-            .block_on(self.engine.read(ino.0, offset, size as usize))
-        {
+        match self.run(self.engine.read(ino.0, offset, size as usize)) {
             Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(errno(error)),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -321,7 +343,9 @@ fn attributes(item: &CatalogItem) -> FileAttr {
         ino: INodeNo(item.inode),
         size: item.size,
         blocks: item.size.div_ceil(512),
-        atime: item.last_accessed_at.map_or(mtime, unix_time),
+        atime: item.last_accessed_at.map_or(mtime, |milliseconds| {
+            UNIX_EPOCH + Duration::from_millis(milliseconds.max(0) as u64)
+        }),
         mtime,
         ctime: mtime,
         crtime: UNIX_EPOCH,

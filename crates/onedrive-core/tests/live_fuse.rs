@@ -1,9 +1,9 @@
 //! Exercise the mounted filesystem in a bounded subprocess.
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
 use onedrive_core::{
@@ -63,6 +63,16 @@ fn live_read_only_mount() {
             panic!("could not unmount {}", retained.join("mount").display());
         }
     }
+    let temp = temp.keep();
+    assert!(
+        command("rm")
+            .arg("-rf")
+            .arg("--")
+            .arg(temp)
+            .status()
+            .unwrap()
+            .success()
+    );
     assert!(result.unwrap().success());
 }
 
@@ -132,14 +142,21 @@ fn exercise_mount(dir: &Path) {
         .collect();
     names.sort();
     assert_eq!(names, ["content.bin", "folder"]);
+    let listing_started = std::time::Instant::now();
     let mut nested: Vec<_> = fs::read_dir(mount.join("folder"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect();
+    eprintln!(
+        "Mounted listing of 1,500 entries: {:?}",
+        listing_started.elapsed()
+    );
     nested.sort();
     assert_eq!(nested, expected_names);
     let path = mount.join("content.bin");
+    let lookup_started = std::time::Instant::now();
     let metadata = fs::metadata(&path).unwrap();
+    eprintln!("Mounted lookup and stat: {:?}", lookup_started.elapsed());
     assert_eq!(metadata.len(), bytes.len() as u64);
     assert_eq!(metadata.mtime(), file.mtime);
     assert_eq!(metadata.ino(), engine.item("file").unwrap().unwrap().inode);
@@ -176,6 +193,9 @@ fn exercise_mount(dir: &Path) {
     handle.read_exact_at(&mut sniff, 32768).unwrap();
     assert_eq!(sniff, bytes[32768..HEADER]);
     assert_eq!(drive.range_requests().len(), 1);
+    let mut mapping = map_prefix(&path, HEADER);
+    assert_mapped_bytes(&mut mapping, &bytes[..HEADER]);
+    assert_eq!(drive.range_requests(), [("file".into(), 0, HEADER)]);
     let mut span = [0; 32];
     handle.read_exact_at(&mut span, STREAM as u64 - 16).unwrap();
     assert_eq!(span, bytes[STREAM - 16..STREAM + 16]);
@@ -192,7 +212,9 @@ fn exercise_mount(dir: &Path) {
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(drive.range_requests().len(), 3);
 
-    file.mtime += 1;
+    // Content changes with unchanged size and mtime require explicit kernel
+    // invalidation. The old descriptor already has these pages resident.
+    file.ctag = Some("content-2".into());
     file.etag = Some("\"version-2\"".into());
     drive.upsert(file.clone());
     let new_bytes = vec![147; bytes.len()];
@@ -200,13 +222,35 @@ fn exercise_mount(dir: &Path) {
     runtime.block_on(engine.sync()).unwrap();
     assert_eq!(fs::metadata(&path).unwrap().mtime(), file.mtime);
     assert_xattrs(&path, b"Cloud-only", b"pinned", b"\"version-2\"");
-    handle.read_exact_at(&mut sniff, 0).unwrap();
-    assert_eq!(sniff, new_bytes[..32768]);
+    let mut updated = vec![0; HEADER];
+    handle.read_exact_at(&mut updated, 0).unwrap();
+    assert_eq!(updated, new_bytes[..HEADER]);
     assert_eq!(
         drive.range_requests().last().unwrap(),
         &("file".into(), 0, HEADER)
     );
     assert_eq!(drive.range_requests().len(), 4);
+    mapping.stdin.take().unwrap().write_all(b"r").unwrap();
+    assert_mapped_bytes(&mut mapping, &new_bytes[..HEADER]);
+    assert!(mapping.wait().unwrap().success());
+    assert_eq!(drive.range_requests().len(), 4);
+
+    assert!(!mount.join("renamed").exists());
+    assert!(mount.join("folder").is_dir());
+    drive.upsert(RemoteItem {
+        item_id: "folder".into(),
+        parent_id: Some("root".into()),
+        name: Some("renamed".into()),
+        mtime: root.mtime + 1,
+        ..root
+    });
+    runtime.block_on(engine.sync()).unwrap();
+    assert!(!mount.join("folder").exists());
+    assert_eq!(
+        fs::metadata(mount.join("renamed")).unwrap().mtime(),
+        file.mtime + 1
+    );
+    assert_eq!(fs::read_dir(mount.join("renamed")).unwrap().count(), 1500);
     drop(handle);
 
     assert!(
@@ -219,6 +263,37 @@ fn exercise_mount(dir: &Path) {
     );
     assert!(mount_type(&mount).is_none());
     mounted.join().unwrap();
+}
+
+fn map_prefix(path: &Path, length: usize) -> Child {
+    command("python3")
+        .args([
+            "-c",
+            "import mmap, sys
+with open(sys.argv[1], 'rb') as file:
+    with mmap.mmap(file.fileno(), int(sys.argv[2]), access=mmap.ACCESS_READ) as data:
+        sys.stdout.buffer.write(data[:])
+        sys.stdout.buffer.flush()
+        if sys.stdin.buffer.read(1):
+            sys.stdout.buffer.write(data[:])",
+        ])
+        .arg(path)
+        .arg(length.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn assert_mapped_bytes(mapping: &mut Child, expected: &[u8]) {
+    let mut actual = vec![0; expected.len()];
+    mapping
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut actual)
+        .unwrap();
+    assert!(actual == expected, "mapped bytes did not match");
 }
 
 fn assert_xattrs(path: &Path, state: &[u8], pin: &[u8], etag: &[u8]) {

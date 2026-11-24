@@ -3,16 +3,18 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    Session,
 };
 use tokio::runtime::Handle;
 
+use crate::engine::{CatalogInvalidation, CatalogObserver};
 use crate::{CatalogItem, Engine, EngineError, ItemKind};
 
 type DirectoryEntry = (INodeNo, FileType, String);
@@ -22,6 +24,7 @@ pub struct FuseAdapter {
     runtime: Handle,
     directories: Mutex<HashMap<u64, Arc<[DirectoryEntry]>>>,
     next_directory: AtomicU64,
+    observer: Arc<OnceLock<CatalogObserver>>,
 }
 
 impl FuseAdapter {
@@ -32,6 +35,7 @@ impl FuseAdapter {
             runtime,
             directories: Mutex::default(),
             next_directory: AtomicU64::new(1),
+            observer: Arc::default(),
         }
     }
 
@@ -46,7 +50,31 @@ impl FuseAdapter {
             MountOption::NoSuid,
         ];
         config.n_threads = Some(4);
-        fuser::spawn_mount(self, mountpoint, &config)
+        let engine = self.engine.clone();
+        let owner = self.observer.clone();
+        let session = Session::new(self, mountpoint, &config)?;
+        let notifier = session.notifier();
+        let observer: CatalogObserver = Arc::new(move |changes: &[CatalogInvalidation]| {
+            for change in changes {
+                let result = match change {
+                    CatalogInvalidation::Inode { inode, content } => {
+                        notifier.inval_inode(INodeNo(*inode), if *content { 0 } else { -1 }, 0)
+                    }
+                    CatalogInvalidation::Entry { parent, name } => {
+                        notifier.inval_entry(INodeNo(*parent), OsStr::new(name))
+                    }
+                };
+                if let Err(error) = result
+                    && error.kind() != io::ErrorKind::NotFound
+                    && error.raw_os_error() != Some(rustix::io::Errno::NODEV.raw_os_error())
+                {
+                    log::warn!("FUSE cache invalidation failed: {error}");
+                }
+            }
+        });
+        engine.observe_catalog(&observer);
+        assert!(owner.set(observer).is_ok());
+        session.spawn()
     }
 
     fn item(&self, ino: INodeNo) -> Result<CatalogItem, Errno> {
@@ -97,6 +125,13 @@ impl FuseAdapter {
 }
 
 impl Filesystem for FuseAdapter {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+        // fuser requires a positive byte limit. One byte rounds down to zero
+        // pages on Linux, keeping cached mmap and MIME sniffing demand-driven.
+        let _ = config.set_max_readahead(1);
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let item = (|| {
             let name = name.to_str().ok_or(Errno::ENOENT)?;
@@ -176,8 +211,7 @@ impl Filesystem for FuseAdapter {
         }
         match self.item(ino) {
             Ok(item) if item.kind == ItemKind::Folder => reply.error(Errno::EISDIR),
-            // Preserve the application's read sizes and let the Engine own content freshness.
-            Ok(_) => reply.opened(FileHandle(0), FopenFlags::FOPEN_DIRECT_IO),
+            Ok(_) => reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE),
             Err(error) => reply.error(error),
         }
     }

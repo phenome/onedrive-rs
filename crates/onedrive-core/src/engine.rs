@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
@@ -13,7 +13,10 @@ use crate::{
     RemoteItem,
 };
 
+mod catalog_invalidation;
 mod sparse_cache;
+
+pub(crate) use catalog_invalidation::{CatalogInvalidation, CatalogObserver};
 
 use sparse_cache::SparseCache;
 
@@ -95,6 +98,7 @@ pub struct Engine {
     cloud: Arc<dyn CloudDrive>,
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
+    observers: Mutex<Vec<Weak<catalog_invalidation::Observer>>>,
 }
 
 const ITEM_COLUMNS: &str =
@@ -129,6 +133,7 @@ impl Engine {
         let transaction = db.transaction()?;
         transaction.execute_batch(include_str!("schema.sql"))?;
         transaction.commit()?;
+        catalog_invalidation::install(&db)?;
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
         Ok(Self {
             cache,
@@ -136,6 +141,7 @@ impl Engine {
             cloud,
             clock,
             syncing: tokio::sync::Mutex::new(()),
+            observers: Mutex::default(),
         })
     }
 
@@ -201,6 +207,8 @@ impl Engine {
     fn commit_page(&self, page: DeltaPage, revision: i64) -> Result<bool, EngineError> {
         let mut db = self.db();
         let transaction = db.transaction()?;
+        transaction.execute("DELETE FROM changed_inodes", [])?;
+        transaction.execute("DELETE FROM changed_entries", [])?;
         let (link, complete) = match page.cursor {
             DeltaCursor::Next(link) => (link, false),
             DeltaCursor::Complete(link) => (link, true),
@@ -218,10 +226,30 @@ impl Engine {
             reconcile_catalog(&transaction, full_scan)?;
             transaction.execute("UPDATE delta_checkpoint SET full_scan = 0", [])?;
         }
+        let observers: Vec<_> = {
+            let mut observers = self.observers.lock().unwrap();
+            observers.retain(|observer| observer.strong_count() > 0);
+            observers.iter().filter_map(Weak::upgrade).collect()
+        };
+        let invalidations = if observers.is_empty() {
+            Vec::new()
+        } else {
+            catalog_invalidation::collect(&transaction)?
+        };
         transaction.commit()?;
         drop(db);
+        for observer in observers {
+            observer(&invalidations);
+        }
         self.reclaim_sparse_cache()?;
         Ok(complete)
+    }
+
+    pub(crate) fn observe_catalog(&self, observer: &CatalogObserver) {
+        self.observers
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(observer));
     }
 
     fn restart_full_sync(&self, revision: i64) -> Result<(), EngineError> {

@@ -124,6 +124,17 @@ pub trait CloudDrive: Send + Sync {
         Err(CloudError::Unsupported)
     }
 
+    /// Move the item only while its eTag matches the acknowledged version.
+    async fn move_if_match(
+        &self,
+        _item_id: &str,
+        _parent_id: &str,
+        _name: &str,
+        _etag: &str,
+    ) -> Result<RemoteItem, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
     async fn delete_if_match(&self, _item_id: &str, _etag: &str) -> Result<(), CloudError> {
         Err(CloudError::Unsupported)
     }

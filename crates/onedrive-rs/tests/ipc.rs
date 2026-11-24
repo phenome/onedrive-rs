@@ -29,7 +29,7 @@ fn status_round_trips_over_a_private_socket_removed_on_drop() {
     std::thread::scope(|scope| {
         let responder = scope.spawn(|| {
             let dispatch = |request| {
-                assert_eq!(request, Request::Status);
+                assert_eq!(request, Request::Status {});
                 Ok(status.clone())
             };
             server.serve_one(dispatch).unwrap();
@@ -49,7 +49,7 @@ fn status_round_trips_over_a_private_socket_removed_on_drop() {
         );
 
         assert_eq!(
-            IpcClient::new(&path).request(&Request::Status).unwrap(),
+            IpcClient::new(&path).request(&Request::Status {}).unwrap(),
             Response::Success(status.clone())
         );
         responder.join().unwrap();
@@ -61,7 +61,7 @@ fn status_round_trips_over_a_private_socket_removed_on_drop() {
 }
 
 #[test]
-fn pin_accepts_only_canonical_paths_rooted_in_the_mount() {
+fn wire_requests_require_newline_and_canonical_mount_paths() {
     use std::net::Shutdown;
 
     let runtime = tempfile::tempdir().unwrap();
@@ -101,6 +101,7 @@ fn pin_accepts_only_canonical_paths_rooted_in_the_mount() {
         b"{\"op\":\"pin\",\"path\":\"/./file\"}\n",
         b"{\"op\":\"pin\",\"path\":\"/file\\u0000\"}\n",
         b"{\"op\":\"pin\"}\n",
+        b"{\"op\":\"status\",\"path\":\"/file\"}\n",
         b"{\"op\":\"rename\"}\n",
         b"{\"op\":\"status\"}",
     ] {
@@ -108,4 +109,31 @@ fn pin_accepts_only_canonical_paths_rooted_in_the_mount() {
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("invalid request"));
     }
+}
+
+#[test]
+fn binding_and_cleanup_preserve_existing_files() {
+    let runtime = tempfile::tempdir().unwrap();
+    let path = socket_path(runtime.path());
+    let parent = path.parent().unwrap();
+
+    fs::create_dir(parent).unwrap();
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        IpcServer::bind(&path).err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert!(!path.exists());
+
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&path, "existing").unwrap();
+    assert!(IpcServer::bind(&path).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "existing");
+
+    fs::remove_file(&path).unwrap();
+    let server = IpcServer::bind(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, "replacement").unwrap();
+    drop(server);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
 }

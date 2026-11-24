@@ -18,14 +18,14 @@ pub fn socket_path(runtime_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Status,
+    Status {},
     Pin { path: MountPath },
     Unpin { path: MountPath },
     Purge { path: MountPath },
-    Sync,
-    Uploads,
-    Pause,
-    Resume,
+    Sync {},
+    Uploads {},
+    Pause {},
+    Resume {},
 }
 
 /// A canonical UTF-8 path in the OneDrive namespace. "/" is the drive root.

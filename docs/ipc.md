@@ -1,0 +1,52 @@
+# OneDrive daemon IPC
+
+Connect to `$XDG_RUNTIME_DIR/onedrive-rs/daemon.sock` with an `AF_UNIX` stream socket.
+Send one UTF-8 JSON object followed by a newline. Read one JSON object through
+its terminating newline. The server closes the connection after each reply.
+Requests may be up to 64 KiB including the newline. Unknown operations and
+fields, invalid paths, and malformed requests receive an error envelope.
+
+The socket is mode `0600` in a directory owned by the effective user with mode
+`0700`. Dropping the Rust server removes its socket file and leaves the
+directory available for the next start. Binding fails if the socket path is
+already occupied, including after an abrupt exit that left the socket file
+behind.
+
+## Requests and results
+
+| Request | Successful `result` |
+| --- | --- |
+| `{"op":"status"}` | Object with `sync_state` (string), `unpinned_cache_bytes`, `pinned_cache_bytes`, `pending_upload_count` (nonnegative integers), `free_disk_floor_warning` and `paused` (booleans) |
+| `{"op":"pin","path":"/folder/file"}` | `null` |
+| `{"op":"unpin","path":"/folder/file"}` | `null` |
+| `{"op":"purge","path":"/folder/file"}` | `null` |
+| `{"op":"sync"}` | `null` |
+| `{"op":"uploads"}` | Array of entries with `path` and `sync_state` strings, for example `[{"path":"/draft.txt","sync_state":"dirty"}]` |
+| `{"op":"pause"}` | `null` |
+| `{"op":"resume"}` | `null` |
+
+A wire path starts at the OneDrive mount root. Use `/` for the root itself.
+Paths are UTF-8 and exclude empty components, `.`, `..`, trailing slashes
+(except for the root), and NUL characters.
+
+A successful Pin or Purge replies with `{"ok":true,"result":null}`. An error
+replies with `{"ok":false,"error":"Cannot purge a Dirty item"}`. Nautilus can
+send Pin and Purge over this socket from its worker thread, then invalidate the
+file info on success or surface the error message.
+
+## CLI
+
+The CLI takes absolute filesystem paths or paths relative to the working
+directory. For example, `onedrive-rs pin "$XDG_RUNTIME_DIR/onedrive/docs/draft.txt"`
+sends a Pin request for `/docs/draft.txt`. Supply `--mount-path /absolute/mount`
+for a custom mount. Path validation checks components and mount containment
+without accessing the item on disk. Paths containing `..` are rejected.
+
+With `--json`, command results and errors are printed to stdout in the same
+response envelope as IPC. Human-readable errors go to stderr. Exit status is
+`0` on success, `1` on command failure and `2` on invalid arguments. Help and
+version output are human-readable.
+
+The current binary parses `daemon` and `auth login|status|logout` and reports
+that their integrations are unavailable. The transport tests supply a
+dispatcher in the test process and exercise the production CLI against it.

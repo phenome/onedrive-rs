@@ -25,6 +25,12 @@ struct Cli {
 enum Command {
     #[command(flatten)]
     Local(LocalCommand),
+    #[command(flatten)]
+    Control(ControlCommand),
+}
+
+#[derive(Subcommand)]
+enum ControlCommand {
     /// Show sync, cache, and upload status
     Status,
     /// Pin a file or folder
@@ -94,25 +100,25 @@ fn main() -> ExitCode {
 
 impl Cli {
     fn execute(&self) -> Result<String, String> {
-        if let Command::Local(command) = &self.command {
-            return self.run_local_command(command);
-        }
+        let command = match &self.command {
+            Command::Local(command) => return self.run_local_command(command),
+            Command::Control(command) => command,
+        };
         let runtime_dir = runtime_dir()?;
         let mount = self
             .mount_path
             .clone()
             .unwrap_or_else(|| runtime_dir.join("onedrive"));
         let path = |path: &Path| mount_relative_path(&mount, path);
-        let request = match &self.command {
-            Command::Status => Request::Status,
-            Command::Pin { path: input } => Request::Pin { path: path(input)? },
-            Command::Unpin { path: input } => Request::Unpin { path: path(input)? },
-            Command::Purge { path: input } => Request::Purge { path: path(input)? },
-            Command::Sync => Request::Sync,
-            Command::Uploads => Request::Uploads,
-            Command::Pause => Request::Pause,
-            Command::Resume => Request::Resume,
-            Command::Local(_) => unreachable!("local commands are handled before IPC"),
+        let request = match command {
+            ControlCommand::Status => Request::Status {},
+            ControlCommand::Pin { path: input } => Request::Pin { path: path(input)? },
+            ControlCommand::Unpin { path: input } => Request::Unpin { path: path(input)? },
+            ControlCommand::Purge { path: input } => Request::Purge { path: path(input)? },
+            ControlCommand::Sync => Request::Sync {},
+            ControlCommand::Uploads => Request::Uploads {},
+            ControlCommand::Pause => Request::Pause {},
+            ControlCommand::Resume => Request::Resume {},
         };
         let result = daemon_request(&runtime_dir, &request)?;
         if self.json {
@@ -179,14 +185,14 @@ fn daemon_request(runtime_dir: &Path, request: &Request) -> Result<Value, String
 
 fn render_reply(request: Request, result: Value) -> Result<String, String> {
     let output = match request {
-        Request::Status => return render_status(result),
-        Request::Uploads => return render_uploads(result),
+        Request::Status {} => return render_status(result),
+        Request::Uploads {} => return render_uploads(result),
         Request::Pin { path } => format!("Pin completed for {:?}", path.as_str()),
         Request::Unpin { path } => format!("Unpin completed for {:?}", path.as_str()),
         Request::Purge { path } => format!("Purge completed for {:?}", path.as_str()),
-        Request::Sync => "Sync completed".into(),
-        Request::Pause => "Paused background sync".into(),
-        Request::Resume => "Resumed background sync".into(),
+        Request::Sync {} => "Sync completed".into(),
+        Request::Pause {} => "Paused background sync".into(),
+        Request::Resume {} => "Resumed background sync".into(),
     };
     Ok(output)
 }

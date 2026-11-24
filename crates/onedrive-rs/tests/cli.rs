@@ -28,7 +28,7 @@ fn status_renders_the_same_daemon_data_as_human_text_and_json() {
     let [human, json_output] = with_server(
         server,
         |request| {
-            assert_eq!(request, Request::Status);
+            assert_eq!(request, Request::Status {});
             Ok(status.clone())
         },
         || {
@@ -99,6 +99,12 @@ fn control_commands_dispatch_to_the_socket_and_preserve_errors() {
             json!({"op":"unpin", "path":"/"}),
             Value::Null,
             "Unpin completed",
+        ),
+        (
+            vec!["purge", "onedrive/clean.txt"],
+            json!({"op":"purge", "path":"/clean.txt"}),
+            Value::Null,
+            "Purge completed",
         ),
         (
             vec!["sync"],

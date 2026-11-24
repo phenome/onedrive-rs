@@ -6,7 +6,14 @@ use super::tests::{anonymous, mock_graph};
 
 #[tokio::test]
 async fn disappeared_upload_session_checks_destination_bytes() {
+    use std::io::Write;
     let bytes = vec![42; SIMPLE_UPLOAD_LIMIT + 1];
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&bytes).unwrap();
+    let source = UploadSource::File {
+        file: &file,
+        size: bytes.len(),
+    };
     for (new, matches, final_status, expected) in [
         (false, true, 201, Ok("stored")),
         (false, true, 502, Ok("stored")),
@@ -118,7 +125,7 @@ async fn disappeared_upload_session_checks_destination_bytes() {
                 .build()
                 .unwrap();
         }
-        let result = graph_drive.upload(target, &bytes, etag).await;
+        let result = graph_drive.upload_from(target, source, etag).await;
         assert_eq!(
             result
                 .as_ref()

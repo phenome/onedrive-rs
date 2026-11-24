@@ -133,6 +133,12 @@ fn reconcile_name(
             let conflict = choose_conflict_name(db, parent_id, name, kind, "conflict")?;
             db.prepare_cached("UPDATE items SET name = ?2, alias = NULL WHERE item_id = ?1")?
                 .execute(params![item_id, conflict])?;
+            if db.prepare_cached(
+                "UPDATE writeback_queue SET conflict = 1 WHERE inode = (SELECT inode FROM items WHERE item_id = ?1)",
+            )?.execute([&item_id])? > 0 {
+                db.prepare_cached("UPDATE items SET sync_state = 3 WHERE item_id = ?1")?
+                    .execute([item_id])?;
+            }
         } else {
             let alias_claimed = match alias {
                 Some(alias) => db

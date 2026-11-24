@@ -33,8 +33,8 @@ fn mount_type(path: &Path) -> Option<String> {
 }
 
 #[test]
-fn live_read_only_mount() {
-    run_live("live_read_only_mount", exercise_mount);
+fn live_cached_reads_on_writable_mount() {
+    run_live("live_cached_reads_on_writable_mount", exercise_mount);
 }
 
 #[test]
@@ -432,6 +432,23 @@ fn exercise_writeback(dir: &Path) {
     drop(append);
     drop(editor);
 
+    assert!(
+        command("python3")
+            .args([
+                "-c",
+                "import mmap, sys
+with open(sys.argv[1], 'r+b') as file:
+ with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_WRITE) as view:
+  view[1:2] = b'Y'
+  view.flush()"
+            ])
+            .arg(&draft)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::read(&draft).unwrap(), b"fYrst\0\0!");
+
     fs::create_dir(mount.join("work")).unwrap();
     fs::write(mount.join("work/final"), b"previous").unwrap();
     let old_handle = File::open(mount.join("work/final")).unwrap();
@@ -463,7 +480,7 @@ fn exercise_writeback(dir: &Path) {
     let session = FuseAdapter::new(engine.clone(), runtime.handle().clone())
         .mount(&mount)
         .unwrap();
-    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fXrst\0\0!");
+    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fYrst\0\0!");
     assert_eq!(
         fs::metadata(mount.join("work/final")).unwrap().mode() & 0o777,
         0o640
@@ -483,7 +500,13 @@ fn exercise_writeback(dir: &Path) {
     assert_ne!(uploaded.item_id, file.item_id);
     assert!(uploaded.etag.is_some() && uploaded.ctag.is_some());
     engine.check_purge(&uploaded.item_id).unwrap();
-    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fXrst\0\0!");
+    runtime.block_on(engine.sync()).unwrap();
+    assert_eq!(
+        engine.resolve_path("/work/final").unwrap().unwrap().inode,
+        file.inode
+    );
+    assert_eq!(engine.list_children("root").unwrap().len(), 1);
+    assert_eq!(fs::read(mount.join("work/final")).unwrap(), b"fYrst\0\0!");
     assert_ne!(
         xattr::get(mount.join("work/final"), "user.onedrive.state")
             .unwrap()

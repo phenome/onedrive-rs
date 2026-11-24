@@ -22,6 +22,10 @@ pub enum Request {
     Pin { path: MountPath },
     Unpin { path: MountPath },
     Purge { path: MountPath },
+    Sync,
+    Uploads,
+    Pause,
+    Resume,
 }
 
 /// A canonical UTF-8 path in the OneDrive namespace. "/" is the drive root.
@@ -62,6 +66,13 @@ pub struct Status {
     pub free_disk_floor_warning: bool,
     pub pending_upload_count: u64,
     pub paused: bool,
+}
+
+/// An entry in the result array for a successful uploads request.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Upload {
+    pub path: MountPath,
+    pub sync_state: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]

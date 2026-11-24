@@ -1,9 +1,9 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use onedrive_rs::ipc::{IpcClient, Request, Response, Status, socket_path};
+use onedrive_rs::ipc::{IpcClient, MountPath, Request, Response, Status, Upload, socket_path};
 use serde_json::Value;
 
 #[derive(Parser)]
@@ -13,6 +13,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Override the mount path (defaults to $XDG_RUNTIME_DIR/onedrive)
+    #[arg(long, global = true, value_name = "DIRECTORY")]
+    mount_path: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -21,6 +25,20 @@ struct Cli {
 enum Command {
     /// Show sync, cache, and upload status
     Status,
+    /// Pin a file or folder
+    Pin { path: PathBuf },
+    /// Unpin a file or folder
+    Unpin { path: PathBuf },
+    /// Purge the cached contents of a file or folder
+    Purge { path: PathBuf },
+    /// Run a delta sync now
+    Sync,
+    /// Show pending uploads and conflicts
+    Uploads,
+    /// Pause background sync
+    Pause,
+    /// Resume background sync
+    Resume,
 }
 
 fn main() -> ExitCode {
@@ -54,12 +72,56 @@ fn main() -> ExitCode {
 impl Cli {
     fn execute(&self) -> Result<String, String> {
         let runtime_dir = runtime_dir()?;
-        let result = daemon_request(&runtime_dir, &Request::Status)?;
+        let mount = self
+            .mount_path
+            .clone()
+            .unwrap_or_else(|| runtime_dir.join("onedrive"));
+        let path = |path: &Path| mount_relative_path(&mount, path);
+        let request = match &self.command {
+            Command::Status => Request::Status,
+            Command::Pin { path: input } => Request::Pin { path: path(input)? },
+            Command::Unpin { path: input } => Request::Unpin { path: path(input)? },
+            Command::Purge { path: input } => Request::Purge { path: path(input)? },
+            Command::Sync => Request::Sync,
+            Command::Uploads => Request::Uploads,
+            Command::Pause => Request::Pause,
+            Command::Resume => Request::Resume,
+        };
+        let result = daemon_request(&runtime_dir, &request)?;
         if self.json {
             return Ok(Response::Success(result).into_json().to_string());
         }
-        render_status(result)
+        render_reply(request, result)
     }
+}
+
+fn mount_relative_path(mount: &Path, input: &Path) -> Result<MountPath, String> {
+    if !mount.is_absolute() {
+        return Err("The OneDrive mount path must be absolute".into());
+    }
+    if input.as_os_str().is_empty() {
+        return Err("An item path is required".into());
+    }
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|error| format!("Cannot determine the current directory ({error})"))?
+            .join(input)
+    };
+    if mount
+        .components()
+        .chain(absolute.components())
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err("OneDrive paths cannot contain parent components (..)".into());
+    }
+    let relative = absolute
+        .strip_prefix(mount)
+        .map_err(|_| format!("Path {absolute:?} is outside the OneDrive mount at {mount:?}"))?;
+    let mount_path = Path::new("/").join(relative.components().collect::<PathBuf>());
+    let utf8 = mount_path.to_str().ok_or("OneDrive paths must be UTF-8")?;
+    MountPath::try_from(utf8.to_owned()).map_err(str::to_owned)
 }
 
 fn runtime_dir() -> Result<PathBuf, String> {
@@ -78,6 +140,33 @@ fn daemon_request(runtime_dir: &Path, request: &Request) -> Result<Value, String
             "Cannot communicate with the OneDrive daemon at {path:?} ({error})"
         )),
     }
+}
+
+fn render_reply(request: Request, result: Value) -> Result<String, String> {
+    let output = match request {
+        Request::Status => return render_status(result),
+        Request::Uploads => return render_uploads(result),
+        Request::Pin { path } => format!("Pin completed for {:?}", path.as_str()),
+        Request::Unpin { path } => format!("Unpin completed for {:?}", path.as_str()),
+        Request::Purge { path } => format!("Purge completed for {:?}", path.as_str()),
+        Request::Sync => "Sync completed".into(),
+        Request::Pause => "Paused background sync".into(),
+        Request::Resume => "Resumed background sync".into(),
+    };
+    Ok(output)
+}
+
+fn render_uploads(result: Value) -> Result<String, String> {
+    let uploads: Vec<Upload> = serde_json::from_value(result)
+        .map_err(|error| format!("Invalid daemon uploads response ({error})"))?;
+    if uploads.is_empty() {
+        return Ok("No pending uploads or conflicts.".into());
+    }
+    let lines: Vec<_> = uploads
+        .iter()
+        .map(|upload| format!("{}  {:?}", upload.sync_state, upload.path.as_str()))
+        .collect();
+    Ok(lines.join("\n"))
 }
 
 fn render_status(result: Value) -> Result<String, String> {

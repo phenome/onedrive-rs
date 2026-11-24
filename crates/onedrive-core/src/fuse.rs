@@ -3,18 +3,19 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, Owner, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenFlags, Owner,
+    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session, TimeOrNow, WriteFlags,
 };
 use tokio::runtime::Handle;
 
-use crate::{CatalogItem, Engine, EngineError, ItemKind};
+use crate::engine::{CatalogInvalidation, CatalogObserver};
+use crate::{CatalogItem, CloudError, Engine, EngineError, ItemKind};
 
 type DirectoryEntry = (INodeNo, FileType, String);
 
@@ -23,6 +24,7 @@ pub struct FuseAdapter {
     runtime: Handle,
     directories: Mutex<HashMap<u64, Arc<[DirectoryEntry]>>>,
     next_directory: AtomicU64,
+    observer: Arc<OnceLock<CatalogObserver>>,
 }
 
 impl FuseAdapter {
@@ -33,6 +35,7 @@ impl FuseAdapter {
             runtime,
             directories: Mutex::default(),
             next_directory: AtomicU64::new(1),
+            observer: Arc::default(),
         }
     }
 
@@ -47,10 +50,40 @@ impl FuseAdapter {
             MountOption::NoSuid,
         ];
         config.n_threads = Some(4);
-        let engine = Arc::downgrade(&self.engine);
+        let engine = self.engine.clone();
+        let owner = self.observer.clone();
         let runtime = self.runtime.clone();
-        let session = fuser::spawn_mount(self, mountpoint, &config)?;
-        runtime.spawn(Engine::run_upload_worker(engine));
+        let session = Session::new(self, mountpoint, &config)?;
+        let notifier = session.notifier();
+        let (send, mut changes) =
+            tokio::sync::mpsc::unbounded_channel::<Vec<CatalogInvalidation>>();
+        runtime.spawn_blocking(move || {
+            while let Some(changes) = changes.blocking_recv() {
+                for change in &changes {
+                    let result = match change {
+                        CatalogInvalidation::Inode { inode, content } => {
+                            notifier.inval_inode(INodeNo(*inode), if *content { 0 } else { -1 }, 0)
+                        }
+                        CatalogInvalidation::Entry { parent, name } => {
+                            notifier.inval_entry(INodeNo(*parent), OsStr::new(name))
+                        }
+                    };
+                    if let Err(error) = result
+                        && error.kind() != io::ErrorKind::NotFound
+                        && error.raw_os_error() != Some(rustix::io::Errno::NODEV.raw_os_error())
+                    {
+                        log::warn!("FUSE cache invalidation failed: {error}");
+                    }
+                }
+            }
+        });
+        let observer: CatalogObserver = Arc::new(move |changes| {
+            let _ = send.send(changes.to_vec());
+        });
+        engine.observe_catalog(&observer);
+        assert!(owner.set(observer).is_ok());
+        let session = session.spawn()?;
+        runtime.spawn(Engine::run_upload_worker(Arc::downgrade(&engine)));
         Ok(session)
     }
 
@@ -86,7 +119,7 @@ impl FuseAdapter {
         };
         let entries = self
             .engine
-            .list_children(&directory.item_id)
+            .list_directory_entries(&directory.item_id)
             .map_err(errno)?;
         Ok([
             (ino, FileType::Directory, ".".into()),
@@ -96,12 +129,19 @@ impl FuseAdapter {
         .chain(
             entries
                 .into_iter()
-                .map(|entry| (INodeNo(entry.inode), file_type(entry.kind), entry.name)),
+                .map(|(inode, kind, name)| (INodeNo(inode), file_type(kind), name)),
         ))
     }
 }
 
 impl Filesystem for FuseAdapter {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+        // fuser requires a positive byte limit. One byte rounds down to zero
+        // pages on Linux, keeping cached mmap and MIME sniffing demand-driven.
+        let _ = config.set_max_readahead(1);
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let item = (|| {
             let name = name.to_str().ok_or(Errno::ENOENT)?;
@@ -177,7 +217,7 @@ impl Filesystem for FuseAdapter {
         reply: ReplyOpen,
     ) {
         match self.engine.open_file(ino.0) {
-            Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_DIRECT_IO),
+            Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_KEEP_CACHE),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -197,14 +237,8 @@ impl Filesystem for FuseAdapter {
         let result = (|| {
             let item = self
                 .engine
-                .create_with_mode(
-                    parent.0,
-                    file_name(name)?,
-                    ItemKind::File,
-                    Some(permissions(mode & !umask)),
-                )
+                .create_and_open(parent.0, file_name(name)?, Some(permissions(mode & !umask)))
                 .map_err(errno)?;
-            self.engine.open_file(item.inode).map_err(errno)?;
             Ok::<_, Errno>(item)
         })();
         match result {
@@ -213,7 +247,7 @@ impl Filesystem for FuseAdapter {
                 &attributes(&item),
                 Generation(0),
                 FileHandle(item.inode),
-                FopenFlags::FOPEN_DIRECT_IO,
+                FopenFlags::FOPEN_KEEP_CACHE,
             ),
             Err(error) => reply.error(error),
         }
@@ -565,14 +599,54 @@ fn errno(error: EngineError) -> Errno {
     match error {
         EngineError::NotFound => Errno::ENOENT,
         EngineError::IsDirectory => Errno::EISDIR,
+        EngineError::CacheIo(error) => {
+            Errno::from_i32(error.raw_os_error().unwrap_or(Errno::EIO.code()))
+        }
         EngineError::NotDirectory => Errno::ENOTDIR,
         EngineError::NotEmpty => Errno::ENOTEMPTY,
         EngineError::AlreadyExists => Errno::EEXIST,
         EngineError::InvalidMutation => Errno::EINVAL,
         EngineError::TrashProhibited => Errno::EACCES,
-        EngineError::CacheIo(error) => {
-            Errno::from_i32(error.raw_os_error().unwrap_or(Errno::EIO.code()))
-        }
+        EngineError::Cloud(error) => cloud_errno(error),
         _ => Errno::EIO,
+    }
+}
+
+fn cloud_errno(error: CloudError) -> Errno {
+    match error {
+        CloudError::NotFound => Errno::ENOENT,
+        CloudError::Conflict => Errno::ESTALE,
+        CloudError::Authentication => Errno::EACCES,
+        CloudError::Unsupported => Errno::EOPNOTSUPP,
+        CloudError::Throttled { .. } => Errno::EAGAIN,
+        CloudError::InvalidResponse | CloudError::ResyncRequired | CloudError::Unavailable => {
+            Errno::EIO
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_all_cloud_errors_to_fuse_errno() {
+        for (error, expected) in [
+            (CloudError::NotFound, Errno::ENOENT),
+            (CloudError::Conflict, Errno::ESTALE),
+            (CloudError::Authentication, Errno::EACCES),
+            (CloudError::Unsupported, Errno::EOPNOTSUPP),
+            (
+                CloudError::Throttled {
+                    retry_after: Duration::from_secs(5),
+                },
+                Errno::EAGAIN,
+            ),
+            (CloudError::InvalidResponse, Errno::EIO),
+            (CloudError::ResyncRequired, Errno::EIO),
+            (CloudError::Unavailable, Errno::EIO),
+        ] {
+            assert_eq!(errno(EngineError::Cloud(error)), expected);
+        }
     }
 }

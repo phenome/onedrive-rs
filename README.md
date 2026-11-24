@@ -8,6 +8,10 @@ A cloud-first Microsoft OneDrive (Personal) client in Rust for Linux desktops, t
 - **Async write-back** with a persistent upload queue and conflict-copy preservation on `If-Match` / `eTag` mismatch.
 - **Shared local IPC** serving the CLI, a thin `nautilus-python` extension (emblems + Pin/Purge menu), and (Phase 2) a native Rust `gpui` management app.
 
+## Setup
+
+- [Register a Microsoft Entra desktop app](docs/entra-setup.md)
+
 ## Design Docs
 
 - [GLOSSARY.md](GLOSSARY.md) — canonical domain language

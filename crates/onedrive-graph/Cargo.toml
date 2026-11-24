@@ -1,0 +1,34 @@
+[package]
+name = "onedrive-graph"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+getrandom = "0.3"
+httpdate = "1"
+onedrive-core = { path = "../onedrive-core" }
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "process", "rt", "sync", "time"] }
+
+[dev-dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rcgen = "0.13"
+tempfile = "3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio = { version = "1", features = ["test-util"] }
+wiremock = "0.6"

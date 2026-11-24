@@ -9,6 +9,7 @@ workspace = true
 [dependencies]
 async-trait = "0.1"
 fuser = "0.19"
+log = "0.4"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }

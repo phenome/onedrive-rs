@@ -7,17 +7,29 @@ use thiserror::Error;
 /// The Graph adapter translates HTTP responses into this port's domain types.
 #[async_trait]
 pub trait CloudDrive: Send + Sync {
-    /// Read up to length bytes, stopping at remote EOF.
+    async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError>;
+
+    /// Read up to `length` authentic file bytes starting at `offset`.
+    /// Return an empty vector at EOF and for a zero-length read.
     async fn read_range(
         &self,
         _item_id: &str,
         _offset: u64,
         _length: usize,
     ) -> Result<Vec<u8>, CloudError> {
-        Err(CloudError::Unavailable)
+        Err(CloudError::Unsupported)
     }
 
-    async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError>;
+    async fn list_thumbnails(&self, _folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    async fn download_thumbnail(
+        &self,
+        _thumbnail: &RemoteThumbnail,
+    ) -> Result<Vec<u8>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
 
     async fn upload(
         &self,
@@ -44,6 +56,13 @@ pub trait CloudDrive: Send + Sync {
     async fn delete_item(&self, _item_id: &str) -> Result<(), CloudError> {
         Err(CloudError::Unsupported)
     }
+}
+
+/// The large rendition of a child item. Its temporary URL carries access.
+#[derive(Clone)]
+pub struct RemoteThumbnail {
+    pub item_id: String,
+    pub url: String,
 }
 
 #[derive(Clone, Copy)]

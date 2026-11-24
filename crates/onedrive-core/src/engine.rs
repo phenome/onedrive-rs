@@ -1,22 +1,30 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use thiserror::Error;
 
+use crate::namespace::AffectedNames;
 use crate::{
     Clock, CloudDrive, CloudError, DeltaChange, DeltaCursor, DeltaPage, DeltaRequest, ItemKind,
     RemoteItem,
 };
 
+mod catalog_invalidation;
 mod sparse_cache;
 mod writeback;
 
+pub(crate) use catalog_invalidation::{CatalogInvalidation, CatalogObserver};
+
 use sparse_cache::SparseCache;
+
+// Recover within the same call when both the saved cursor and the first
+// replacement continuation expire, while keeping repeated expiry bounded.
+const MAX_FULL_SYNC_RESTARTS: usize = 2;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -44,7 +52,7 @@ pub enum EngineError {
     InvalidMutation,
     #[error("top-level .Trash directories are prohibited")]
     TrashProhibited,
-    #[error("local file I/O error")]
+    #[error("sparse cache I/O error")]
     CacheIo(#[from] io::Error),
     #[error("cloud range did not match the catalog file size")]
     InvalidRange,
@@ -57,6 +65,7 @@ pub struct CatalogItem {
     pub inode: u64,
     pub item_id: String,
     pub parent_id: Option<String>,
+    /// The name exposed by the local namespace, including any temporary alias.
     pub name: String,
     pub kind: ItemKind,
     pub size: u64,
@@ -67,6 +76,7 @@ pub struct CatalogItem {
     pub last_accessed_at: Option<i64>,
     pub pin_state: PinState,
     pub sync_state: SyncState,
+    pub intended_name: String,
     pub mode: Option<u16>,
     pub local_atime: Option<i64>,
     pub local_mtime: Option<i64>,
@@ -115,15 +125,16 @@ pub struct Engine {
     clock: Arc<dyn Clock>,
     syncing: tokio::sync::Mutex<()>,
     writeback: writeback::Writeback,
+    observers: Mutex<Vec<Weak<catalog_invalidation::Observer>>>,
 }
 
 const ITEM_COLUMNS: &str =
-    "inode, item_id, parent_id, name, kind, size, mtime, etag, ctag, quickxor_hash, last_accessed_at, sync_state,
+    "inode, item_id, parent_id, coalesce(alias, name), kind, size, mtime, etag, ctag, quickxor_hash, last_accessed_at, sync_state,
      (SELECT pin_state FROM pin_directives WHERE item_id = items.item_id),
      (SELECT mode FROM local_attributes WHERE inode = items.inode),
      (SELECT atime FROM local_attributes WHERE inode = items.inode),
      (SELECT mtime FROM local_attributes WHERE inode = items.inode),
-     EXISTS (SELECT 1 FROM writeback_queue WHERE inode = items.inode AND deleted)";
+     EXISTS (SELECT 1 FROM writeback_queue WHERE inode = items.inode AND deleted), name";
 
 impl Engine {
     pub fn open(
@@ -150,9 +161,11 @@ impl Engine {
             return Err(EngineError::WalUnavailable);
         }
         db.pragma_update(None, "synchronous", "FULL")?;
-        let transaction = db.transaction()?;
+        let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("schema.sql"))?;
+        crate::namespace::migrate(&transaction)?;
         transaction.commit()?;
+        catalog_invalidation::install(&db)?;
         let cache = SparseCache::open(cache_dir.as_ref(), &db)?;
         let writeback = writeback::Writeback::open(database.as_ref(), &mut db)?;
         Ok(Self {
@@ -162,6 +175,7 @@ impl Engine {
             cloud,
             clock,
             syncing: tokio::sync::Mutex::new(()),
+            observers: Mutex::default(),
         })
     }
 
@@ -171,11 +185,11 @@ impl Engine {
 
     pub async fn sync(&self) -> Result<(), EngineError> {
         let _sync = self.syncing.lock().await;
-        let mut restarted = false;
+        let mut restarts = 0;
         loop {
             let (link, revision) = self.ready_checkpoint().await?;
             let request = link.map_or(DeltaRequest::Initial, DeltaRequest::Link);
-            let can_resync = !restarted && request != DeltaRequest::Initial;
+            let can_resync = request != DeltaRequest::Initial;
             let page = match self.cloud.delta(request).await {
                 Ok(page) => page,
                 Err(CloudError::Throttled { retry_after }) => {
@@ -184,8 +198,12 @@ impl Engine {
                     continue;
                 }
                 Err(CloudError::ResyncRequired) if can_resync => {
+                    // Discard expired progress even when this invocation is out of retries.
                     self.restart_full_sync(revision)?;
-                    restarted = true;
+                    if restarts == MAX_FULL_SYNC_RESTARTS {
+                        return Err(CloudError::ResyncRequired.into());
+                    }
+                    restarts += 1;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -225,41 +243,99 @@ impl Engine {
     }
 
     fn commit_page(&self, page: DeltaPage, revision: i64) -> Result<bool, EngineError> {
-        let mut db = self.db();
-        let transaction = db.transaction()?;
-        let (link, complete) = match page.cursor {
-            DeltaCursor::Next(link) => (link, false),
-            DeltaCursor::Complete(link) => (link, true),
-        };
-        advance_checkpoint(&transaction, revision, Some(&link))?;
-        let full_scan = transaction.query_row(
-            "SELECT full_scan FROM delta_checkpoint WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        for change in page.changes {
-            apply_change(&transaction, change, full_scan)?;
-        }
-        if complete {
-            reconcile_catalog(&transaction, full_scan)?;
-            transaction.execute("UPDATE delta_checkpoint SET full_scan = 0", [])?;
-        }
-        transaction.commit()?;
-        self.cache.reclaim(&db)?;
+        let complete = self.update_catalog(|transaction| {
+            let (link, complete) = match page.cursor {
+                DeltaCursor::Next(link) => (link, false),
+                DeltaCursor::Complete(link) => (link, true),
+            };
+            advance_checkpoint(transaction, revision, Some(&link))?;
+            let full_scan = transaction.query_row(
+                "SELECT full_scan FROM delta_checkpoint WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut affected = AffectedNames::default();
+            for (position, change) in page.changes.into_iter().enumerate() {
+                apply_change(
+                    transaction,
+                    change,
+                    full_scan,
+                    &mut affected,
+                    revision + 1,
+                    position,
+                )?;
+            }
+            if complete {
+                reconcile_catalog(transaction, full_scan, &mut affected)?;
+                transaction.execute("UPDATE delta_checkpoint SET full_scan = 0", [])?;
+            }
+            affected.reconcile(transaction, complete)?;
+            Ok(complete)
+        })?;
+        self.reclaim_sparse_cache()?;
         Ok(complete)
     }
 
-    fn restart_full_sync(&self, revision: i64) -> Result<(), EngineError> {
+    fn update_catalog<T>(
+        &self,
+        update: impl FnOnce(&Transaction<'_>) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        self.update_catalog_after(update, |_| {})
+    }
+
+    fn update_catalog_after<T>(
+        &self,
+        update: impl FnOnce(&Transaction<'_>) -> Result<T, EngineError>,
+        committed: impl FnOnce(&T),
+    ) -> Result<T, EngineError> {
         let mut db = self.db();
-        let transaction = db.transaction()?;
-        advance_checkpoint(&transaction, revision, None)?;
-        transaction.execute_batch(
-            "UPDATE delta_checkpoint SET full_scan = 1;
-             DELETE FROM delta_deletions;
-             DELETE FROM full_sync_seen;",
-        )?;
+        let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM changed_inodes", [])?;
+        transaction.execute("DELETE FROM changed_entries", [])?;
+        let result = update(&transaction)?;
+        let observers: Vec<_> = {
+            let mut observers = self.observers.lock().unwrap();
+            observers.retain(|observer| observer.strong_count() > 0);
+            observers.iter().filter_map(Weak::upgrade).collect()
+        };
+        let invalidations = if observers.is_empty() {
+            Vec::new()
+        } else {
+            catalog_invalidation::collect(&transaction)?
+        };
         transaction.commit()?;
-        Ok(())
+        committed(&result);
+        drop(db);
+        for observer in observers {
+            observer(&invalidations);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn observe_catalog(&self, observer: &CatalogObserver) {
+        self.observers
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(observer));
+    }
+
+    fn restart_full_sync(&self, revision: i64) -> Result<(), EngineError> {
+        self.update_catalog(|transaction| {
+            advance_checkpoint(transaction, revision, None)?;
+            let mut affected = AffectedNames::default();
+            affected.extend(
+                transaction,
+                "SELECT parent_id, name
+                FROM delta_deletions JOIN items USING (item_id)",
+            )?;
+            transaction.execute_batch(
+                "UPDATE delta_checkpoint SET full_scan = 1;
+                 DELETE FROM delta_deletions;
+                 DELETE FROM full_sync_seen;",
+            )?;
+            affected.reconcile(transaction, false)?;
+            Ok(())
+        })
     }
 
     /// Store the explicit directive. Effective sticky pin policy belongs in Engine.
@@ -318,16 +394,25 @@ impl Engine {
         Ok(self
             .db()
             .prepare_cached(&format!(
-                "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1
-                 AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted)
-                 AND NOT EXISTS (
-                     SELECT 1 FROM items AS local JOIN writeback_queue AS q ON local.inode = q.inode
-                     WHERE local.parent_id = items.parent_id AND local.name = items.name
-                       AND local.inode <> items.inode AND NOT q.deleted
-                 )
-                 ORDER BY name, inode"
+                "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted) ORDER BY coalesce(alias, name), inode"
             ))?
             .query_map([parent_id], catalog_item)?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub(crate) fn list_directory_entries(
+        &self,
+        parent_id: &str,
+    ) -> Result<Vec<(u64, ItemKind, String)>, EngineError> {
+        Ok(self
+            .db()
+            .prepare_cached(
+                "SELECT inode, kind, coalesce(alias, name)
+                 FROM items WHERE parent_id = ?1 AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted) ORDER BY coalesce(alias, name), inode",
+            )?
+            .query_map([parent_id], |row| {
+                Ok((row.get(0)?, item_kind(row, 1)?, row.get(2)?))
+            })?
             .collect::<Result<_, _>>()?)
     }
 
@@ -369,10 +454,7 @@ impl Engine {
                 path.extend(names.into_iter().rev());
                 return Ok(Some(path));
             };
-            if !seen.insert(item.item_id)
-                || lookup(&snapshot, &parent_id, &item.name)?
-                    .is_none_or(|entry| entry.inode != item.inode)
-            {
+            if !seen.insert(item.item_id) {
                 return Ok(None);
             }
             names.push(item.name);
@@ -393,9 +475,8 @@ fn root(db: &Connection) -> rusqlite::Result<Option<CatalogItem>> {
 
 fn lookup(db: &Connection, parent_id: &str, name: &str) -> rusqlite::Result<Option<CatalogItem>> {
     db.prepare_cached(&format!(
-        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND name = ?2
-         AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted)
-         ORDER BY (inode IN (SELECT inode FROM writeback_queue)) DESC, inode"
+        "SELECT {ITEM_COLUMNS} FROM items WHERE parent_id = ?1 AND coalesce(alias, name) = ?2
+         AND inode NOT IN (SELECT inode FROM writeback_queue WHERE deleted)"
     ))?
     .query_row(params![parent_id, name], catalog_item)
     .optional()
@@ -417,17 +498,21 @@ fn item_by_inode(db: &Connection, inode: u64) -> rusqlite::Result<Option<Catalog
     .optional()
 }
 
+fn item_kind(row: &Row<'_>, index: usize) -> rusqlite::Result<ItemKind> {
+    Ok(if row.get::<_, bool>(index)? {
+        ItemKind::Folder
+    } else {
+        ItemKind::File
+    })
+}
+
 fn catalog_item(row: &Row<'_>) -> rusqlite::Result<CatalogItem> {
     Ok(CatalogItem {
         inode: row.get(0)?,
         item_id: row.get(1)?,
         parent_id: row.get(2)?,
         name: row.get(3)?,
-        kind: if row.get::<_, bool>(4)? {
-            ItemKind::Folder
-        } else {
-            ItemKind::File
-        },
+        kind: item_kind(row, 4)?,
         size: row.get(5)?,
         mtime: row.get(6)?,
         etag: row.get(7)?,
@@ -435,10 +520,12 @@ fn catalog_item(row: &Row<'_>) -> rusqlite::Result<CatalogItem> {
         quickxor_hash: row.get(9)?,
         last_accessed_at: row.get(10)?,
         sync_state: row.get(11)?,
+        intended_name: row.get(17)?,
         mode: row.get(13)?,
         local_atime: row.get(14)?,
         local_mtime: row.get(15)?,
         unlinked: row.get(16)?,
+
         pin_state: row
             .get::<_, Option<PinState>>(12)?
             .unwrap_or(PinState::None),
@@ -465,49 +552,74 @@ fn apply_change(
     transaction: &Transaction<'_>,
     change: DeltaChange,
     full_scan: bool,
+    affected: &mut AffectedNames,
+    revision: i64,
+    position: usize,
 ) -> rusqlite::Result<()> {
     match change {
         DeltaChange::Delete(item_id) => {
+            affected.record_item(transaction, &item_id)?;
             transaction.execute(
                 "DELETE FROM writeback_recycled WHERE item_id = ?1",
                 [&item_id],
             )?;
-            transaction.execute(
-                "INSERT OR IGNORE INTO delta_deletions VALUES (?1)",
-                [item_id],
-            )?;
+            transaction
+                .prepare_cached("INSERT OR IGNORE INTO delta_deletions VALUES (?1)")?
+                .execute([item_id])?;
         }
         DeltaChange::Upsert(item) => {
+            affected.record_item(transaction, &item.item_id)?;
             record_sighting(transaction, &item.item_id, full_scan)?;
-            let recycled: bool = transaction.query_row(
-                "SELECT EXISTS (SELECT 1 FROM writeback_recycled WHERE item_id = ?1)",
-                [&item.item_id],
-                |row| row.get(0),
-            )?;
-            if !recycled && item.name.is_some() {
-                upsert_remote_item(transaction, item)?;
+            let recycled = !full_scan
+                && transaction.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM writeback_recycled WHERE item_id = ?1)",
+                    [&item.item_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+            if !recycled && let Some(name) = &item.name {
+                affected.insert(item.parent_id.clone(), name.clone());
+                upsert_remote_item(transaction, item, revision, position)?;
             }
         }
     }
     Ok(())
 }
 
-fn upsert_remote_item(transaction: &Transaction<'_>, item: RemoteItem) -> rusqlite::Result<()> {
-    transaction.execute(
-        "INSERT INTO items (inode, item_id, parent_id, name, kind, size, mtime, etag, ctag, quickxor_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+fn upsert_remote_item(
+    transaction: &Transaction<'_>,
+    item: RemoteItem,
+    revision: i64,
+    position: usize,
+) -> rusqlite::Result<()> {
+    transaction
+        .prepare_cached(
+            "INSERT INTO items (inode, item_id, parent_id, name, kind, size, mtime, etag, ctag,
+                            quickxor_hash, claim_revision, claim_position)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(item_id) DO UPDATE SET
+             alias = CASE WHEN items.parent_id IS excluded.parent_id AND items.name = excluded.name
+                          THEN items.alias END,
              parent_id = excluded.parent_id, name = excluded.name, kind = excluded.kind,
              size = excluded.size, mtime = excluded.mtime, etag = excluded.etag,
-             ctag = excluded.ctag, quickxor_hash = excluded.quickxor_hash
+             ctag = excluded.ctag, quickxor_hash = excluded.quickxor_hash,
+             claim_revision = excluded.claim_revision, claim_position = excluded.claim_position
          WHERE items.sync_state IN (0, 3)
            AND items.inode NOT IN (SELECT inode FROM writeback_queue)",
-        params![
-            reserved_inode(&item), item.item_id, item.parent_id, item.name,
-            item.kind == ItemKind::Folder, item.size, item.mtime, item.etag, item.ctag,
-            item.quickxor_hash
-        ],
-    )?;
+        )?
+        .execute(params![
+            reserved_inode(&item),
+            item.item_id,
+            item.parent_id,
+            item.name,
+            item.kind == ItemKind::Folder,
+            item.size,
+            item.mtime,
+            item.etag,
+            item.ctag,
+            item.quickxor_hash,
+            revision,
+            position
+        ])?;
     Ok(())
 }
 
@@ -521,52 +633,65 @@ fn record_sighting(
     item_id: &str,
     full_scan: bool,
 ) -> rusqlite::Result<()> {
-    transaction.execute("DELETE FROM delta_deletions WHERE item_id = ?1", [item_id])?;
-    transaction.execute(
-        "UPDATE items SET remote_missing = 0 WHERE item_id = ?1 AND remote_missing = 1",
-        [item_id],
-    )?;
+    transaction
+        .prepare_cached("DELETE FROM delta_deletions WHERE item_id = ?1")?
+        .execute([item_id])?;
+    transaction
+        .prepare_cached(
+            "UPDATE items SET remote_missing = 0 WHERE item_id = ?1 AND remote_missing = 1",
+        )?
+        .execute([item_id])?;
     if full_scan {
-        transaction.execute(
-            "INSERT OR IGNORE INTO full_sync_seen VALUES (?1)",
-            [item_id],
-        )?;
+        transaction
+            .prepare_cached("INSERT OR IGNORE INTO full_sync_seen VALUES (?1)")?
+            .execute([item_id])?;
     }
     Ok(())
 }
 
-fn reconcile_catalog(transaction: &Transaction<'_>, full_scan: bool) -> rusqlite::Result<()> {
+fn reconcile_catalog(
+    transaction: &Transaction<'_>,
+    full_scan: bool,
+    affected: &mut AffectedNames,
+) -> rusqlite::Result<()> {
     // Wait for the final page so later moves can remove children from deleted folders.
-    transaction.execute(
+    let mut mark_missing = transaction.prepare(
         "WITH RECURSIVE deleted(item_id) AS (
              SELECT item_id FROM delta_deletions
              UNION
              SELECT i.item_id FROM items AS i JOIN deleted AS d ON i.parent_id = d.item_id
          )
          UPDATE items SET remote_missing = 1
-         WHERE item_id IN (
+         WHERE remote_missing = 0 AND item_id IN (
              SELECT item_id FROM deleted
              UNION
              SELECT item_id FROM items WHERE ?1 AND item_id NOT IN full_sync_seen
-         )",
-        [full_scan],
+         )
+         RETURNING parent_id, name",
     )?;
-    prune_remote_deletions(transaction)?;
+    affected.read(&mut mark_missing.query([full_scan])?)?;
+    prune_remote_deletions(transaction, affected)?;
+    if full_scan {
+        transaction.execute("DELETE FROM writeback_recycled", [])?;
+    }
     transaction.execute_batch("DELETE FROM delta_deletions; DELETE FROM full_sync_seen;")
 }
 
-fn prune_remote_deletions(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+fn prune_remote_deletions(
+    transaction: &Transaction<'_>,
+    affected: &mut AffectedNames,
+) -> rusqlite::Result<()> {
     // Retain the parent chain needed to reach local changes. Persist the absence
     // so a later sync can remove the chain after the local changes are resolved.
-    transaction.execute(
+    let mut prune = transaction.prepare(
         "WITH RECURSIVE protected(item_id, parent_id) AS (
              SELECT item_id, parent_id FROM items WHERE sync_state <> 0
              UNION
              SELECT i.item_id, i.parent_id FROM items AS i JOIN protected AS p ON i.item_id = p.parent_id
          )
          DELETE FROM items WHERE remote_missing = 1
-           AND item_id NOT IN (SELECT item_id FROM protected)",
-        [],
+           AND item_id NOT IN (SELECT item_id FROM protected)
+         RETURNING parent_id, name",
     )?;
-    Ok(())
+    affected.read(&mut prune.query([])?)
 }

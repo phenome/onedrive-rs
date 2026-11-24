@@ -140,7 +140,7 @@ fn enqueue_existing(tx: &Transaction<'_>, item: &CatalogItem) -> rusqlite::Resul
             item.inode,
             item.item_id,
             item.parent_id,
-            item.name,
+            item.intended_name,
             item.sync_state == SyncState::Conflict
         ],
     )?;
@@ -201,34 +201,60 @@ impl Engine {
         kind: ItemKind,
         mode: Option<u16>,
     ) -> Result<CatalogItem, EngineError> {
-        let mut db = self.db();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let parent = directory(&tx, parent)?;
-        validate_name(&parent, name, kind)?;
-        if lookup(&tx, &parent.item_id, name)?.is_some() {
-            return Err(EngineError::AlreadyExists);
-        }
-        tx.execute(
-            "INSERT INTO items (item_id, parent_id, name, kind, size, mtime, sync_state)
+        self.create_entry(parent, name, kind, mode, false)
+    }
+
+    pub fn create_and_open(
+        &self,
+        parent: u64,
+        name: &str,
+        mode: Option<u16>,
+    ) -> Result<CatalogItem, EngineError> {
+        self.create_entry(parent, name, ItemKind::File, mode, true)
+    }
+
+    fn create_entry(
+        &self,
+        parent: u64,
+        name: &str,
+        kind: ItemKind,
+        mode: Option<u16>,
+        open: bool,
+    ) -> Result<CatalogItem, EngineError> {
+        let item = self.update_catalog_after(
+            |tx| {
+                let parent = directory(tx, parent)?;
+                validate_name(&parent, name, kind)?;
+                if lookup(tx, &parent.item_id, name)?.is_some() {
+                    return Err(EngineError::AlreadyExists);
+                }
+                tx.execute(
+                    "INSERT INTO items (item_id, parent_id, name, kind, size, mtime, sync_state)
              VALUES ('local:' || lower(hex(randomblob(16))), ?1, ?2, ?3, 0, ?4, ?5)",
-            params![
-                parent.item_id,
-                name,
-                kind == ItemKind::Folder,
-                self.write_time(),
-                SyncState::Dirty as i64
-            ],
+                    params![
+                        parent.item_id,
+                        name,
+                        kind == ItemKind::Folder,
+                        self.write_time(),
+                        SyncState::Dirty as i64
+                    ],
+                )?;
+                let inode = tx.last_insert_rowid();
+                tx.execute("INSERT INTO writeback_queue (inode) VALUES (?1)", [inode])?;
+                if let Some(mode) = mode {
+                    tx.execute(
+                        "INSERT INTO local_attributes (inode, mode) VALUES (?1, ?2)",
+                        params![inode, mode],
+                    )?;
+                }
+                item_by_inode(tx, inode as u64)?.ok_or(EngineError::NotFound)
+            },
+            |item| {
+                if open {
+                    self.register_open(item.inode);
+                }
+            },
         )?;
-        let inode = tx.last_insert_rowid();
-        tx.execute("INSERT INTO writeback_queue (inode) VALUES (?1)", [inode])?;
-        if let Some(mode) = mode {
-            tx.execute(
-                "INSERT INTO local_attributes (inode, mode) VALUES (?1, ?2)",
-                params![inode, mode],
-            )?;
-        }
-        let item = item_by_inode(&tx, inode as u64)?.ok_or(EngineError::NotFound)?;
-        tx.commit()?;
         self.writeback.changed.notify_one();
         Ok(item)
     }
@@ -240,21 +266,21 @@ impl Engine {
         atime: Option<i64>,
         mtime: Option<i64>,
     ) -> Result<CatalogItem, EngineError> {
-        let mut db = self.db();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if item_by_inode(&tx, inode)?.is_none() {
-            return Err(EngineError::NotFound);
-        }
-        tx.execute(
-            "INSERT INTO local_attributes (inode, mode, atime, mtime) VALUES (?1, ?2, ?3, ?4)
+        let item = self.update_catalog(|tx| {
+            if item_by_inode(tx, inode)?.is_none() {
+                return Err(EngineError::NotFound);
+            }
+            tx.execute(
+                "INSERT INTO local_attributes (inode, mode, atime, mtime) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(inode) DO UPDATE SET
                 mode = coalesce(excluded.mode, local_attributes.mode),
                 atime = coalesce(excluded.atime, local_attributes.atime),
                 mtime = coalesce(excluded.mtime, local_attributes.mtime)",
-            params![inode, mode, atime, mtime],
-        )?;
-        let item = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
-        tx.commit()?;
+                params![inode, mode, atime, mtime],
+            )?;
+            let item = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
+            Ok(item)
+        })?;
         Ok(item)
     }
 
@@ -330,15 +356,14 @@ impl Engine {
                 None
             };
 
-            let mut db = self.db();
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let current = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
-            let current_job = job(&tx, inode)?;
+            let Some(current) = self.update_catalog(|tx| {
+            let current = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
+            let current_job = job(tx, inode)?;
             if !same_content_version(&before, &current)
                 || previous.as_ref().map(|job| job.generation)
                     != current_job.as_ref().map(|job| job.generation)
             {
-                continue;
+                return Ok(None);
             }
             if prefix
                 .as_ref()
@@ -346,7 +371,7 @@ impl Engine {
             {
                 return Err(EngineError::InvalidRange);
             }
-            enqueue_existing(&tx, &current)?;
+            enqueue_existing(tx, &current)?;
             let file = self.writeback.stage(
                 stage,
                 prefix.as_deref().unwrap_or_default(),
@@ -368,33 +393,35 @@ impl Engine {
                 [inode],
             )?;
             tx.execute("DELETE FROM sparse_files WHERE inode = ?1", [inode])?;
-            let current = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
+            let current = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
             // Disarm automatic unlink before committing a reference to this file.
             let (_file, _path) = file.keep().map_err(|err| err.error)?;
-            tx.commit()?;
+                tx.execute("INSERT INTO changed_inodes VALUES (?1, 1)", [inode])?;
+                Ok(Some(current))
+            })? else { continue };
             self.writeback.retire(stage);
-            let _ = self.cache.reclaim(&db);
+            let _ = self.reclaim_sparse_cache();
             self.writeback.changed.notify_one();
             return Ok(current);
         }
     }
 
-    pub(super) fn has_staged(&self, db: &Connection, inode: u64) -> Result<bool, EngineError> {
-        Ok(job(db, inode)?.is_some_and(|job| job.stage.is_some()))
-    }
-
-    pub(super) fn read_staged(
+    pub(super) fn open_stage(
         &self,
         db: &Connection,
         inode: u64,
-        offset: u64,
-        output: &mut [u8],
-    ) -> Result<bool, EngineError> {
-        let Some(stage) = job(db, inode)?.and_then(|job| job.stage) else {
-            return Ok(false);
-        };
-        File::open(self.writeback.root.join(stage))?.read_exact_at(output, offset)?;
-        Ok(true)
+    ) -> Result<Option<File>, EngineError> {
+        let stage = db
+            .query_row(
+                "SELECT stage FROM writeback_queue WHERE inode = ?1",
+                [inode],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(stage
+            .map(|name| File::open(self.writeback.root.join(name)))
+            .transpose()?)
     }
 
     /// Refuse Purge while there is local work queued for this item.
@@ -407,13 +434,13 @@ impl Engine {
 
 impl Engine {
     pub fn unlink(&self, parent: u64, name: &str, kind: ItemKind) -> Result<(), EngineError> {
-        let mut db = self.db();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let parent = directory(&tx, parent)?;
-        let item = lookup(&tx, &parent.item_id, name)?.ok_or(EngineError::NotFound)?;
-        check_removable(&tx, &item, kind)?;
-        queue_delete(&tx, &item)?;
-        tx.commit()?;
+        self.update_catalog(|tx| {
+            let parent = directory(tx, parent)?;
+            let item = lookup(tx, &parent.item_id, name)?.ok_or(EngineError::NotFound)?;
+            check_removable(tx, &item, kind)?;
+            queue_delete(tx, &item)?;
+            Ok(())
+        })?;
         self.writeback.changed.notify_one();
         Ok(())
     }
@@ -426,11 +453,10 @@ impl Engine {
         new_name: &str,
         no_replace: bool,
     ) -> Result<(), EngineError> {
-        let mut db = self.db();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let parent = directory(&tx, parent)?;
-        let new_parent = directory(&tx, new_parent)?;
-        let item = lookup(&tx, &parent.item_id, name)?.ok_or(EngineError::NotFound)?;
+        self.update_catalog(|tx| {
+        let parent = directory(tx, parent)?;
+        let new_parent = directory(tx, new_parent)?;
+        let item = lookup(tx, &parent.item_id, name)?.ok_or(EngineError::NotFound)?;
         validate_name(&new_parent, new_name, item.kind)?;
         if (parent.inode, name) == (new_parent.inode, new_name) {
             return Ok(());
@@ -445,29 +471,30 @@ impl Engine {
                 ancestor = folder
                     .parent_id
                     .as_deref()
-                    .map(|id| item_by_id(&tx, id))
+                    .map(|id| item_by_id(tx, id))
                     .transpose()?
                     .flatten();
             }
         }
 
-        if let Some(replaced) = lookup(&tx, &new_parent.item_id, new_name)? {
+        if let Some(replaced) = lookup(tx, &new_parent.item_id, new_name)? {
             if no_replace {
                 return Err(EngineError::AlreadyExists);
             }
-            check_removable(&tx, &replaced, item.kind)?;
-            queue_delete(&tx, &replaced)?;
+            check_removable(tx, &replaced, item.kind)?;
+            queue_delete(tx, &replaced)?;
         }
-        enqueue_existing(&tx, &item)?;
+        enqueue_existing(tx, &item)?;
         tx.execute(
-            "UPDATE items SET parent_id = ?2, name = ?3, sync_state = CASE WHEN sync_state = 3 THEN 3 ELSE 1 END WHERE inode = ?1",
+            "UPDATE items SET parent_id = ?2, name = ?3, alias = NULL, sync_state = CASE WHEN sync_state = 3 THEN 3 ELSE 1 END WHERE inode = ?1",
             params![item.inode, new_parent.item_id, new_name],
         )?;
         tx.execute(
             "UPDATE writeback_queue SET generation = generation + 1 WHERE inode = ?1",
             [item.inode],
         )?;
-        tx.commit()?;
+        Ok(())
+        })?;
         self.writeback.changed.notify_one();
         Ok(())
     }
@@ -481,6 +508,11 @@ impl Engine {
         if job(&db, inode)?.is_some_and(|job| job.deleted) {
             return Err(EngineError::NotFound);
         }
+        self.register_open(inode);
+        Ok(())
+    }
+
+    fn register_open(&self, inode: u64) {
         *self
             .writeback
             .open_files
@@ -488,10 +520,9 @@ impl Engine {
             .unwrap()
             .entry(inode)
             .or_default() += 1;
-        Ok(())
     }
 
-    pub(crate) fn release_file(&self, inode: u64) {
+    pub fn release_file(&self, inode: u64) {
         let mut files = self.writeback.open_files.lock().unwrap();
         if let Some(count) = files.get_mut(&inode) {
             *count -= 1;
@@ -623,14 +654,14 @@ impl Engine {
                     continue;
                 }
                 let path_changed = queued.remote_parent != item.parent_id
-                    || queued.remote_name.as_deref() != Some(&item.name);
+                    || queued.remote_name.as_deref() != Some(&item.intended_name);
                 if queued.remote_id.is_none() || (queued.stage.is_none() && path_changed) {
                     let occupied = tx
                         .query_row(
                             "SELECT inode FROM writeback_queue
                          WHERE inode <> ?1 AND remote_parent = ?2 AND remote_name = ?3
                          ORDER BY sequence LIMIT 1",
-                            params![inode, item.parent_id, item.name],
+                            params![inode, item.parent_id, item.intended_name],
                             |row| row.get::<_, u64>(0),
                         )
                         .optional()?;
@@ -685,7 +716,7 @@ impl Engine {
             .parent_id
             .as_deref()
             .ok_or(EngineError::InvalidMutation)?;
-        let name = &work.item.name;
+        let name = &work.item.intended_name;
         let cloud_id = work.queued.remote_id.as_deref();
         let remote = match &work.action {
             Action::Delete => {
@@ -761,28 +792,34 @@ impl Engine {
     }
 
     fn finish_delete(&self, work: &Work) -> Result<(), EngineError> {
-        let mut db = self.db();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let stage = job(&tx, work.item.inode)?.and_then(|job| job.stage);
-        if let Some(id) = work.queued.remote_id.as_deref() {
-            tx.execute(
-                "INSERT OR IGNORE INTO writeback_recycled (item_id) VALUES (?1)",
-                [id],
-            )?;
-        }
-        tx.execute("DELETE FROM items WHERE inode = ?1", [work.item.inode])?;
-        tx.commit()?;
+        let stage = self.update_catalog(|tx| {
+            let stage = job(tx, work.item.inode)?.and_then(|job| job.stage);
+            if let Some(id) = work.queued.remote_id.as_deref() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO writeback_recycled (item_id) VALUES (?1)",
+                    [id],
+                )?;
+            }
+            tx.execute("DELETE FROM items WHERE inode = ?1", [work.item.inode])?;
+            Ok(stage)
+        })?;
         self.writeback.retire(stage.as_deref());
-        self.cache.reclaim(&db)?;
+        self.reclaim_sparse_cache()?;
         Ok(())
     }
 
     fn acknowledge(&self, work: &Work, remote: Option<RemoteItem>) -> Result<(), EngineError> {
-        let mut db = self.db();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cache_lock = work
+            .stage
+            .as_ref()
+            .map(|_| self.cache.lock_disk())
+            .transpose()
+            .ok()
+            .flatten();
+        let stage = self.update_catalog(|tx| {
         let inode = work.item.inode;
-        let current = item_by_inode(&tx, inode)?.ok_or(EngineError::NotFound)?;
-        let queued = job(&tx, inode)?.ok_or(EngineError::NotFound)?;
+        let current = item_by_inode(tx, inode)?.ok_or(EngineError::NotFound)?;
+        let queued = job(tx, inode)?.ok_or(EngineError::NotFound)?;
         let sent_content = matches!(work.action, Action::CreateFile | Action::Upload);
         let retire = sent_content && queued.stage == work.queued.stage;
         if retire {
@@ -800,7 +837,7 @@ impl Engine {
                 Action::TemporaryMove => (remote.parent_id.as_deref(), remote.name.as_deref()),
                 _ => (
                     work.item.parent_id.as_deref(),
-                    Some(work.item.name.as_str()),
+                    Some(work.item.intended_name.as_str()),
                 ),
             };
             tx.execute(
@@ -851,21 +888,13 @@ impl Engine {
             }
             (retire || queued.stage.is_none())
                 && current.parent_id.as_deref() == parent
-                && Some(current.name.as_str()) == name
+                && Some(current.intended_name.as_str()) == name
         } else {
             queued.generation == work.queued.generation
         };
-        if retire
-            && !queued.deleted
-            && let Some(stage) = queued.stage.as_deref()
-        {
-            let source = self.writeback.root.join(stage);
+        if retire && !queued.deleted && let (Some(directory), Some(source)) = (&cache_lock, &work.stage) {
             tx.execute_batch("SAVEPOINT cache_uploaded_content")?;
-            if self
-                .cache
-                .retain_upload(&tx, inode, current.size, &source)
-                .is_err()
-            {
+            if self.cache.retain_upload(directory, tx, inode, current.size, source).is_err() {
                 tx.execute_batch("ROLLBACK TO cache_uploaded_content")?;
             }
             tx.execute_batch("RELEASE cache_uploaded_content")?;
@@ -884,11 +913,11 @@ impl Engine {
                 ],
             )?;
         }
-        tx.commit()?;
-        if retire {
-            self.writeback.retire(queued.stage.as_deref());
-        }
-        self.cache.reclaim(&db)?;
+        Ok(retire.then_some(queued.stage).flatten())
+        })?;
+        drop(cache_lock);
+        self.writeback.retire(stage.as_deref());
+        self.reclaim_sparse_cache()?;
         Ok(())
     }
 }
@@ -973,6 +1002,11 @@ fn check_removable(db: &Connection, item: &CatalogItem, kind: ItemKind) -> Resul
 fn queue_delete(tx: &Transaction<'_>, item: &CatalogItem) -> rusqlite::Result<()> {
     enqueue_existing(tx, item)?;
     tx.execute(
+        "INSERT INTO changed_entries VALUES (?1, ?2)",
+        params![item.parent_id, item.name],
+    )?;
+    tx.execute("INSERT INTO changed_inodes VALUES (?1, 0)", [item.inode])?;
+    tx.execute(
         "UPDATE writeback_queue SET deleted = 1, generation = generation + 1 WHERE inode = ?1",
         [item.inode],
     )?;
@@ -1005,10 +1039,9 @@ impl Engine {
                 DeltaCursor::Complete(_) => break,
             }
         }
-        let mut db = self.db();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let item = item_by_inode(&tx, work.item.inode)?.ok_or(EngineError::NotFound)?;
-        let queued = job(&tx, item.inode)?.ok_or(EngineError::NotFound)?;
+        self.update_catalog(|tx| {
+        let item = item_by_inode(tx, work.item.inode)?.ok_or(EngineError::NotFound)?;
+        let queued = job(tx, item.inode)?.ok_or(EngineError::NotFound)?;
         if queued.deleted {
             return Ok(());
         }
@@ -1016,7 +1049,7 @@ impl Engine {
             .parent_id
             .as_deref()
             .ok_or(EngineError::InvalidMutation)?;
-        let name = conflict_name(&tx, parent, &item, self.write_time(), &remote)?;
+        let name = conflict_name(tx, parent, &item, self.write_time(), &remote)?;
         let original_id = queued.remote_id.as_deref();
         // A stale conditional upload forks the item; a destination-name
         // collision can keep the current item and use a different destination.
@@ -1032,7 +1065,7 @@ impl Engine {
             )?;
         }
         tx.execute(
-            "UPDATE items SET name = ?2, sync_state = 3 WHERE inode = ?1",
+            "UPDATE items SET name = ?2, alias = NULL, sync_state = 3 WHERE inode = ?1",
             params![item.inode, name],
         )?;
         tx.execute(
@@ -1044,19 +1077,30 @@ impl Engine {
         for original in remote.into_values().filter(|entry| {
             (matches!(work.action, Action::Upload) && Some(entry.item_id.as_str()) == original_id)
                 || (entry.parent_id.as_deref() == Some(parent)
-                    && entry.name.as_deref() == Some(&item.name))
+                    && entry.name.as_deref() == Some(&item.intended_name))
         }) {
             let existing = lookup(
-                &tx,
+                tx,
                 original.parent_id.as_deref().unwrap_or_default(),
                 original.name.as_deref().unwrap_or_default(),
             )?;
             if existing.is_none() || existing.is_some_and(|local| local.item_id == original.item_id)
             {
-                super::upsert_remote_item(&tx, original)?;
+                let mut affected = crate::namespace::AffectedNames::default();
+                affected.record_item(tx, &original.item_id)?;
+                if let Some(name) = &original.name {
+                    affected.insert(original.parent_id.clone(), name.clone());
+                }
+                let revision =
+                    tx.query_row("SELECT revision FROM delta_checkpoint", [], |row| {
+                        row.get(0)
+                    })?;
+                super::upsert_remote_item(tx, original, revision, 0)?;
+                affected.reconcile(tx, false)?;
             }
         }
-        tx.commit()?;
+        Ok(())
+        })?;
         Ok(())
     }
 }
@@ -1068,7 +1112,7 @@ fn conflict_name(
     seconds: i64,
     remote: &HashMap<String, RemoteItem>,
 ) -> Result<String, EngineError> {
-    let name = item.name.as_str();
+    let name = item.intended_name.as_str();
     let (stem, extension) = Path::new(name)
         .extension()
         .filter(|_| item.kind == ItemKind::File)

@@ -8,6 +8,67 @@ use thiserror::Error;
 #[async_trait]
 pub trait CloudDrive: Send + Sync {
     async fn delta(&self, request: DeltaRequest) -> Result<DeltaPage, CloudError>;
+
+    /// Read up to `length` authentic file bytes starting at `offset`.
+    /// Return an empty vector at EOF and for a zero-length read.
+    async fn read_range(
+        &self,
+        _item_id: &str,
+        _offset: u64,
+        _length: usize,
+    ) -> Result<Vec<u8>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    async fn list_thumbnails(&self, _folder_id: &str) -> Result<Vec<RemoteThumbnail>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    async fn download_thumbnail(
+        &self,
+        _thumbnail: &RemoteThumbnail,
+    ) -> Result<Vec<u8>, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    async fn upload(
+        &self,
+        _target: UploadTarget<'_>,
+        _bytes: &[u8],
+        _if_match: Option<&str>,
+    ) -> Result<RemoteItem, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    async fn create_folder(&self, _parent_id: &str, _name: &str) -> Result<RemoteItem, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    async fn move_item(
+        &self,
+        _item_id: &str,
+        _parent_id: &str,
+        _name: &str,
+    ) -> Result<RemoteItem, CloudError> {
+        Err(CloudError::Unsupported)
+    }
+
+    async fn delete_item(&self, _item_id: &str) -> Result<(), CloudError> {
+        Err(CloudError::Unsupported)
+    }
+}
+
+/// The large rendition of a child item. Its temporary URL carries access.
+#[derive(Clone)]
+pub struct RemoteThumbnail {
+    pub item_id: String,
+    pub url: String,
+}
+
+#[derive(Clone, Copy)]
+pub enum UploadTarget<'a> {
+    New { parent_id: &'a str, name: &'a str },
+    Existing { item_id: &'a str },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -71,6 +132,16 @@ pub enum CloudError {
     Throttled { retry_after: Duration },
     #[error("cloud requires a full metadata resync")]
     ResyncRequired,
+    #[error("cloud item changed since it was last read")]
+    Conflict,
+    #[error("cloud item does not exist")]
+    NotFound,
+    #[error("cloud operation is unsupported")]
+    Unsupported,
+    #[error("cloud request requires authentication")]
+    Authentication,
+    #[error("cloud returned an invalid response")]
+    InvalidResponse,
     #[error("cloud unavailable")]
     Unavailable,
 }

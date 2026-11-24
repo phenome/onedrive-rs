@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/onedrive-core"]
+members = ["crates/onedrive-core", "crates/onedrive-rs"]
 resolver = "3"
 
 [workspace.package]

@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use thiserror::Error;
 
@@ -53,6 +54,26 @@ pub enum SyncState {
     Dirty = 1,
     Uploading = 2,
     Conflict = 3,
+}
+
+impl FromSql for PinState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let integer = value.as_i64()?;
+        [Self::None, Self::Pinned, Self::UnpinOverride]
+            .into_iter()
+            .find(|state| *state as i64 == integer)
+            .ok_or(FromSqlError::OutOfRange(integer))
+    }
+}
+
+impl FromSql for SyncState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let integer = value.as_i64()?;
+        [Self::Clean, Self::Dirty, Self::Uploading, Self::Conflict]
+            .into_iter()
+            .find(|state| *state as i64 == integer)
+            .ok_or(FromSqlError::OutOfRange(integer))
+    }
 }
 
 pub struct Engine {
@@ -211,7 +232,7 @@ impl Engine {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(decode_pin(value))
+        Ok(value.unwrap_or(PinState::None))
     }
 
     pub fn set_sync_state(&self, item_id: &str, state: SyncState) -> Result<bool, EngineError> {
@@ -343,22 +364,11 @@ fn catalog_item(row: &Row<'_>) -> rusqlite::Result<CatalogItem> {
         ctag: row.get(8)?,
         quickxor_hash: row.get(9)?,
         last_accessed_at: row.get(10)?,
-        sync_state: match row.get::<_, i64>(11)? {
-            1 => SyncState::Dirty,
-            2 => SyncState::Uploading,
-            3 => SyncState::Conflict,
-            _ => SyncState::Clean,
-        },
-        pin_state: decode_pin(row.get(12)?),
+        sync_state: row.get(11)?,
+        pin_state: row
+            .get::<_, Option<PinState>>(12)?
+            .unwrap_or(PinState::None),
     })
-}
-
-fn decode_pin(value: Option<i64>) -> PinState {
-    match value {
-        Some(1) => PinState::Pinned,
-        Some(2) => PinState::UnpinOverride,
-        _ => PinState::None,
-    }
 }
 
 fn advance_checkpoint(
@@ -390,9 +400,7 @@ fn apply_change(
             )?;
         }
         DeltaChange::Upsert(item) => {
-            if full_scan {
-                record_full_sync_sighting(transaction, &item.item_id)?;
-            }
+            record_sighting(transaction, &item.item_id, full_scan)?;
             if item.name.is_some() {
                 upsert_remote_item(transaction, item)?;
             }
@@ -402,14 +410,6 @@ fn apply_change(
 }
 
 fn upsert_remote_item(transaction: &Transaction<'_>, item: RemoteItem) -> rusqlite::Result<()> {
-    transaction.execute(
-        "DELETE FROM delta_deletions WHERE item_id = ?1",
-        [&item.item_id],
-    )?;
-    transaction.execute(
-        "UPDATE items SET remote_missing = 0 WHERE item_id = ?1 AND remote_missing = 1",
-        [&item.item_id],
-    )?;
     transaction.execute(
         "INSERT INTO items (inode, item_id, parent_id, name, kind, size, mtime, etag, ctag, quickxor_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -432,11 +432,22 @@ fn reserved_inode(item: &RemoteItem) -> Option<u64> {
 }
 
 // Even a nameless stub establishes presence in a full enumeration.
-fn record_full_sync_sighting(transaction: &Transaction<'_>, item_id: &str) -> rusqlite::Result<()> {
+fn record_sighting(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    full_scan: bool,
+) -> rusqlite::Result<()> {
+    transaction.execute("DELETE FROM delta_deletions WHERE item_id = ?1", [item_id])?;
     transaction.execute(
-        "INSERT OR IGNORE INTO full_sync_seen VALUES (?1)",
+        "UPDATE items SET remote_missing = 0 WHERE item_id = ?1 AND remote_missing = 1",
         [item_id],
     )?;
+    if full_scan {
+        transaction.execute(
+            "INSERT OR IGNORE INTO full_sync_seen VALUES (?1)",
+            [item_id],
+        )?;
+    }
     Ok(())
 }
 

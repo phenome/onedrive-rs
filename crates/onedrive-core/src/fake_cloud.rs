@@ -45,7 +45,7 @@ impl FakeCloudDrive {
 
     pub fn upsert(&self, item: RemoteItem) {
         let mut state = self.state.lock().unwrap();
-        if item.name.is_some() {
+        if item.name.is_some() || !state.items.contains_key(&item.item_id) {
             state.items.insert(item.item_id.clone(), item.clone());
         }
         state.changes.push(DeltaChange::Upsert(item));

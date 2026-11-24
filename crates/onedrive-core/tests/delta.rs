@@ -321,3 +321,35 @@ async fn root_uses_kernel_root_inode_even_if_a_child_arrives_first() {
     assert_eq!(engine.root().unwrap().unwrap().inode, 1);
     assert_eq!(engine.resolve_path("/early.txt").unwrap(), Some(early));
 }
+
+#[tokio::test]
+async fn nameless_sighting_restores_a_folder_retained_for_a_dirty_child() {
+    use onedrive_core::SyncState;
+
+    for full_scan in [true, false] {
+        let temp = TempDir::new().unwrap();
+        let drive = drive(1);
+        let mut folder = item("folder", Some("root"), "Folder", ItemKind::Folder);
+        drive.upsert(folder.clone());
+        drive.upsert(item("child", Some("folder"), "edit.txt", ItemKind::File));
+        let engine = open(&temp, &drive);
+        engine.sync().await.unwrap();
+        engine.set_sync_state("child", SyncState::Dirty).unwrap();
+        drive.delete("folder");
+        engine.sync().await.unwrap();
+
+        folder.name = None;
+        drive.upsert(folder);
+        if full_scan {
+            drive.expire_tokens();
+        }
+        engine.sync().await.unwrap();
+        engine.set_sync_state("child", SyncState::Clean).unwrap();
+        engine.sync().await.unwrap();
+        assert_eq!(
+            engine.resolve_path("/Folder").unwrap().unwrap().item_id,
+            "folder"
+        );
+        assert!(engine.item("child").unwrap().is_none());
+    }
+}
